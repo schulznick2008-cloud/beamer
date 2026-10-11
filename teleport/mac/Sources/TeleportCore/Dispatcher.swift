@@ -123,8 +123,7 @@ public final class Dispatcher {
             return [:]
 
         case "shutdown":
-            quit = true
-            backend.shutdown()
+            quit = true // das Aufraeumen (backend.shutdown) macht der IPC-Server nach der Antwort, mit Zeitlimit
             return [:]
 
         default:

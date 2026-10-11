@@ -160,7 +160,7 @@ final class DispatcherTests: XCTestCase {
     func testShutdownQuits() {
         let r = d.handle(line: JSONLine.encode(["v": 1, "id": 99, "cmd": "shutdown"]))
         XCTAssertTrue(r.quit)
-        XCTAssertEqual(backend.calls, ["shutdown"])
+        XCTAssertTrue(backend.calls.isEmpty, "Aufraeumen macht der IPC-Server nach der Antwort")
     }
 }
 
