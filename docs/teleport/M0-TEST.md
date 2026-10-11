@@ -79,7 +79,21 @@ Dazu Nicks iPhone für Fotos sowie die Dateien aus `tools/teleport/m0/` auf beid
 - Moonlight-Fenster etwa so groß wie ein App-Fenster ziehen. Die Finanz-App über Moonlight bedienen: tippen, scrollen, klicken.
 - Note 1–5: „Fühlt sich das wie ein lokales Fenster an?“
 
-**Optional B8, falls WLAN schwach:** PC per LAN-Kabel an die Fritzbox, B2 bis B3 wiederholen. Das ist der wichtigste Hebel.
+**Optional B7b, falls WLAN schwach:** PC per LAN-Kabel an die Fritzbox, B2 bis B3 wiederholen. Das ist der wichtigste Hebel.
+
+**Optional B8. Direktkabel Mac↔PC (ca. 20 min)**
+Ein LAN-Kabel direkt vom PC zum USB-C-LAN-Adapter am Mac. Das WLAN bleibt auf beiden Rechnern an. Feste IPs werden empfohlen, weil sie sofort und immer gleich da sind.
+1. **Mac:** Adapter und Kabel einstecken. Systemeinstellungen → Netzwerk → *USB-LAN* (Name je nach Adapter) → Details → TCP/IP → „IPv4 konfigurieren: Manuell“, IP `192.168.77.1`, Teilnetzmaske `255.255.255.0`, Router leer lassen → OK.
+2. **PC:** Einstellungen → Netzwerk und Internet → Ethernet → IP-Zuweisung „Bearbeiten“ → Manuell, IPv4 an: IP `192.168.77.2`, Subnetzpräfixlänge `24`, Gateway und DNS leer → Speichern. Auf derselben Seite den Netzwerkprofiltyp auf **Privat** stellen, sonst blockt die Firewall.
+3. **Prüfen:** Auf dem Mac `ping -c 5 192.168.77.2`. Antworten kommen in unter 1 ms.
+- Alternative ohne Einstellungen: beide Seiten auf DHCP lassen. Nach etwa 1 min hat jeder eine Link-Local-Adresse `169.254.x.y` (Mac: Details → TCP/IP, PC: `ipconfig`). Diese Adressen dann statt `.1`/`.2` nehmen.
+- **Messen wie oben**, nur mit den Kabel-IPs:
+  - B1: `./mac_netz.sh 192.168.77.2 60` und `pc_netz.ps1 -Mac 192.168.77.1`.
+  - B2/B3: Sunshine auf dem Mac in Moonlight über „+“ mit `192.168.77.1` hinzufügen und koppeln, dann wie bei B2/B3 messen.
+  - B4: HEVC 80 und 150 Mbit/s.
+  - B6 und B7 wie oben.
+- **Kabelwechsel (Info):** Kabel während des Streams ziehen. Moonlight wechselt nicht auf WLAN, der Abbruch ist hier normal. Nur notieren, dass es so ist. Den nahtlosen Wechsel baut erst Teleport (`SCHNITTSTELLEN.md` §7).
+- **Rückbau:** Auf beiden Seiten wieder „DHCP“ bzw. „Automatisch“ einstellen, oder die Einstellungen einfach lassen. Sie stören das WLAN nicht.
 
 ---
 
@@ -113,5 +127,9 @@ Die macOS-Version ist experimentell. Ersatz **nur zum Messen**: Parsec (Closed S
 | B5 Ruckler mit AWDL an / aus | |
 | B6 Ping unter Last p95/max | |
 | B7 Gefühl (1–5) | |
+| B8 Kabel: Ping Mac→PC p50/p95/max/Verlust | |
+| B8 Kabel: Moonlight Netzwerklatenz Ø / Schwankung, Drops pro 5 min | |
+| B8 Kabel: Glass-to-Glass Median / max | |
+| B8 Kabel: Text bei HEVC 80 / 150, Gefühl (1–5) | |
 | Ampel | 🟢 / 🟡 / 🔴 |
 | Bemerkungen | |
