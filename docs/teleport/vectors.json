@@ -1,0 +1,30 @@
+{
+  "comment": "Teleport HKDF test vectors (SCHNITTSTELLEN.md \u00a74.2). Hex = bytes on wire.",
+  "link": {
+    "token": "KFX5cT76a4uBbZ-k66SlHbJJiHqvMrPcHqOVZl_v3Mo",
+    "key_id_hex": "7dd820d674da2b465292b2a5456ff756",
+    "prefix_i_hex": "220ca92180d4505b",
+    "prefix_r_hex": "4ed33c9398f8d412",
+    "share_i_hex": "0d5297c17a85a9a09d4bbaaacd973d9a171068c7f108f4169297cd84847dee3b",
+    "share_r_hex": "b6c7450905c00ca9a4a5e6d0ed892c8deea001da3b4c3073963da9ab40e7c608",
+    "shared_hex": "e42730a125f0a5d698205c7263739f082f56ba90bce85a06535f43157190c958",
+    "transcript_t_hex": "067dd820d674da2b465292b2a5456ff756220ca92180d4505b4ed33c9398f8d4120d5297c17a85a9a09d4bbaaacd973d9a171068c7f108f4169297cd84847dee3bb6c7450905c00ca9a4a5e6d0ed892c8deea001da3b4c3073963da9ab40e7c608",
+    "master_hex": "772c916ba9e90a4e2b6d62c2b5d11771ab16808fdd7bd0d6323af5ad1de0804e"
+  },
+  "streams": [
+    {
+      "salt16_hex": "0123456789abcdef0123456789abcdef",
+      "tid": 42,
+      "s2r_key_hex": "b05f3699b24fdc1fa7f14c2aaf5f9495a6ebb46a942834ae88d681518b3b6d67",
+      "s2r_prefix_hex": "c904e3b2",
+      "r2s_key_hex": "187880e13824a13b167eb02536b439cd565229acb4a499030d8606e12b7353ee",
+      "r2s_prefix_hex": "40a6533d",
+      "keys_ipc": {
+        "s2r_key": "sF82mbJP3B+n8Uwqr1+UlabrtGqUKDSuiNaBUYs7bWc=",
+        "s2r_prefix": "yQTjsg==",
+        "r2s_key": "GHiA4TgkoTsWfrAlNrQ5zVZSKay0pJkDDYYG4StzU+4=",
+        "r2s_prefix": "QKZTPQ=="
+      }
+    }
+  ]
+}

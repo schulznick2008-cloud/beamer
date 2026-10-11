@@ -7,7 +7,7 @@ passen dann an. Unklarheiten nicht selbst auflösen, sondern im PR als Frage mel
 Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zeiten sind in µs
 (monotone Uhr des Senders).
 
-Änderungen: v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
+Änderungen: v1.3 – §1: optionale Zusatzfelder in `hello` und `stats` zugelassen (z. B. `low_power`, `encoder_slow`), Python-seitige Ereignisse wie `helper_restarted` abgegrenzt; §4.2: Einmal-Regel für `salt16`/`tid` und Testvektoren nur für Python. v1.2 – §4.1 Frame-Frist bei unvollständigen Frames: `2×RTT + 4×Jitter`, mindestens 60 ms (statt 30 ms), Maximum 250 ms unverändert. v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
 
 ## 0. Begriffe und Komponenten
 
@@ -37,7 +37,7 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 
 | cmd | Felder | Antwort-Felder | Seite |
 |---|---|---|---|
-| `hello` | `beamer_version` | `helper_version`, `platform` (`mac`/`win`), `caps` (Liste aus `send_window`,`send_display`,`recv`,`inject`,`audio`) | beide |
+| `hello` | `beamer_version` | `helper_version`, `platform` (`mac`/`win`), `caps` (Liste aus `send_window`,`send_display`,`recv`,`inject`,`audio`), optional `low_power` (bool, Energiesparmodus des Senders) | beide |
 | `transport.open` | `local_port` (0 = beliebig), `peer_host`, `peer_port` (0 = später) | `local_port` | beide |
 | `transport.peer` | `peer_host`, `peer_port` | – (darf bei laufenden Streams kommen, siehe §7) | beide |
 | `transport.close` | – | – | beide |
@@ -64,8 +64,11 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 | `proxy.closed` | `tid` | Nutzer hat den Proxy geschlossen (bedeutet: zurückholen) |
 | `send.gone` | `tid`, `reason` | Fenster geschlossen bzw. Capture beendet |
 | `send.size` | `tid`, `width`, `height`, `scale` | Stream-Größe hat sich geändert |
-| `stats` | `tid`, `fps`, `kbps`, `rtt_ms`, `loss_pct`, `latency_ms` (geschätzt) | alle 1 s |
+| `stats` | `tid`, `fps`, `kbps`, `rtt_ms`, `loss_pct`, `latency_ms` (geschätzt); dazu optionale Zusatzfelder (siehe unten) | alle 1 s |
 | `error` | `code`, `msg`, optional `tid` | asynchroner Fehler |
+
+- Zusatzfelder (v1.3): Helfer dürfen in Antworten und Ereignissen weitere Felder melden; Python ignoriert unbekannte Felder und verlässt sich nur auf die Felder dieser Tabelle. Dokumentiert werden Zusatzfelder in der README des Helfers (`teleport/mac/README.md`: u. a. `encoder_slow`, `effective_fps`, `low_power`, `backlog_drops`; `teleport/win/README.md`: u. a. `recv_to_present_ms`, `frames_presented`, `dropped_*`). Wird Python von einem Zusatzfeld abhängig (z. B. Codec-Wahl nach `low_power`/`encoder_slow`), wandert es zuerst per Vertrags-PR in diese Tabelle.
+- Python-seitige Ereignisse: `core/teleport_ipc.py` erzeugt selbst `helper_restarted` (`code` = Exit-Code; Helfer nach Absturz neu gestartet, alle Transporte und Streams sind weg und müssen mit **neuen** Schlüsseln neu geöffnet werden) und `error`/`bad_request` bei unlesbaren Zeilen. Sie kommen nie vom Helfer und gehören nicht zum IPC-Draht.
 
 ## 2. Beamer-Link: neue Nachrichten (Python ↔ Python, über den bestehenden verschlüsselten TCP-Link)
 
@@ -128,7 +131,7 @@ Klartext je Typ:
 - **ping/pong**: `t_us` u64 (pong spiegelt das t_us des pings).
 
 Verhalten:
-- Der Empfänger schickt bei Lücken einen NACK. Ist ein Frame nach 2 × RTT (mindestens 30 ms, höchstens 250 ms, gerechnet ab dem letzten Paket des Frames) noch unvollständig, wird er verworfen und ein `keyframe_req` geschickt (höchstens alle 300 ms).
+- Der Empfänger schickt bei Lücken einen NACK. Ist ein Frame nach 2 × RTT + 4 × Jitter (mindestens 60 ms, höchstens 250 ms, gerechnet ab dem letzten Paket des Frames) noch unvollständig, wird er verworfen und ein `keyframe_req` geschickt (höchstens alle 300 ms).
 - Der Sender hält einen Puffer zum erneuten Senden von 300 ms.
 - Bitratenregelung (Sender, v1.1/C01a): Zielbitrate um 15 % pro Sekunde senken bei **Restverlust** `loss_permille` > 10 (1 %), bei **Rohverlust** `raw_loss_permille` > 80 (8 %, Notbremse) oder bei steigendem Jitter (zwei Anstiege in Folge um je ≥ 15 % und ≥ 2 ms). Sonst um 5 % pro Sekunde anheben, bis zur Obergrenze (`bitrate_kbps`, `bt_set_max_kbps`). Untergrenze: Obergrenze/20, mindestens 200 kbit/s. Grund: FEC und NACK heilen Verluste unterhalb dieser Schwellen, eine Drosselung nach Rohverlust würde nur Qualität kosten.
 - Pacing (Sender): Token-Bucket mit 1,5 × Zielbitrate, Burst höchstens 64 KB; Wiederholungen und Steuerpakete laufen durch denselben Bucket. Die Sendewarteschlange ist zeitlich begrenzt: Liegt die Wartezeit der bereits wartenden Pakete bei aktueller Bucket-Rate über 150 ms, lehnt `bt_send_frame` mit einem Fehler ab (der Encoder soll das Frame auslassen); darunter wird auch ein einzelnes großes Keyframe angenommen.
@@ -149,7 +152,8 @@ Ableitung (Python, `core/teleport_keys.py`, HKDF-SHA256 wie `protocol.hkdf_sha25
   - `r2s_key = HKDF(master, salt16 + sid, b"tp-key-r2s")`
   - `s2r_prefix = HKDF(master, salt16 + sid, b"tp-pfx-s2r")[:4]`
   - `r2s_prefix = HKDF(master, salt16 + sid, b"tp-pfx-r2s")[:4]`
-- Testvektoren legt Cursor in `docs/teleport/vectors.json` ab.
+- Einmal-Regel (v1.3): `salt16` ist pro Teleport frisch zufällig; ein Paar (`salt16`, `tid`) wird je Master höchstens einmal abgeleitet. Weil alle vier Werte aus demselben Paar entstehen, schützt das beide Richtungen (s2r und r2s) vor Nonce-Wiederverwendung; eine eigene r2s-Sperre ist nicht nötig. Die Sperre in `bt_add_stream` (§5) ist nur das zweite Netz.
+- Testvektoren legt Cursor in `docs/teleport/vectors.json` ab. Sie gelten nur für Python: Die Helfer leiten nichts ab, sie bekommen fertige Schlüssel (deshalb keine Rust-Prüfung der Vektoren).
 
 ## 5. Rust-API `beamer-transport` (C-ABI, Header per cbindgen: `teleport/transport/include/beamer_transport.h`)
 

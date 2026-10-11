@@ -95,6 +95,21 @@ pub struct Counters {
     pub frames_complete: u64,
     pub frames_delivered: u64,
     pub frames_dropped: u64,
+    /// Aufschluesselung von `frames_dropped` (Summe = frames_dropped):
+    /// Video-Frame nach der Frist (2 x RTT bzw. 250 ms Hoechstalter) noch unvollstaendig.
+    pub dropped_incomplete: u64,
+    /// Zu viele offene bzw. fertige, aber blockierte Frames (MAX_OPEN_FRAMES).
+    pub dropped_overflow: u64,
+    /// Fertige Frames, die nach einer Luecke bis zum naechsten Keyframe nicht ausgeliefert wurden.
+    pub dropped_gap: u64,
+    /// Audio-Frames (Frist oder Ueberlauf).
+    pub dropped_audio: u64,
+    /// Pakete fuer Frames, die schon verworfen bzw. uebersprungen waren (kamen zu spaet).
+    pub late_packets: u64,
+    /// Wie oft der Empfang auf "bis zum Keyframe warten" ging: Frame unvollstaendig abgelaufen ...
+    pub gaps_incomplete: u64,
+    /// ... bzw. ein Frame kam innerhalb der Frist gar nicht (Reihenfolge blockiert).
+    pub gaps_blocked: u64,
     pub retransmits: u64,
     pub nacks_sent: u64,
     pub nack_seqs_sent: u64,
@@ -219,6 +234,8 @@ pub struct Stream {
     audio: BTreeMap<u32, Asm>,
     completed: BTreeMap<u32, Done>,
     floor: Option<u32>,
+    /// Zuletzt verworfene Video-frame_ids (nur fuer den Zaehler `late_packets`).
+    dropped_ids: std::collections::VecDeque<u32>,
     broken: bool,
     broken_since: Option<Instant>,
     blocked_since: Option<Instant>,
@@ -303,6 +320,7 @@ impl Stream {
             audio: BTreeMap::new(),
             completed: BTreeMap::new(),
             floor: None,
+            dropped_ids: std::collections::VecDeque::new(),
             broken: true,
             broken_since: None,
             blocked_since: None,
@@ -814,6 +832,9 @@ impl Stream {
         if video {
             self.first_media.get_or_insert(now);
             if !self.accepts(m.frame_id) || self.completed.contains_key(&m.frame_id) {
+                if self.dropped_ids.contains(&m.frame_id) {
+                    self.c.late_packets += 1;
+                }
                 return true; // spaeter Nachzuegler, unauffaellig
             }
             if self.broken_since.is_none() && self.broken {
@@ -829,6 +850,16 @@ impl Stream {
             let oldest = *map.keys().next().unwrap();
             map.remove(&oldest);
             self.c.frames_dropped += 1;
+            if video {
+                self.c.dropped_overflow += 1;
+                // map leiht self.video; dropped_ids direkt (disjunktes Feld) statt note_dropped.
+                if self.dropped_ids.len() >= 64 {
+                    self.dropped_ids.pop_front();
+                }
+                self.dropped_ids.push_back(oldest);
+            } else {
+                self.c.dropped_audio += 1;
+            }
         }
         let new_frame = map.get(&m.frame_id).is_none_or(|a| a.cnt == 0);
         let a = map.entry(m.frame_id).or_insert_with(|| Asm {
@@ -887,12 +918,17 @@ impl Stream {
             return false;
         }
         if !self.accepts(fh.frame_id) || self.completed.contains_key(&fh.frame_id) {
+            if self.dropped_ids.contains(&fh.frame_id) {
+                self.c.late_packets += 1;
+            }
             return true;
         }
         if !self.video.contains_key(&fh.frame_id) && self.video.len() >= MAX_OPEN_FRAMES {
             let oldest = *self.video.keys().next().unwrap();
             self.video.remove(&oldest);
             self.c.frames_dropped += 1;
+            self.c.dropped_overflow += 1;
+            self.note_dropped(oldest);
         }
         let a = self.video.entry(fh.frame_id).or_insert_with(|| Asm {
             cnt: 0,
@@ -984,6 +1020,8 @@ impl Stream {
                 let k = *self.completed.keys().next().unwrap();
                 self.completed.remove(&k);
                 self.c.frames_dropped += 1;
+                self.c.dropped_overflow += 1;
+                self.note_dropped(k);
             }
             self.drain(now, io);
         } else {
@@ -1025,6 +1063,8 @@ impl Stream {
                 for o in older {
                     self.completed.remove(&o);
                     self.c.frames_dropped += 1;
+                    self.c.dropped_gap += 1;
+                    self.note_dropped(o);
                 }
                 let d = self.completed.remove(&k).unwrap();
                 self.deliver(now, 1, k, d, io);
@@ -1061,6 +1101,13 @@ impl Stream {
         self.c.keyframe_reqs_sent += 1;
         self.packet(now, T_KEYFRAME_REQ, &[], false, io);
         true
+    }
+
+    fn note_dropped(&mut self, frame_id: u32) {
+        if self.dropped_ids.len() >= 64 {
+            self.dropped_ids.pop_front();
+        }
+        self.dropped_ids.push_back(frame_id);
     }
 
     fn go_broken(&mut self, now: Instant, io: &mut Io) {
@@ -1105,9 +1152,13 @@ impl Stream {
             .map(|(k, _)| *k)
             .collect();
         let mut lost = false;
+        let mut incomplete = false;
         for k in expired {
             self.video.remove(&k);
             self.c.frames_dropped += 1;
+            self.c.dropped_incomplete += 1;
+            self.note_dropped(k);
+            incomplete = true;
             let nf = k.wrapping_add(1);
             if self.floor.is_none_or(|f| id_ge(nf, f)) {
                 self.floor = Some(nf);
@@ -1123,13 +1174,23 @@ impl Stream {
         for k in expired_a {
             self.audio.remove(&k);
             self.c.frames_dropped += 1;
+            self.c.dropped_audio += 1;
         }
         // Wartet die Reihenfolge auf einen Frame, der nie kommt?
+        let mut blocked = false;
         if !self.broken {
             if let Some(b) = self.blocked_since {
                 if now.saturating_duration_since(b) > deadline {
                     lost = true;
+                    blocked = true;
                 }
+            }
+        }
+        if lost && !self.broken {
+            if incomplete {
+                self.c.gaps_incomplete += 1;
+            } else if blocked {
+                self.c.gaps_blocked += 1;
             }
         }
         if lost {
@@ -1323,7 +1384,7 @@ impl Stream {
         let json = format!(
             "{{\"fps\":{:.1},\"kbps\":{:.0},\"rtt_ms\":{:.1},\"loss_pct\":{:.1},\"latency_ms\":{:.1},\
 \"role\":\"{}\",\"target_kbps\":{},\"jitter_ms\":{:.2},\"frames_complete\":{},\"frames_delivered\":{},\
-\"frames_dropped\":{},\"retransmits\":{},\"nacks\":{},\"fec_recovered\":{},\"auth_fail\":{},\"peer_recv_kbps\":{},\"resid_loss_pct\":{:.1},\"peer\":\"{}\",\"sock_rcvbuf\":{},\"sock_sndbuf\":{},\"pace_queue_bytes\":{},\"pace_queue_ms\":{:.0}}}",
+\"frames_dropped\":{},\"dropped_incomplete\":{},\"dropped_overflow\":{},\"dropped_gap\":{},\"dropped_audio\":{},\"late_packets\":{},\"gaps_incomplete\":{},\"gaps_blocked\":{},\"retransmits\":{},\"nacks\":{},\"fec_recovered\":{},\"auth_fail\":{},\"peer_recv_kbps\":{},\"resid_loss_pct\":{:.1},\"peer\":\"{}\",\"sock_rcvbuf\":{},\"sock_sndbuf\":{},\"pace_queue_bytes\":{},\"pace_queue_ms\":{:.0}}}",
             fps,
             kbps,
             rtt,
@@ -1335,6 +1396,13 @@ impl Stream {
             self.c.frames_complete,
             self.c.frames_delivered,
             self.c.frames_dropped,
+            self.c.dropped_incomplete,
+            self.c.dropped_overflow,
+            self.c.dropped_gap,
+            self.c.dropped_audio,
+            self.c.late_packets,
+            self.c.gaps_incomplete,
+            self.c.gaps_blocked,
             self.c.retransmits,
             self.c.nacks_sent,
             self.c.fec_recovered,
