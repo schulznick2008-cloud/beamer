@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 
 use windows::core::{Interface, Result, BOOL};
-use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, RECT};
+use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, RECT, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
@@ -297,7 +297,14 @@ impl Presenter {
         Ok(())
     }
 
+    /// Ist ein Platz in der Present-Queue frei (hoechstens `wait_ms` warten)? Bei `true` ist der Platz belegt und
+    /// der Aufrufer muss als Naechstes `present` rufen (Frame-Latency-Waitable-Object, Latenz 1).
+    pub fn try_acquire(&self, wait_ms: u32) -> bool {
+        unsafe { WaitForSingleObjectEx(self.waitable, wait_ms, false) == WAIT_OBJECT_0 }
+    }
+
     /// Skaliert `tex[slice]` (Ausschnitt `src` Pixel) in den Backbuffer und praesentiert sofort.
+    /// Vorher `try_acquire`, sonst kann `Present` bis zu einem Bildschirm-Refresh blockieren.
     pub fn present(
         &mut self,
         gpu: &Gpu,
@@ -331,8 +338,6 @@ impl Presenter {
         }
         let input = vp.in_views.get(&key).cloned();
         unsafe {
-            // Nicht ewig warten: haengt die Queue, lieber verspaetet praesentieren als blockieren.
-            WaitForSingleObjectEx(self.waitable, 100, true);
             let stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
                 OutputIndex: 0,

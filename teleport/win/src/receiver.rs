@@ -90,6 +90,9 @@ pub struct Config {
     pub session: SessionSlot,
     /// Sender und Empfaenger teilen die Uhr (Selbsttest auf einem Rechner): Alter des Bildes messen.
     pub same_clock: bool,
+    /// Nur fuer Vergleichsmessungen: jedes Bild zeigen und blockierend auf die Present-Queue warten
+    /// (Verhalten vor dem Jitter-Puffer).
+    pub present_all: bool,
 }
 
 /// Thread starten. Kehrt zurueck, sobald GPU, Swapchain und Decoder stehen (oder mit dem Fehler).
@@ -128,11 +131,29 @@ pub fn spawn(cfg: Config) -> Result<Handle, String> {
     }
 }
 
+/// Dekodiert, wartet auf einen freien Platz in der Present-Queue.
+struct Ready {
+    d: Decoded,
+    t_recv: Instant,
+    t_decoded: Instant,
+    pts_us: u64,
+}
+
+/// Wartet ein Bild laenger, wird ohne freien Platz praesentiert (Fenster verdeckt, DWM haengt).
+const MAX_PRESENT_WAIT: Duration = Duration::from_millis(100);
+/// So lange wird je Durchlauf hoechstens auf einen freien Platz in der Present-Queue gewartet.
+const PRESENT_WAIT_MS: u32 = 4;
+
 struct State {
     gpu: Gpu,
     presenter: Presenter,
     decoder: Decoder,
+    /// Zuletzt gezeigtes Bild (fuer Neuzeichnen nach Groessenaenderung).
     last: Option<Decoded>,
+    /// Jitter-Puffer mit hoechstens einem Bild: das neueste dekodierte, noch nicht gezeigte.
+    ready: Option<Ready>,
+    /// Letztes Bild nach Groessenaenderung erneut zeigen.
+    redraw: bool,
     /// Nach Fehler oder Luecke: nichts anzeigen bis zum naechsten Keyframe.
     waiting_key: bool,
     last_frame_id: Option<u32>,
@@ -169,6 +190,8 @@ fn run(
             presenter,
             decoder,
             last: None,
+            ready: None,
+            redraw: false,
             waiting_key: true,
             last_frame_id: None,
         })
@@ -186,7 +209,13 @@ fn run(
     };
     let mut pending: Vec<FrameIn> = Vec::new();
     loop {
-        let msg = match rx.recv_timeout(Duration::from_millis(50)) {
+        // Wartet ein Bild auf die Present-Queue, kurz schlafen und erneut pruefen.
+        let wait = if st.ready.is_some() || st.redraw {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(50)
+        };
+        let msg = match rx.recv_timeout(wait) {
             Ok(m) => Some(m),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -211,6 +240,9 @@ fn run(
                 }
                 for f in pending.drain(..) {
                     handle_frame(f, &mut st, &cfg, &shared);
+                    if cfg.present_all {
+                        present_if_possible(&mut st, &cfg, &shared);
+                    }
                 }
             }
             None => {}
@@ -221,11 +253,63 @@ fn run(
                 eprintln!("beamer-teleport: tid {} ResizeBuffers: {e}", cfg.tid);
             }
             // Letztes gutes Bild in neuer Groesse zeigen.
-            if let Some(d) = st.last.as_ref() {
-                let _ = st
-                    .presenter
-                    .present(&st.gpu, d.texture(), d.slice(), d.size());
+            st.redraw = st.last.is_some();
+        }
+        present_if_possible(&mut st, &cfg, &shared);
+    }
+}
+
+/// Neuestes Bild zeigen, sobald die Present-Queue frei ist (nie blockierend warten).
+fn present_if_possible(st: &mut State, cfg: &Config, shared: &Shared) {
+    if st.ready.is_none() && !st.redraw {
+        return;
+    }
+    let overdue = st
+        .ready
+        .as_ref()
+        .is_some_and(|r| r.t_decoded.elapsed() > MAX_PRESENT_WAIT);
+    // Kurz direkt auf den Platz warten (meist sofort frei); sonst zurueck in die Schleife, damit
+    // neue Frames nicht liegen bleiben.
+    let wait = if cfg.present_all {
+        100
+    } else {
+        PRESENT_WAIT_MS
+    };
+    if !st.presenter.try_acquire(wait) && !overdue && !cfg.present_all {
+        return;
+    }
+    if let Some(r) = st.ready.take() {
+        st.redraw = false;
+        let t0 = Instant::now();
+        if let Err(e) = st
+            .presenter
+            .present(&st.gpu, r.d.texture(), r.d.slice(), r.d.size())
+        {
+            eprintln!("beamer-teleport: tid {} Present: {e}", cfg.tid);
+            st.last = Some(r.d);
+            return;
+        }
+        let t1 = Instant::now();
+        let mut w = shared.stats.lock().unwrap();
+        w.present_ms.push((t1 - t0).as_secs_f64() * 1000.0);
+        w.queue_ms.push((t0 - r.t_decoded).as_secs_f64() * 1000.0);
+        w.recv_to_present_ms
+            .push((t1 - r.t_recv).as_secs_f64() * 1000.0);
+        if cfg.same_clock {
+            let now = clock::now_us();
+            if now >= r.pts_us {
+                w.pts_age_ms.push((now - r.pts_us) as f64 / 1000.0);
             }
+        }
+        w.presented += 1;
+        drop(w);
+        st.last = Some(r.d);
+    } else if st.redraw {
+        st.redraw = false;
+        if let Some(d) = st.last.as_ref() {
+            let _ = st
+                .presenter
+                .present(&st.gpu, d.texture(), d.slice(), d.size());
         }
     }
 }
@@ -234,6 +318,7 @@ fn run(
 fn catch_up(pending: &mut Vec<FrameIn>, st: &mut State, cfg: &Config, shared: &Shared) {
     let n = pending.len();
     let mut w = shared.stats.lock().unwrap();
+    w.catchups += 1;
     match pending.iter().rposition(FrameIn::is_key) {
         Some(k) => {
             w.skipped += k as u64;
@@ -305,27 +390,18 @@ fn handle_frame(f: FrameIn, st: &mut State, cfg: &Config, shared: &Shared) {
         }
     };
     st.waiting_key = false;
-    if let Err(e) = st
-        .presenter
-        .present(&st.gpu, d.texture(), d.slice(), d.size())
-    {
-        eprintln!("beamer-teleport: tid {} Present: {e}", cfg.tid);
-        st.last = Some(d);
-        return;
-    }
-    let t2 = Instant::now();
     let mut w = shared.stats.lock().unwrap();
     w.decode_ms.push((t1 - t0).as_secs_f64() * 1000.0);
-    w.present_ms.push((t2 - t1).as_secs_f64() * 1000.0);
-    w.recv_to_present_ms
-        .push((t2 - f.t_recv).as_secs_f64() * 1000.0);
-    if cfg.same_clock {
-        let now = clock::now_us();
-        if now >= f.pts_us {
-            w.pts_age_ms.push((now - f.pts_us) as f64 / 1000.0);
-        }
+    // Ein noch nicht gezeigtes aelteres Bild wird ersetzt: nach einem Schwung (WLAN-Aussetzer)
+    // springt die Anzeige auf das neueste Bild, statt jedes einzeln einen Refresh lang zu zeigen.
+    if st.ready.is_some() {
+        w.superseded += 1;
     }
-    w.presented += 1;
     drop(w);
-    st.last = Some(d);
+    st.ready = Some(Ready {
+        d,
+        t_recv: f.t_recv,
+        t_decoded: t1,
+        pts_us: f.pts_us,
+    });
 }

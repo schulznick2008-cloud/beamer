@@ -9,7 +9,7 @@ use std::io::BufRead;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use beamer_transport::{Callbacks, Role, Session};
+use beamer_transport::{Callbacks, NetemConfig, Role, Session};
 use serde_json::{json, Value};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -39,8 +39,40 @@ struct Recv {
 
 pub struct Options {
     pub same_clock: bool,
-    /// Nur fuer Tests: kuenstlicher Paketverlust (%) auf der Empfangsseite des Transports.
-    pub test_loss_pct: f64,
+    /// Nur Tests: Jitter-Puffer aus (jedes Bild zeigen, blockierend warten).
+    pub present_all: bool,
+    /// Nur fuer Tests: kuenstliche Netzstoerung auf der Empfangsseite des Transports.
+    pub test_netem: Option<NetemConfig>,
+}
+
+/// `--test-netem "loss=2,delay=5,jitter=3,stall=40,stall_every=1500,reorder=1,seed=7"` (alle optional).
+pub fn parse_netem(spec: &str) -> Result<NetemConfig, String> {
+    let mut c = NetemConfig {
+        seed: 7,
+        ..Default::default()
+    };
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (k, v) = part
+            .split_once('=')
+            .ok_or_else(|| format!("netem: {part} ist nicht schluessel=wert"))?;
+        let x: f64 = v
+            .parse()
+            .map_err(|_| format!("netem: {v} ist keine Zahl"))?;
+        if !x.is_finite() || x < 0.0 {
+            return Err(format!("netem: {k} muss >= 0 sein"));
+        }
+        match k {
+            "loss" => c.loss_pct = x,
+            "delay" => c.delay_ms = x,
+            "jitter" => c.jitter_ms = x,
+            "reorder" => c.reorder_pct = x,
+            "stall" => c.stall_ms = x,
+            "stall_every" => c.stall_every_ms = x,
+            "seed" => c.seed = x as u64,
+            _ => return Err(format!("netem: unbekannt {k}")),
+        }
+    }
+    Ok(c)
 }
 
 pub struct App {
@@ -282,16 +314,9 @@ impl App {
                 eprintln!("beamer-teleport: tid {tid} add_stream: {e}");
             }
         }
-        if self.opts.test_loss_pct > 0.0 {
-            eprintln!(
-                "beamer-teleport: TEST: {} % kuenstlicher Paketverlust",
-                self.opts.test_loss_pct
-            );
-            s.set_netem(beamer_transport::NetemConfig {
-                loss_pct: self.opts.test_loss_pct,
-                seed: 7,
-                ..Default::default()
-            });
+        if let Some(n) = &self.opts.test_netem {
+            eprintln!("beamer-teleport: TEST: kuenstliche Netzstoerung {n:?}");
+            s.set_netem(n.clone());
         }
         let port = s.local_port();
         *lock(&self.slot) = Some(s.clone());
@@ -336,6 +361,7 @@ impl App {
             win: win.shared.clone(),
             session: self.slot.clone(),
             same_clock: self.opts.same_clock,
+            present_all: self.opts.present_all,
         }) {
             Ok(h) => h,
             Err(e) => {
@@ -385,5 +411,24 @@ impl App {
             self.teardown(t);
         }
         self.transport_close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_netem;
+
+    #[test]
+    fn netem_spec() {
+        let c = parse_netem("loss=2.5, delay=5,stall=40,stall_every=1500").unwrap();
+        assert_eq!(
+            (c.loss_pct, c.delay_ms, c.stall_ms, c.stall_every_ms),
+            (2.5, 5.0, 40.0, 1500.0)
+        );
+        assert_eq!(c.seed, 7);
+        assert!(parse_netem("loss").is_err());
+        assert!(parse_netem("loss=-1").is_err());
+        assert!(parse_netem("foo=1").is_err());
+        assert!(parse_netem("").unwrap().is_off());
     }
 }

@@ -33,6 +33,17 @@ pub fn test_keys(tid: u32) -> StreamKeys {
     }
 }
 
+/// Feste Testschluessel des Mac-Senders (`tools/teleport/send_demo.py`, `StreamKeys.testOnly`).
+/// NUR fuer Tests, Begruendung wie bei `test_keys`.
+pub fn mac_test_keys() -> StreamKeys {
+    StreamKeys {
+        s2r_key: [0x11; 32],
+        s2r_prefix: [0xA1, 0xA2, 0xA3, 0xA4],
+        r2s_key: [0x22; 32],
+        r2s_prefix: [0xB1, 0xB2, 0xB3, 0xB4],
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Opts {
     pub host: String,
@@ -47,6 +58,8 @@ pub struct Opts {
     /// Encoder erzwingen (z. B. `h264_amf`, `libopenh264`).
     pub encoder: Option<String>,
     pub local_port: u16,
+    /// Testschluessel des Mac-Senders (`send_demo.py`) statt `test_keys(tid)`: simuliert den Mac.
+    pub mac_keys: bool,
 }
 
 impl Default for Opts {
@@ -63,6 +76,7 @@ impl Default for Opts {
             secs: 0.0,
             encoder: None,
             local_port: 0,
+            mac_keys: false,
         }
     }
 }
@@ -83,6 +97,7 @@ pub fn parse_args(a: &[String]) -> Result<Opts, String> {
             "--kbps" => o.kbps = val()?.parse().map_err(|_| "kbps ungueltig")?,
             "--secs" => o.secs = val()?.parse().map_err(|_| "secs ungueltig")?,
             "--local-port" => o.local_port = val()?.parse().map_err(|_| "local-port ungueltig")?,
+            "--mac-test-keys" => o.mac_keys = true,
             "--encoder" => o.encoder = Some(val()?),
             "--codec" => {
                 let c = val()?;
@@ -485,7 +500,16 @@ pub fn run(o: &Opts, stop: Arc<AtomicBool>) -> Result<Report, String> {
         },
     )?;
     session.set_peer(&o.host, o.port)?;
-    session.add_stream(o.tid, Role::Sender, &test_keys(o.tid), o.kbps.max(1000) * 2)?;
+    session.add_stream(
+        o.tid,
+        Role::Sender,
+        &if o.mac_keys {
+            mac_test_keys()
+        } else {
+            test_keys(o.tid)
+        },
+        o.kbps.max(1000) * 2,
+    )?;
     let mut enc = Encoder::open(o)?;
     eprintln!(
         "beamer-teleport: Selbsttest sendet tid {} {}x{}@{} {} {} kbit/s an {}:{}",
