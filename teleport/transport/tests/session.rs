@@ -452,54 +452,7 @@ fn fec_repairs_single_loss_per_group() {
     );
 }
 
-#[test]
-fn bitrate_drops_at_20_percent_loss() {
-    let l = link(8000);
-    l.rx.set_netem(NetemConfig {
-        loss_pct: 20.0,
-        seed: 7,
-        ..Default::default()
-    });
-    assert_eq!(l.tx.target_kbps(SID), 8000);
-    // Kriterium: innerhalb von 3 s um mindestens 30 % runter. Gemessen wird, wann die Zielbitrate zum
-    // ersten Mal <= 70 % ist. Die Regel selbst senkt mit 15 %/s, es bleiben also nur ~0,8 s fuer Anlauf,
-    // erstes Feedback und Verlusterkennung; auf den langsamen virtuellen CI-Runnern (Umgebungsvariable CI)
-    // kommt eine Sekunde Toleranz dazu, lokal gilt die strenge Grenze.
-    let limit = if std::env::var("CI").is_ok() {
-        4.0
-    } else {
-        3.0
-    };
-    let start = Instant::now();
-    let mut i = 0u64;
-    let mut reached = None;
-    while start.elapsed().as_secs_f64() < limit + 0.3 {
-        l.tx.send_frame(
-            SID,
-            1,
-            &blob(5000, i as usize),
-            i * 16_666,
-            if i.is_multiple_of(120) { 1 } else { 0 },
-        )
-        .unwrap();
-        i += 1;
-        if reached.is_none() && l.tx.target_kbps(SID) <= 5600 {
-            reached = Some(start.elapsed().as_secs_f64());
-        }
-        std::thread::sleep(Duration::from_millis(16));
-    }
-    eprintln!(
-        "target_kbps nach {:.1} s bei 20 % Verlust: {} von 8000 (<= 5600 erreicht nach {:?} s)",
-        start.elapsed().as_secs_f64(),
-        l.tx.target_kbps(SID),
-        reached
-    );
-    let r = reached.expect("Zielbitrate nie auf 70 % gesunken");
-    assert!(
-        r <= limit,
-        "mindestens 30 % Absenkung innerhalb von {limit} s erwartet, erreicht nach {r:.2} s"
-    );
-}
+// bitrate_drops_at_20_percent_loss: nach tests/streams.rs verschoben (simulierte Uhr, deterministisch).
 
 #[test]
 fn bitrate_recovers_without_loss() {

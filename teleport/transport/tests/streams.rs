@@ -558,16 +558,20 @@ fn max_field(stats: &[String], key: &str) -> f64 {
         .fold(0.0, f64::max)
 }
 
-struct ReorderRun {
+struct SimRun {
     raw_rx: f64,
     raw_tx: f64,
     target: u32,
     delivered: u64,
+    /// Erster Zeitpunkt (ms), zu dem die Zielbitrate <= 70 % des Maximums war.
+    below_70: Option<u64>,
 }
 
-/// 4,5 s, 60 fps, 5000 Byte je Frame, Hinrichtung mit 0..10 ms zufaelliger Verzoegerung (Umordnung,
-/// kein Verlust), Rueckrichtung ohne Stoerung. Simulierte Uhr in 1-ms-Schritten, fester Seed.
-fn reorder_run(fec: bool, seed: u64) -> ReorderRun {
+/// Simulierte Strecke: 60 fps, 5000 Byte je Frame, Maximum 8000 kbit/s. Hinrichtung mit
+/// 0..`jitter_ms` zufaelliger Verzoegerung und `loss_pct` Verlust, Rueckrichtung ohne Stoerung
+/// (wie `set_netem` auf dem Empfaenger). Simulierte Uhr in 1-ms-Schritten, fester Seed: keine Sockets,
+/// keine Wall-Clock, auf jedem Runner gleich.
+fn sim_run(fec: bool, seed: u64, jitter_ms: f64, loss_pct: f64, total_ms: u64) -> SimRun {
     use beamer_transport::netem::Rng;
     use beamer_transport::stream::TickInfo;
     let mut p = pair(fec);
@@ -579,9 +583,11 @@ fn reorder_run(fec: bool, seed: u64) -> ReorderRun {
     let (mut rx_stats, mut tx_stats) = (Vec::new(), Vec::new());
     let mut order = 0u64;
     let mut frame = 0u64;
-    let jitter =
-        |rng: &mut Rng, now: Instant| now + Duration::from_secs_f64(rng.next_f64() * 0.010);
-    for ms in 0..4500u64 {
+    let mut below_70 = None;
+    let jitter = |rng: &mut Rng, now: Instant| {
+        now + Duration::from_secs_f64(rng.next_f64() * jitter_ms / 1000.0)
+    };
+    for ms in 0..total_ms {
         let now = t0 + Duration::from_millis(ms);
         let mut io = Io::default();
         if ms % 16 == 0 {
@@ -601,8 +607,14 @@ fn reorder_run(fec: bool, seed: u64) -> ReorderRun {
             p.tx.receive(now, &d, &h, &mut io);
         }
         for d in io.out.drain(..) {
+            if loss_pct > 0.0 && rng.next_f64() * 100.0 < loss_pct {
+                continue;
+            }
             order += 1;
             to_rx.push((jitter(&mut rng, now), order, d));
+        }
+        if below_70.is_none() && p.tx.target_kbps() <= 5600 {
+            below_70 = Some(ms);
         }
         for e in io.events.drain(..) {
             if let Event::Stats { json, .. } = e {
@@ -626,11 +638,12 @@ fn reorder_run(fec: bool, seed: u64) -> ReorderRun {
         }
     }
     assert!(rx_stats.len() >= 3 && tx_stats.len() >= 3);
-    ReorderRun {
+    SimRun {
         raw_rx: max_field(&rx_stats, "loss_pct"),
         raw_tx: max_field(&tx_stats, "loss_pct"),
         target: p.tx.target_kbps(),
         delivered: p.rx.c.frames_delivered,
+        below_70,
     }
 }
 
@@ -641,7 +654,7 @@ fn reordering_without_loss_is_not_raw_loss() {
     // tests/session.rs; mehrere Seeds decken verschiedene Umordnungsmuster ab.
     for fec in [true, false] {
         for seed in 1..=4 {
-            let r = reorder_run(fec, seed);
+            let r = sim_run(fec, seed, 10.0, 0.0, 4500);
             assert!(
                 r.raw_rx < 1.0 && r.raw_tx < 1.0,
                 "FEC {fec}, Seed {seed}: Umordnung zaehlt als Verlust: {} / {}",
@@ -659,5 +672,26 @@ fn reordering_without_loss_is_not_raw_loss() {
                 r.delivered
             );
         }
+    }
+}
+
+#[test]
+fn bitrate_drops_at_20_percent_loss() {
+    // Kriterium: bei 20 % Verlust innerhalb von 3 s um mindestens 30 % runter (Regel: -15 %/s bei
+    // Restverlust > 1 % bzw. Rohverlust > 8 %). Deterministisch statt Sockets und Wall-Clock wie frueher
+    // in tests/session.rs (dort auf langsamen CI-Runnern gelegentlich rot).
+    for seed in 1..=4 {
+        let r = sim_run(true, seed, 0.0, 20.0, 3300);
+        let at = r.below_70.unwrap_or_else(|| {
+            panic!(
+                "Seed {seed}: Zielbitrate nie auf 70 % gesunken ({})",
+                r.target
+            )
+        });
+        eprintln!("Seed {seed}: <= 70 % nach {at} ms");
+        assert!(
+            at <= 3000,
+            "Seed {seed}: mindestens 30 % Absenkung innerhalb von 3 s erwartet, erreicht nach {at} ms"
+        );
     }
 }
