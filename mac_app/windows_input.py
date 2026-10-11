@@ -24,6 +24,7 @@ import no_unlock
 from core import protocol
 from core import peerlist
 from core import receiver
+from core import settings_sync
 from core.receiver import LinkResponder, ServerState
 
 LOGGER = logging.getLogger("Beamer")
@@ -92,6 +93,7 @@ class WindowsInput:
         return any("settings" in caps for caps in known) if known else None
 
     def sync(self, cfg) -> None:
+        self._controller.crossing_displays_changed()
         speeds = (cfg.pointer_speed, cfg.scroll_speed, cfg.reverse_scroll)
         if self.server.input_scale is None or speeds != self._speeds:
             self._speeds = speeds
@@ -161,7 +163,7 @@ class WindowsInput:
             caps = self.server.caps_of(peer)
             if protocol.id_text(peer) == source or caps is None or "settings" not in caps or self._outbound_up(peer):
                 continue
-            sent = self.server.send(peer, protocol.settings_msg(data)) or sent
+            sent = self.server.send(peer, protocol.settings_msg(settings_sync.for_capabilities(data, caps))) or sent
         return sent
 
     def _announce(self, peer: bytes):
@@ -175,17 +177,19 @@ class WindowsInput:
         if entry is None:
             return []
         messages = []
-        if entry.get("port") != 0 and entry.get("side") in crossing.EDGES:
-            by = protocol.read_id(entry.get("side_by")) or bytes(self._controller.identity()["id"])
-            messages.append(protocol.arrangement_v6(entry["side"], entry.get("side_set_at", 0), by,
-                                                    way_back=self._controller.way_back(text),
-                                                    way_back_by=protocol.read_id(self._controller.way_back_by(text))))
-        caps = self.server.caps_of(peer) or frozenset()
-        if entry.get("port") != 0 and "settings" in caps:
-            messages += [m for m in self._controller.announce() if m.get("type") == protocol.MSG_SETTINGS]
         if entry.get("send") is True:
-            ids = [protocol.read_id(item.get("id")) for item in self._controller.book.peers() if item.get("id") != text]
-            messages.append(protocol.paired_msg([ident for ident in ids if ident is not None][:protocol.MAX_PEERS]))
+            ids = [protocol.read_id(ident) for ident in peerlist.paired_ids(
+                self._controller.book.peers(), exclude=text)]
+            messages.append(protocol.paired_msg(ids))
+        for message in messages:
+            self.server.send(peer, message)
+        messages = []
+        if entry.get("port") != 0:
+            self._controller.crossing_link_up(text)
+        caps = self.server.caps_of(peer) or frozenset()
+        if entry.get("port") != 0 and "settings" in caps and "layout" not in caps:
+            messages += [dict(m, data=settings_sync.for_capabilities(m.get("data", {}), caps))
+                         for m in self._controller.announce() if m.get("type") == protocol.MSG_SETTINGS]
         return messages
 
     def _on_arrangement(self, peer, read) -> None:

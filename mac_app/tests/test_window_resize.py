@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from mac_app.tests.test_window_geometry import offscreen_control_window, kvm_bridge_app
+from mac_app.tests.design_offscreen import offscreen_control_window, kvm_bridge_app, settle
 
 AppKit = kvm_bridge_app.AppKit
 widgets = kvm_bridge_app.widgets
@@ -24,13 +24,6 @@ def measured_stack(vertical=True, spacing=10.0):
     view.setAlignment_(AppKit.NSLayoutAttributeLeading if vertical else AppKit.NSLayoutAttributeCenterY)
     view.setDistribution_(AppKit.NSStackViewDistributionFill)
     return view
-
-
-def settle(window):
-    from Foundation import NSDate, NSRunLoop
-    window.contentView().layoutSubtreeIfNeeded()
-    NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.01))
-    window.contentView().layoutSubtreeIfNeeded()
 
 
 class WindowResizeTests(unittest.TestCase):
@@ -81,7 +74,7 @@ class WindowResizeTests(unittest.TestCase):
             control = offscreen_control_window()
         control._select_page("crossing")
         window = control.window
-        previous = control.ways_pair.orientation()
+        previous = tuple(pair.orientation() for pair in control.side_by_side)
         flips = 0
         ambiguous = 0
         MeasuredStack.passes = 0
@@ -89,12 +82,12 @@ class WindowResizeTests(unittest.TestCase):
         for index, width in enumerate(widths):
             window.setFrame_display_(((100000 + index, 100000 + index), (width, 800)), False)
             settle(window)
-            orientation = control.ways_pair.orientation()
+            orientation = tuple(pair.orientation() for pair in control.side_by_side)
             flips += orientation != previous
             previous = orientation
             self.assertAlmostEqual(window.frame().size.width, width, delta=1)
             views = (control.pages["crossing"].documentView().subviews()[0],
-                     control.ways_pair.view, control.ways_pair.first, control.ways_pair.second)
+                     *(view for pair in control.side_by_side for view in (pair.view, pair.first, pair.second)))
             ambiguous += sum(view.hasAmbiguousLayout() for view in views)
         resize_passes = MeasuredStack.passes
         MeasuredStack.passes = 0

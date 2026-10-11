@@ -22,8 +22,7 @@ import time
 
 import AppKit
 import Quartz
-import rumps
-
+from frame_clock import FrameClock
 import tokens
 
 NOTCH_FALLBACK_HEIGHT = 32.0
@@ -130,7 +129,7 @@ class NotchIsland:
         self.kick = 0.0
         self.held = 0.0
         self.held_at = None
-        self.timer = rumps.Timer(self._tick, 1 / 60)
+        self.timer = FrameClock(None, lambda: self._tick(None))
 
     def _held(self, level, now):
         """Pressure as the animation shows it. Lifting a finger to reposition lets real pressure

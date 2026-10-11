@@ -63,6 +63,8 @@ class AppearanceContrast(unittest.TestCase):
         cls.window = SyntheticWindow(write_synthetic_settings(Path(cls.folder.name)))
         cls.window.full_screen_timer.stop()
         cls.window.refresh_timer.stop()
+        cls.window._live = lambda _peer: True
+        cls.window._reflect_ways()
         cls.window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
         cls.window.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         cls.window.resize(WIDTH, 900)

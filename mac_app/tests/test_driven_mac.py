@@ -221,6 +221,20 @@ class WindowsOnlyKeyTests(InjectorCase):
         flags = self.keys()[0][2]
         self.assertEqual(flags, FakeQuartz.kCGEventFlagMaskCommand | FakeQuartz.kCGEventFlagMaskShift)
 
+    def test_search_and_spotlight_press_command_space(self):
+        command = FakeQuartz.kCGEventFlagMaskCommand
+        for name in ("search", "spotlight"):
+            self.quartz.posted.clear()
+            injector.inject_key(name, down=True)
+            injector.inject_key(name, down=False)
+            self.assertEqual(
+                self.keys(), [(0x37, True, command), (0x31, True, command), (0x31, False, command), (0x37, False, 0)], name
+            )
+
+    def test_dictation_presses_f5(self):
+        injector.inject_key("dictation", down=True)
+        self.assertEqual([code for code, _, _ in self.keys()], [0x60])
+
     def test_menu_has_no_mac_key_and_is_logged_once(self):
         with self.assertLogs("Beamer", level="WARNING") as logged:
             injector.inject_key("menu", down=True)
@@ -240,7 +254,11 @@ class WindowsOnlyKeyTests(InjectorCase):
             and name not in injector.WINDOWS_ONLY_KEY_CODES
             and not injector.handles_key(name)
         }
-        self.assertEqual(unplaced, {"media_stop", "menu"})
+        # Windows keys with no Mac action are dropped on purpose (docs/special-keys-1.5.2.md).
+        self.assertEqual(unplaced, {
+            "media_stop", "menu", "media_select", "launch_app1", "launch_app2", "mail",
+            "browser_stop", "browser_home", "browser_refresh", "browser_search", "browser_favourites",
+        })
 
 
 class ScrollRemainderTests(InjectorCase):

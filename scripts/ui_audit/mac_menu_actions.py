@@ -103,7 +103,7 @@ def main():
                                         (AppKit.NSApp, tray.control_window.window, tray.control_window.host_field))
                     actions.append({"state": count, "title": str(parent.title()) + "/" + str(item.title()),
                                     "selector": selector, "result": "selector-present" if supported else "responder-chain-only",
-                                    "note": "Native Edit/Hide/Close/Minimise effects are not invoked on Toby's desktop."})
+                                    "note": "Native Edit/Hide/Close/Minimise effects are not invoked on the desktop it runs on."})
     path = ROOT / "renders/mac/menu-actions.json"
     path.write_text(json.dumps(actions, indent=2))
     print(json.dumps({"menu_actions": len(actions), "exceptions": sum(row["result"] == "exception" for row in actions),

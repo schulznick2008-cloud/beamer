@@ -5,7 +5,9 @@ with nothing faked but the platform edges. The links are the harness's scripted 
 
 import time
 import unittest
+from unittest import mock
 
+from core import return_edge
 from core import owner as owner_module
 from core import protocol
 from core.tests.responder_harness import Initiator, Machine, entry, ident, token, wait_for
@@ -123,6 +125,11 @@ class Chain(unittest.TestCase):
     """Owner to A, A's zone to B, B's zone to C, C's zone back to A, over four real links."""
 
     def setUp(self):
+        # These tests cross the moment input lands; the arrival grace is test_arrival_grace's
+        # subject, not theirs.
+        grace = mock.patch.object(return_edge, "ARRIVAL_GRACE_SECONDS", 0.0)
+        grace.start()
+        self.addCleanup(grace.stop)
         self.a = responder(self, A, [(O, "bottom"), (B, "right"), (C, "left")], zones=(O, B))
         self.b = responder(self, B, [(O, "bottom"), (A, "left"), (C, "right")], zones=(O, C))
         self.c = responder(self, C, [(O, "bottom"), (B, "left"), (A, "right")], zones=(O, A))

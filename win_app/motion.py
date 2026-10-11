@@ -126,7 +126,7 @@ def target_shown(widget: QWidget) -> bool:
     return (not widget.isHidden()) if target is None else target
 
 
-def set_shown(widget: QWidget, shown: bool) -> None:
+def set_shown(widget: QWidget, shown: bool, *, fade: bool = True) -> None:
     """Shows or hides a row or module by sliding its height open or shut and fading it; the cap on
     its height comes off at the end, so later layout is never held to the animated size."""
     shown = bool(shown)
@@ -150,7 +150,8 @@ def set_shown(widget: QWidget, shown: bool) -> None:
         stop(widget, "shown")
         finish()
         return
-    fade = _fade_of(widget)
+    # Crossing rows uncover at full opacity: an opacity effect composites the whole subtree.
+    fade = _fade_of(widget) if fade else None
     start_height = widget.height() if (moving or not widget.isHidden()) else 0
     start_opacity = fade.opacity() if (fade is not None and moving) else (0.0 if shown else 1.0)
     end_height = _natural_height(widget) if shown else 0

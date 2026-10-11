@@ -32,6 +32,7 @@ from core import keytable
 from core import owner as owner_module
 from core import peerlist
 from core import protocol
+from core import special_keys
 from core import receiver
 from core import return_edge
 from core import ways
@@ -55,7 +56,7 @@ NOT_CONNECTED_STATUS = "Not connected"
 # table takes the physical key, so the two are swapped back here.
 PHYSICAL = {"cmd": "ctrl", "cmd_r": "ctrl_r", "ctrl": "cmd", "ctrl_r": "cmd_r"}
 MEDIA_KEYS = frozenset(
-    {"volume_mute", "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause"}
+    {"volume_mute", "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause", "brightness_up", "brightness_down"}
 )
 MODIFIER_KEYS = frozenset({"shift", "shift_r", "ctrl", "ctrl_r", "alt", "alt_r", "cmd", "cmd_r"})
 # What this machine tells its peers it is (WIRE.md section 2); Linux and Windows read keys alike.
@@ -168,16 +169,21 @@ class LinkSender:
         self._entries: list = []        # every entry, in the order the UI shows them
         self._zone_list: list = []
         self._models: list = []         # [(peer id, model)], this PC's zones in use
+        self._pressure_model = None
         self._edge_cursor_error_logged = False
         self._ignore_gate = ignored.Gate()
         # The name a key went down under, by virtual key, so its release matches even when Shift or
         # the style changes while it is held.
         self._keys_down: dict = {}
+        self._pending_windows_key: Optional[int] = None
+        self._intent_keys_up: set = set()
+        self._intent_windows_up: set = set()
         self._accepts: dict = {}        # peer id: whether it lets this PC drive it
         self._sent_names: dict = {}     # (peer, physical key): the name its press went out under
         self._buttons_held = set()
         self._pin_point = None
         self._monitors = None
+        self._display_map = {}
         self._monitors_at = 0.0
         self._clipboard_stamp = None
         # The machine this PC's input last landed on, as an id text, for the shortcut's choice.
@@ -242,6 +248,13 @@ class LinkSender:
         owner = self._owner
         return owner.on if owner is not None else None
 
+    @property
+    def route_chain(self) -> tuple:
+        """The current route and any onward machine named by a refusal."""
+        with self._lock:
+            owner = self._owner
+            return owner.chain if owner is not None else ()
+
     def expects_clipboard(self, link, began) -> bool:
         """For a link's `large` hook: whether a frame its peer began sending at `began` could be the
         clipboard of a let-go."""
@@ -271,6 +284,50 @@ class LinkSender:
             return peer is not None and self.links.up(peer) and self._accepts.get(peer) is True
 
         return protocol.read_id(ways.shortcut_peer(self._entries, self._last_on, ready))
+
+    def _cycle_order(self) -> list:
+        config = self._setting("layout", {}) or {}
+        own = protocol.id_text(self._own_id)
+        layout = ways.derive_layout({"machine_id": own, "peers": self._entries,
+                                     "zones": self._zone_list, "layout": config}, gap=0)
+        positions = {ident: (tile["x"], tile["y"], tile["w"], tile["h"])
+                     for ident, tile in layout.items()}
+        return ways.shortcut_order(self._entries, own, positions,
+                                   self._setting("shortcut_goes_to", "last"))
+
+    def _cycle_target(self):
+        target, skipped = ways.next_target({"shortcut_goes_to": self._setting("shortcut_goes_to", "last")},
+                                           self._cycle_order(), protocol.peer_id_text(self.owner) if self.owner else None,
+                                           self._cycle_ready)
+        self._announce_shortcut_skips(skipped)
+        return protocol.read_id(target) if target is not None else None
+
+    def _cycle_ready(self, ident):
+        peer = protocol.read_id(ident)
+        return peer is not None and self.links.up(peer) and self._accepts.get(peer) is True
+
+    def _announce_shortcut_skips(self, skipped):
+        for ident in skipped:
+            self._alert(f"Skipped {peerlist.label_for(self._entries, peer_id=ident) or 'Other machine'}: not connected.")
+
+    def toggle_shortcut(self) -> None:
+        if self._setting("shortcut_goes_to", "last") == "last":
+            self.toggle()
+            return
+        target = self._cycle_target()
+        self.set_redirecting(target is not None, peer=target)
+
+    def hold_shortcut(self, down: bool) -> None:
+        if not down:
+            self.set_redirecting(False)
+            return
+        target, skipped = ways.hold_target(
+            {"shortcut_goes_to": self._setting("shortcut_goes_to", "last")},
+            self._cycle_order(), self._last_on,
+            self._cycle_ready)
+        self._announce_shortcut_skips(skipped)
+        target = protocol.read_id(target) if target else None
+        self.set_redirecting(target is not None, peer=target)
 
     @property
     def waking(self) -> bool:
@@ -449,10 +506,74 @@ class LinkSender:
         if owner.away:
             if not self._live():
                 self._lost()
-            elif vk is not None and self._ignore_gate.keeps(ignored.key(vk), down):
+                return False
+            if vk is not None and self._ignore_gate.keeps(ignored.key(vk), down):
                 return False
         elif vk is not None and not down:
             self._ignore_gate.keeps(ignored.key(vk), False)
+        target = self._peers.get(owner.on) or {}
+        to_mac = not sys.platform.startswith("linux") and target.get("platform") == "macos"
+        to_linux = not sys.platform.startswith("linux") and target.get("platform") == "linux"
+        if vk in self._intent_windows_up:
+            if not down:
+                self._intent_windows_up.discard(vk)
+            return True
+        if vk in self._intent_keys_up:
+            if not down:
+                self._intent_keys_up.discard(vk)
+            return True
+        if vk in (0x5B, 0x5C) and (to_mac or to_linux):
+            if down:
+                self._keys_down[held] = self._key_data(name, us)
+                self._pending_windows_key = held
+                return True
+            if self._pending_windows_key == held:
+                self._pending_windows_key = None
+                self._input({"type": protocol.MSG_KEYDOWN, "data": dict(data)})
+                return self._input({"type": protocol.MSG_KEYUP, "data": dict(data)})
+        active_windows_key = self._pending_windows_key
+        if active_windows_key is None and to_mac:
+            active_windows_key = next((key for key in (0x5B, 0x5C) if key in self._keys_down), None)
+        if down and to_mac and active_windows_key is not None and vk is not None:
+            other_modifiers = {0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x5C}
+            other_modifiers.discard(active_windows_key)
+            intent = None if other_modifiers.intersection(self._keys_down) else special_keys.windows_shortcut_intent(name)
+            if intent is not None:
+                windows_key = active_windows_key
+                was_pending = self._pending_windows_key == windows_key
+                if was_pending:
+                    self._pending_windows_key = None
+                else:
+                    self._input({"type": protocol.MSG_KEYUP, "data": dict(self._keys_down[windows_key])})
+                self._keys_down.pop(windows_key, None)
+                self._intent_windows_up.add(windows_key)
+                self._intent_keys_up.add(vk)
+                if intent:
+                    message = {"type": protocol.MSG_KEYDOWN, "data": {"key": intent}}
+                    self._input(message)
+                    return self._input(dict(message, type=protocol.MSG_KEYUP))
+                return True
+            pending_data = self._keys_down.get(self._pending_windows_key)
+            self._pending_windows_key = None
+            if pending_data is not None:
+                self._input({"type": protocol.MSG_KEYDOWN, "data": dict(pending_data)})
+        if down and to_linux and self._pending_windows_key is not None and vk is not None:
+            intent = {"s": "spotlight", "h": "", "n": ""}.get(name.lower())
+            if intent is not None:
+                windows_key = self._pending_windows_key
+                self._pending_windows_key = None
+                self._keys_down.pop(windows_key, None)
+                self._intent_windows_up.add(windows_key)
+                self._intent_keys_up.add(vk)
+                if intent:
+                    message = {"type": protocol.MSG_KEYDOWN, "data": {"key": intent}}
+                    self._input(message)
+                    return self._input(dict(message, type=protocol.MSG_KEYUP))
+                return True
+            pending_data = self._keys_down.get(self._pending_windows_key)
+            self._pending_windows_key = None
+            if pending_data is not None:
+                self._input({"type": protocol.MSG_KEYDOWN, "data": dict(pending_data)})
         return self._input({"type": protocol.MSG_KEYDOWN if down else protocol.MSG_KEYUP, "data": dict(data)})
 
     def on_text(self, text: str, vk: Optional[int] = None) -> bool:
@@ -488,6 +609,17 @@ class LinkSender:
             data["us"] = us
         return data
 
+    def _send_pending_windows_key(self) -> None:
+        """The Windows key is held back until the next key says whether it begins a shortcut; a
+        mouse button or the wheel is not one, so the key goes ahead of it as the modifier it is."""
+        held = self._pending_windows_key
+        if held is None:
+            return
+        self._pending_windows_key = None
+        data = self._keys_down.get(held)
+        if data is not None:
+            self._input({"type": protocol.MSG_KEYDOWN, "data": dict(data)})
+
     def on_button(self, name: str, down: bool) -> bool:
         """A mouse button, from the hook thread: True when it is not for this PC."""
         if down:
@@ -504,6 +636,8 @@ class LinkSender:
                 return False
         elif not down:
             self._ignore_gate.keeps(ignored.button(name), False)
+        if down and owner.away:
+            self._send_pending_windows_key()
         return self._input({"type": protocol.MSG_MOUSEDOWN if down else protocol.MSG_MOUSEUP, "data": {"button": name}})
 
     def on_wheel(self, dy: float, dx: float) -> bool:
@@ -513,6 +647,7 @@ class LinkSender:
         if not self._live():
             self._lost()
             return False
+        self._send_pending_windows_key()
         return self._input(protocol.scroll_msg(dy, dx, "line"))
 
     def on_pointer_move(self) -> bool:
@@ -580,8 +715,9 @@ class LinkSender:
                 return
             self._edge_cursor_error_logged = False
             outcome = model = target = None
+            display_map = self._cached_display_map()
             for peer, candidate in list(self._models):
-                result = candidate.feed(monitors, pointer, float(dx), float(dy))
+                result = candidate.feed(monitors, pointer, float(dx), float(dy), display_map=display_map)
                 if result.action != return_edge.PASS:
                     outcome, model, target = result, candidate, peer
                     break
@@ -597,12 +733,14 @@ class LinkSender:
         elif isinstance(model, return_edge.CornerPush):
             # The corner's name, so the effects play their corner forms; the glow lights the edge.
             part = model.corner
+        self._pressure_model = model
         self._notify_pressure(model.edge, outcome.pressure, outcome.action == return_edge.CROSS, part)
         if outcome.action == return_edge.CROSS:
             offset = receiver.corner_offset(model.corner, model.edge) if isinstance(model, return_edge.CornerPush) else outcome.offset
             # The model names the edge on the far side, not the one just left: it is the same
-            # border, read from the other end.
-            self._go(target, outcome.edge, offset)
+            # border, read from the other end. The display it leads to lands the pointer there, as
+            # the Mac's own crossing does.
+            self._go(target, outcome.edge, offset, outcome.display, outcome.side)
 
     def zone_models(self) -> list:
         """The models of this PC's ways out, where a desktop that captures input at barriers puts
@@ -610,6 +748,26 @@ class LinkSender:
         if self.edges_held or self._owner is None:
             return []
         return [model for _peer, model in list(self._models)]
+
+    def seam_clip_position(self, x: int, y: int):
+        """Keep a local pointer on an armed display edge when it enters an adjacent display."""
+        if self.redirecting:
+            return None
+        models = self.zone_models()
+        if not models:
+            return None
+        monitors = self._cached_monitors()
+        display_map = {str(index): monitor for index, monitor in enumerate(monitors)}
+        from capture_win import internal_seam_position
+
+        return internal_seam_position((x, y), monitors, display_map, models)
+
+    def pressure_at(self, now: float | None = None) -> float:
+        """The active local way's pressure fraction at `now`, without advancing its model."""
+        model = self._pressure_model
+        if model is None:
+            return 0.0
+        return model.pressure_at(self._clock() if now is None else now)
 
     def _still_dragging(self) -> bool:
         """A release the hook never saw -- let go over the secure desktop or an elevated window --
@@ -625,13 +783,13 @@ class LinkSender:
 
     # -- switching ----------------------------------------------------------
 
-    def set_redirecting(self, value, came_home=True) -> bool:
+    def set_redirecting(self, value, came_home=True, peer=None) -> bool:
         """Moves this PC's input to the shortcut's machine, or home, as the shortcut, the Send button,
         the tray and the direction switch do. False when nothing moved."""
         if value:
             if self.redirecting:
-                return False
-            peer = self.shortcut_target()
+                return self.go(peer) if peer is not None and peer != self.owner else False
+            peer = peer or self.shortcut_target()
             if peer is None:
                 self._alert(f"Cannot switch — {self.status}")
                 return False
@@ -649,10 +807,11 @@ class LinkSender:
         edge is off."""
         self.set_redirecting(not self.redirecting)
 
-    def go(self, peer: bytes, edge: Optional[str] = None, offset: Optional[float] = None) -> bool:
-        return self._go(peer, edge, offset)
+    def go(self, peer: bytes, edge: Optional[str] = None, offset: Optional[float] = None,
+           display=None, side=None) -> bool:
+        return self._go(peer, edge, offset, display, side)
 
-    def _go(self, peer: bytes, edge=None, offset=None) -> bool:
+    def _go(self, peer: bytes, edge=None, offset=None, display=None, side=None) -> bool:
         owner = self._owner
         if owner is None:
             return False
@@ -663,11 +822,12 @@ class LinkSender:
         if self.driven():
             # A machine that is driven does not drive (section 4): its driver goes home first, then
             # the move goes ahead. Waiting happens off this thread, which may be the hook's.
-            threading.Thread(target=self._after_let_go, args=(peer, edge, offset), name="Beamer-links-home", daemon=True).start()
+            threading.Thread(target=self._after_let_go, args=(peer, edge, offset, display, side),
+                             name="Beamer-links-home", daemon=True).start()
             return True
         with self._lock:
             self._note_clipboard()
-            actions = owner.go(peer, edge, offset)
+            actions = owner.go(peer, edge, offset, display=display, side=side)
             self._queue(actions)
         self._report(actions)
         if owner.away and self.driven():
@@ -678,7 +838,7 @@ class LinkSender:
             self._report(actions)
         return owner.away
 
-    def _after_let_go(self, peer, edge, offset) -> None:
+    def _after_let_go(self, peer, edge, offset, display=None, side=None) -> None:
         if not self.send_peer_home() and self.driven():
             self._alert(f"Cannot switch — {self._name(peer)} could not be reached while this PC is being driven")
             return
@@ -686,7 +846,7 @@ class LinkSender:
         while self.driven() and self._clock() < deadline and not self._stop_event.is_set():
             time.sleep(0.02)
         if not self.driven() and not self.redirecting:
-            self._go(peer, edge, offset)
+            self._go(peer, edge, offset, display, side)
 
     def set_receiving(self, receiving: bool) -> None:
         """A peer took this PC's input, or gave it back. Input cannot be here and elsewhere at
@@ -963,6 +1123,11 @@ class LinkSender:
 
     def _send(self, peer: bytes, message: dict) -> None:
         kind = message["type"]
+        if kind == protocol.MSG_KEYDOWN and message.get("data", {}).get("key") == "tab":
+            for transition in self._switcher_transition(peer):
+                if not self.links.send_input(peer, transition):
+                    self._send_failed(peer)
+                    return
         if kind == protocol.MSG_FOCUS:
             data = message["data"]
             message = protocol.focus_v6(
@@ -981,6 +1146,13 @@ class LinkSender:
         else:
             self.links.post(peer, message)
 
+    def _switcher_transition(self, peer: bytes) -> list:
+        sent = {physical: name for (sent_peer, physical), name in self._sent_names.items() if sent_peer == peer}
+        messages, held_as = special_keys.switcher_transitions(OWN_PLATFORM, (self._peers.get(peer) or {}).get("platform", ""), sent)
+        for physical, name in held_as.items():
+            self._sent_names[(peer, physical)] = name
+        return messages
+
     def _key_message(self, peer: bytes, message: dict, preserve: bool = False) -> Optional[dict]:
         """The key as `peer` is sent it: named by the key table for the peer's platform and the
         user's style, and dropped when the peer does not take media keys."""
@@ -994,16 +1166,24 @@ class LinkSender:
             name = self._sent_names[held]
         elif message["type"] == protocol.MSG_KEYUP and held in self._sent_names:
             # The release leaves under the name its press went under, whatever the style says now.
-            name = self._sent_names.pop(held)
+            sent = {key: sent_name for (sent_peer, key), sent_name in self._sent_names.items() if sent_peer == peer}
+            name = special_keys.release_key(physical, sent)
+            self._sent_names.pop(held)
+            if name is None:
+                return None
         elif message["type"] == protocol.MSG_KEYDOWN and held in self._sent_names:
             # So does each auto-repeat of it.
             name = self._sent_names[held]
         else:
             style = self._setting("modifier_style", "semantic")
             try:
-                name = keytable.wire_name(physical, OWN_PLATFORM, entry.get("platform") or "", style)
+                peer_platform = entry.get("platform") or ""
+                name = keytable.wire_name(physical, OWN_PLATFORM, peer_platform, style)
+                name = special_keys.wire_name(name, OWN_PLATFORM, peer_platform)
             except ValueError:
                 name = physical
+            if name is None:
+                return None
             if message["type"] == protocol.MSG_KEYDOWN:
                 self._sent_names[held] = name
         return {"type": message["type"], "data": dict(data, key=name)}
@@ -1074,10 +1254,14 @@ class LinkSender:
         # of deltas still in flight cannot cross twice, and nothing else re-arms it.
         with self._lock:
             self._arm_locked()
+            if moved.edge in return_edge.EDGES:
+                # Landed by a crossing: the push that brought it here does not carry on through a zone.
+                for _peer, model in self._models:
+                    model.start_grace()
         LOGGER.info("input returned to this PC (%s)%s", moved.why, _at_edge(moved.edge))
         self._report_redirecting(False)
         if moved.edge in return_edge.EDGES and isinstance(moved.offset, (int, float)):
-            self._land(moved.edge, moved.offset)
+            self._land(moved.edge, moved.offset, moved.display, moved.side)
         elif moved.why in ("asked", "switch"):
             self._report_arrival(None)
         else:
@@ -1089,12 +1273,14 @@ class LinkSender:
                 reason = HOME_REASONS.get(moved.why, "{name} returned the input").format(name=self._name(moved.left))
             self._alert(reason)
 
-    def _land(self, edge: str, offset: float) -> None:
+    def _land(self, edge: str, offset: float, display=None, side=None) -> None:
         """The peer pushed the pointer back through its zone: land it on the edge of this PC it comes
         back to."""
         try:
             desktop = self._desktop_module()
-            x, y = return_edge.arrival_position(self._cached_monitors(), edge, offset)
+            display_map = getattr(desktop, "display_map", lambda: {})()
+            x, y = return_edge.arrival_position(self._cached_monitors(), edge, offset,
+                                                display, side, display_map)
             desktop.set_cursor_position(x, y)
         except Exception:
             LOGGER.exception("Could not place the pointer at the %s edge on arrival", edge)
@@ -1224,15 +1410,18 @@ class LinkSender:
         """A fresh set of zone models, for the peers this PC can send to now (never the one its input
         is on: that peer's own zones lead on from there)."""
         owner = self._owner
+        self._pressure_model = None
         if owner is None:
             self._models = []
             return
         allowed = set(owner.reach_for(None))
         self._armed_for = frozenset(allowed)
         try:
+            previous = self._models
             self._models = receiver.zone_models(
                 self._zone_list, self._entries, allowed, self._resistance(), None,
             )
+            return_edge.keep_grace(previous, self._models)
         except Exception:
             LOGGER.exception("Could not arm the zones")
             self._models = []
@@ -1288,9 +1477,17 @@ class LinkSender:
     def _cached_monitors(self):
         now = self._clock()
         if self._monitors is None or now - self._monitors_at > MONITORS_MAX_AGE_SECONDS:
-            self._monitors = self._desktop_module().monitors()
+            desktop = self._desktop_module()
+            self._monitors = desktop.monitors()
+            # The keys the map's display-scoped zones name, read with the monitors they describe.
+            reader = getattr(desktop, "display_map", None)
+            self._display_map = reader() if callable(reader) else {}
             self._monitors_at = now
         return self._monitors
+
+    def _cached_display_map(self):
+        self._cached_monitors()
+        return self._display_map
 
     def _desktop_module(self):
         if self._desktop is not None:

@@ -60,6 +60,10 @@ def monitors() -> List[Rect]:
     return found
 
 
+def display_map() -> dict:
+    return {str(index): rect for index, rect in enumerate(monitors())}
+
+
 def cursor_position() -> Tuple[int, int]:
     quartz = _require()
     location = quartz.CGEventGetLocation(quartz.CGEventCreate(None))

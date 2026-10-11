@@ -27,6 +27,8 @@ class FakeQuartz:
     kCGEventTapDisabledByTimeout = 0xFFFFFFFE
     kCGEventTapDisabledByUserInput = 0xFFFFFFFF
     kCGEventSourceUserData = 42
+    kCGEventSourceStateHIDSystemState = 1
+    kCGAnyInputEventType = 0
     kCGKeyboardEventKeycode = 9
     kCGKeyboardEventAutorepeat = 8
     kCGMouseEventDeltaX = 4
@@ -97,6 +99,10 @@ class FakeQuartz:
     @classmethod
     def CGEventTapEnable(cls, tap, enabled):
         cls.tap_enable_calls.append((tap, enabled))
+
+    @staticmethod
+    def CGEventSourceSecondsSinceLastEventType(source, event_type):
+        return 3600.0
 
 
 class FakeGestureEvent:
@@ -200,4 +206,3 @@ class FakeClipboard:
         self.text, self.image = text, image
         self.stamp += 1
         return True
-

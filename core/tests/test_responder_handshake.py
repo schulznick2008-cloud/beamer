@@ -197,6 +197,7 @@ class TheIdsInHello(Case):
             self.initiator(peer=D, key=TOKENS[B]).handshake()
         self.assertEqual(refused.exception.error, protocol.ERROR_WRONG_ID)
         self.assertEqual(self.machine.settings.peer(TOKENS[B])["id"], protocol.id_text(B))
+        self.assertEqual(self.machine.settings.peer(TOKENS[B]).get("dormant_reason"), "wrong_id")
 
     def test_the_answer_is_followed_by_a_close(self):
         link = self.initiator(peer=D, key=TOKENS[B])

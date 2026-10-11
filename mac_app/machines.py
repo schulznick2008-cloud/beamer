@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from core import protocol
+from core import peerlist
 from link_state import AMBER, FAULT, INK, SIGNAL, LinkState
 
 PLATFORMS = {"windows": "Windows", "macos": "Mac", "linux": "Linux", "ios": "iPhone", "android": "Android"}
@@ -25,6 +26,7 @@ class Row:
     address: str
     state: LinkState
     in_use: bool
+    left_out: bool
     drives: bool
     driven: bool
     phone: bool = False
@@ -44,11 +46,15 @@ def row(entry: dict, label: str, live: bool, kind: str, status: str, here: bool,
     return Row(
         entry["token"], label, platform_name(entry.get("platform", "")), address,
         _state(entry, label, live, kind, status, here, driving, inbound, has_link), entry.get("in_use", True) is True,
+        entry.get("left_out") is True,
         entry.get("send") is True, entry.get("allow_drive") is True, port == 0,
     )
 
 
 def _state(entry, label, live, kind, status, here, driving, inbound, has_link) -> LinkState:
+    reason = peerlist.dormant_reason(entry)
+    if reason:
+        return LinkState("dormant", AMBER, "Needs re-pair", "Needs re-pair", reason, AMBER)
     if entry.get("in_use", True) is not True:
         return LinkState("not_in_use", AMBER, "NOT IN USE", "NOT IN USE", f"{label} is not in use on this Mac.", AMBER)
     if not protocol.linkable(entry):

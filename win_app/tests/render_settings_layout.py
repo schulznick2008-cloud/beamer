@@ -33,7 +33,7 @@ from test_settings_layout_acceptance import SyntheticWindow, write_synthetic_set
 WIDTHS = (320, 640, 900, 1440, 1920)
 SCALES = ("1.0", "1.25", "1.5", "2.0")
 HEIGHT = 900
-OUT = Path(os.environ.get("BEAMER_RENDER_OUT", ROOT / "renders"))
+OUT = Path(os.environ.get("BEAMER_RENDER_OUT", ROOT / "win_app" / "renders"))
 
 
 def capture_document(page):
@@ -260,6 +260,88 @@ def run_matrix():
         raise SystemExit(1)
 
 
+def run_crossing_state(state, destination):
+    """Build the seven review states from valid saved settings in a fresh Qt process."""
+    import tempfile
+    import app_config
+    from core import crossing_state, protocol
+    from core.tests import responder_harness as harness
+
+    if state not in range(1, 8):
+        raise ValueError("crossing state must be 1..7")
+    app = QApplication.instance() or QApplication([])
+    theme.init_fonts()
+    app.setFont(theme.font(theme.TYPE["body"]))
+    scratch = ROOT / "win_app" / ".test-tmp"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f"ledger-state-{state}-", dir=scratch) as working:
+        own = protocol.id_text(harness.HERE)
+        first, second, third = (protocol.id_text(peer) for peer in (harness.B, harness.C, harness.D))
+        peer_ids = [second] if state in (2, 3) else [first, second, third] if state == 6 else [first]
+        all_peers = {first: harness.entry(harness.B, "MacBook Pro", platform="macos"),
+                     second: harness.entry(harness.C, "Fedora laptop", platform="linux"),
+                     third: harness.entry(harness.D, "Studio PC", platform="windows", shortcut_cycle=False)}
+        settings = app_config.migrate(None, machine_id=own)
+        settings.update(appearance="dark", name="Desktop PC", check_updates=False,
+                        port=harness.free_port(), shortcut_goes_to="ticked",
+                        peers=[all_peers[peer] for peer in peer_ids])
+        settings["layout"] = {own: {"x": 0, "y": 0, "w": 160, "h": 100}}
+        positions = {first: (0, -100), second: (-160, 0), third: (160, 0)}
+        for peer in peer_ids:
+            x, y = positions[peer]
+            settings["layout"][peer] = {"x": x, "y": y, "w": 160, "h": 100}
+        for peer in peer_ids:
+            thirds = ["start", "end"] if state == 3 else ["middle"] if state == 6 and peer == second else list(("start", "middle", "end"))
+            corner = "top_left" if state in (4, 7) else "bottom_left" if state == 6 and peer == second else ""
+            settings = crossing_state.edit_ways(settings, peer, platform="pc", edge=state != 5,
+                                                 thirds=thirds, corner=bool(corner),
+                                                 corner_at=corner or None,
+                                                 live=lambda _peer: True, gone=lambda _peer: False,
+                                                 capable=peer_ids, now=1791619200)["settings"]
+        if state == 6:
+            next(entry for entry in settings["peers"] if entry["id"] == second)["jump_key"] = "alt+f18"
+        path = Path(working) / "settings.json"
+        app_config.write_settings(path, settings)
+        window = SyntheticWindow(path)
+        window.full_screen_timer.stop()
+        window.refresh_timer.stop()
+        window._live = lambda peer: state != 6 or peer != third
+        window._design_peer_caps = lambda: {peer: {"layout"} for peer in peer_ids}
+        window._chosen = peer_ids[0]
+        window._reflect_ways()
+        window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        window.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        width, height = (640, 600) if state == 7 else (960, 760)
+        window.resize(width, height)
+        window.show()
+        window._select_page("crossing")
+        settle(app)
+        scroll = window.stack.currentWidget()
+        chrome = window.height() - scroll.viewport().height()
+        window.resize(width, scroll.widget().sizeHint().height() + chrome + 2)
+        settle(app)
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        raster = window.grab().toImage()
+        if raster.isNull() or not raster.save(str(destination)):
+            raise RuntimeError(f"could not save built Crossing state {destination}")
+        record = {"state": state, "file": str(destination), "size": [raster.width(), raster.height()],
+                  "ledger_narrow": window.crossing_ledger.narrow,
+                  "map_height": window.atlas_canvas.height(),
+                  "hint_gap": (window.atlas_canvas_hint.mapTo(window.ways_module, QPoint()).y()
+                               - window.atlas_canvas.mapTo(window.ways_module, QPoint(0, window.atlas_canvas.height())).y()),
+                  "horizontal_scroll": scroll.horizontalScrollBar().maximum(),
+                  "rows": [{"name": row.name.full_text, "status": row.status.text(),
+                             "edge": row.edge_value.text(), "corner": row.corner_value.text(),
+                             "jump": row.jump.value} for row in window.crossing_ledger.rows.values()]}
+        (scratch / f"ledger-render-{state}.json").write_text(json.dumps(record, indent=2) + "\n")
+        print(json.dumps(record))
+        window.server.stop()
+        window.close()
+        window.deleteLater()
+        settle(app)
+
+
 def comparison_sheets(qt_root):
     mac_root = ROOT.parent / "laymac" / "renders"
     app = QApplication.instance() or QApplication([])
@@ -304,7 +386,9 @@ def run_test_suite(selectors=()):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 2 and sys.argv[1] == "--matrix":
+    if len(sys.argv) == 4 and sys.argv[1] == "--crossing-state":
+        run_crossing_state(int(sys.argv[2]), sys.argv[3])
+    elif len(sys.argv) == 2 and sys.argv[1] == "--matrix":
         run_matrix()
     elif len(sys.argv) == 3 and sys.argv[1] == "--compare":
         comparison_sheets(Path(sys.argv[2]))

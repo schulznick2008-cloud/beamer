@@ -22,7 +22,17 @@ def names_only(vk, scan, state):
     return {VK_A: "a"}.get(vk)
 
 
+class HookPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
 class NameTests(unittest.TestCase):
+    def test_browser_search_and_app_launch_keys_are_captured(self):
+        state = KeyboardState()
+        self.assertEqual(key_name(0xAA, 0, state, names_only), "browser_search")
+        self.assertEqual(key_name(0xB4, 0, state, names_only), "mail")
+        self.assertEqual(key_name(0xB6, 0, state, names_only), "launch_app1")
+
     def test_ctrl_leaves_this_pc_as_command(self):
         # The semantic swap happens here and nowhere else: the Mac injects
         # exactly the name it is given.
@@ -182,6 +192,133 @@ class NameTests(unittest.TestCase):
         self.assertEqual(key_name(0x45, 0, state, translate, down=True), "ê")
 
 
+class InjectedHookTests(unittest.TestCase):
+    class HookData(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", ctypes.c_ulong),
+            ("scanCode", ctypes.c_ulong),
+            ("flags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    class MouseData(ctypes.Structure):
+        _fields_ = [
+            ("pt", HookPoint),
+            ("mouseData", ctypes.c_ulong),
+            ("flags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    def test_only_beamer_injected_keys_are_ignored(self):
+        on_key = Mock(return_value=True)
+        hooks = capture_win.Hooks(on_key, Mock(), Mock())
+        user32 = Mock()
+        user32.CallNextHookEx.return_value = 99
+        marked = self.HookData(0x41, 0x1E, capture_win.LLKHF_INJECTED, 0, INJECTED_MARK)
+        foreign = self.HookData(0x41, 0x1E, capture_win.LLKHF_INJECTED, 0, 123)
+
+        with patch.object(capture_win, "KBDLLHOOKSTRUCT", self.HookData, create=True), \
+                patch.object(capture_win, "user32", user32), \
+                patch.object(capture_win, "key_name", return_value="a"):
+            marked_result = hooks._keyboard_proc(capture_win.HC_ACTION, capture_win.WM_KEYDOWN, ctypes.byref(marked))
+            foreign_result = hooks._keyboard_proc(capture_win.HC_ACTION, capture_win.WM_KEYDOWN, ctypes.byref(foreign))
+
+        self.assertEqual((marked_result, foreign_result), (99, 1))
+        on_key.assert_called_once_with("a", True, 0x41, "a")
+
+    def test_foreign_injected_mouse_buttons_and_wheel_pass_but_moves_do_not(self):
+        on_mouse = Mock(return_value=True)
+        hooks = capture_win.Hooks(Mock(), on_mouse, Mock())
+        user32 = Mock()
+        user32.CallNextHookEx.return_value = 99
+        marked_button = self.MouseData(HookPoint(5, 7), 0, capture_win.LLMHF_INJECTED, 0, INJECTED_MARK)
+        foreign_button = self.MouseData(HookPoint(5, 7), 0, capture_win.LLMHF_INJECTED, 0, 123)
+        foreign_wheel = self.MouseData(HookPoint(5, 7), 120 << 16, capture_win.LLMHF_INJECTED, 0, 123)
+        foreign_move = self.MouseData(HookPoint(5, 7), 0, capture_win.LLMHF_INJECTED, 0, 123)
+
+        with patch.object(capture_win, "MSLLHOOKSTRUCT", self.MouseData, create=True), \
+                patch.object(capture_win, "user32", user32):
+            results = (
+                hooks._mouse_proc(capture_win.HC_ACTION, 0x0201, ctypes.byref(marked_button)),
+                hooks._mouse_proc(capture_win.HC_ACTION, 0x0201, ctypes.byref(foreign_button)),
+                hooks._mouse_proc(capture_win.HC_ACTION, 0x020A, ctypes.byref(foreign_wheel)),
+                hooks._mouse_proc(capture_win.HC_ACTION, capture_win.WM_MOUSEMOVE, ctypes.byref(foreign_move)),
+            )
+
+        self.assertEqual(results, (99, 1, 1, 99))
+        self.assertEqual(on_mouse.call_count, 2)
+
+    def test_releasing_one_of_two_alt_keys_keeps_the_mac_switcher_open(self):
+        from links_rig import B, Rig
+
+        rig = Rig()
+        rig.sender.set_redirecting(True)
+        rig.flush()
+        rig.links.sent.clear()
+        hooks = capture_win.Hooks(rig.sender.on_key, Mock(), Mock())
+        user32 = Mock()
+        user32.CallNextHookEx.return_value = 99
+        events = [
+            (0xA4, capture_win.WM_KEYDOWN),
+            (0xA5, capture_win.WM_KEYDOWN),
+            (0x09, capture_win.WM_KEYDOWN),
+            (0xA4, capture_win.WM_KEYUP),
+            (0x09, capture_win.WM_KEYUP),
+            (0xA5, capture_win.WM_KEYUP),
+        ]
+        data = [self.HookData(vk, 0, 0, 0, 0) for vk, _kind in events]
+        key_names = {0xA4: "alt", 0xA5: "alt_r", 0x09: "tab"}
+        with patch.object(capture_win, "KBDLLHOOKSTRUCT", self.HookData, create=True), \
+                patch.object(capture_win, "user32", user32), \
+                patch.object(capture_win, "key_name", side_effect=lambda vk, *_args: key_names[vk]):
+            for item, (_vk, kind) in zip(data, events):
+                hooks._keyboard_proc(capture_win.HC_ACTION, kind, ctypes.byref(item))
+
+        keys = [(message["type"], message["data"].get("key")) for message in rig.sent(B)
+                if message["type"] in ("keydown", "keyup")]
+        self.assertEqual(keys.count(("keyup", "cmd")), 1)
+        self.assertEqual(keys[-1], ("keyup", "cmd"))
+
+    def test_alt_tab_to_mac_is_swallowed_and_uses_command_for_the_hold(self):
+        from links_rig import B, Rig
+
+        rig = Rig()
+        rig.sender.set_redirecting(True)
+        hooks = capture_win.Hooks(rig.sender.on_key, Mock(), Mock())
+        user32 = Mock()
+        user32.CallNextHookEx.return_value = 99
+        events = [
+            (0xA4, 0, capture_win.WM_KEYDOWN),
+            (0x09, 0, capture_win.WM_KEYDOWN),
+            (0x09, 0, capture_win.WM_KEYDOWN),
+            (0xA0, 0, capture_win.WM_KEYDOWN),
+            (0x09, 0, capture_win.WM_KEYDOWN),
+            (0x09, 0, capture_win.WM_KEYUP),
+            (0xA0, 0, capture_win.WM_KEYUP),
+            (0xA4, 0, capture_win.WM_KEYUP),
+        ]
+        data = [self.HookData(vk, 0, flags, 0, 0) for vk, flags, _kind in events]
+        key_names = {0xA4: "alt", 0x09: "tab", 0xA0: "shift"}
+        with patch.object(capture_win, "KBDLLHOOKSTRUCT", self.HookData, create=True), \
+                patch.object(capture_win, "user32", user32), \
+                patch.object(capture_win, "key_name", side_effect=lambda vk, *_args: key_names[vk]):
+            results = [
+                hooks._keyboard_proc(capture_win.HC_ACTION, kind, ctypes.byref(item))
+                for item, (_vk, _flags, kind) in zip(data, events)
+            ]
+
+        self.assertEqual(results, [1] * len(events))
+        keys = [(message["type"], message["data"].get("key")) for message in rig.sent(B)
+                if message["type"] in ("keydown", "keyup")]
+        self.assertEqual(keys, [
+            ("keydown", "alt"), ("keyup", "alt"), ("keydown", "cmd"),
+            ("keydown", "tab"), ("keydown", "tab"), ("keydown", "shift"),
+            ("keydown", "tab"), ("keyup", "tab"), ("keyup", "shift"), ("keyup", "cmd"),
+        ])
+
+
 @unittest.skipUnless(sys.platform == "win32", "ToUnicodeEx needs Windows")
 class LayoutTests(unittest.TestCase):
     """Against the real layout. The state passed in is the one the hook keeps,
@@ -220,14 +357,53 @@ class TriggerTests(unittest.TestCase):
     def test_two_taps_inside_the_window_fire_once(self):
         trigger = Trigger("cmd_r", "double_tap", 300)
         self.assertIsNone(trigger.feed("cmd_r", True, 1.00))
+        self.assertIsNone(trigger.feed("cmd_r", False, 1.05))
         self.assertEqual(trigger.feed("cmd_r", True, 1.20), TOGGLE)
+        self.assertIsNone(trigger.feed("cmd_r", False, 1.25))
         # The pair is spent: a third tap starts a new one rather than firing.
         self.assertIsNone(trigger.feed("cmd_r", True, 1.30))
 
     def test_a_slow_second_tap_does_not_fire(self):
         trigger = Trigger("cmd_r", "double_tap", 300)
         trigger.feed("cmd_r", True, 1.0)
+        trigger.feed("cmd_r", False, 1.1)
         self.assertIsNone(trigger.feed("cmd_r", True, 2.0))
+
+    def test_holding_the_key_never_toggles(self):
+        # Windows' default autorepeat: the first repeat at 0.5 s, then every 33 ms. Before 1.5.2
+        # this returned TOGGLE at 0.533, 0.599, 0.665 ... while the key was held.
+        trigger = Trigger("cmd_r", "double_tap", 300)
+        self.assertIsNone(trigger.feed("cmd_r", True, 0.0))
+        held = [0.5 + 0.033 * n for n in range(60)]
+        self.assertEqual([trigger.feed("cmd_r", True, at) for at in held], [None] * len(held))
+        self.assertIsNone(trigger.feed("cmd_r", False, 2.5))
+        # After the release, a real double-tap still fires.
+        self.assertIsNone(trigger.feed("cmd_r", True, 3.0))
+        self.assertIsNone(trigger.feed("cmd_r", False, 3.05))
+        self.assertEqual(trigger.feed("cmd_r", True, 3.2), TOGGLE)
+
+    def test_a_held_second_tap_toggles_once(self):
+        trigger = Trigger("cmd_r", "double_tap", 300)
+        trigger.feed("cmd_r", True, 1.0)
+        trigger.feed("cmd_r", False, 1.05)
+        self.assertEqual(trigger.feed("cmd_r", True, 1.2), TOGGLE)
+        self.assertEqual([trigger.feed("cmd_r", True, 1.7 + 0.033 * n) for n in range(30)], [None] * 30)
+
+    def test_a_key_held_while_the_shortcut_is_rearmed_does_not_toggle(self):
+        # The bridge reconfigures the trigger on every key while the shortcut is off.
+        trigger = Trigger("cmd_r", "double_tap", 300)
+        trigger.feed("cmd_r", True, 1.0)
+        trigger.configure("cmd_r", "double_tap", 300)
+        self.assertEqual([trigger.feed("cmd_r", True, 1.5 + 0.033 * n) for n in range(30)], [None] * 30)
+
+    def test_a_key_pressed_while_disarmed_and_held_into_arming_is_not_a_tap(self):
+        # Pressed with the shortcut off, so feed never saw the press; its autorepeat after
+        # arming must not count as the first tap of a pair a later single tap would complete.
+        trigger = Trigger("cmd_r", "double_tap", 300)
+        trigger.disarmed("cmd_r", True)
+        self.assertIsNone(trigger.feed("cmd_r", True, 1.5))
+        self.assertIsNone(trigger.feed("cmd_r", False, 1.55))
+        self.assertIsNone(trigger.feed("cmd_r", True, 1.7))
 
     def test_another_key_is_not_the_trigger(self):
         trigger = Trigger("cmd_r", "double_tap", 300)

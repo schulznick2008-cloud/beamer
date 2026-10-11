@@ -60,7 +60,8 @@ def live_glow(edge, size, *, pressure=1.0, corner=None, third=False, style="beam
     width, height = 1728.0, 1117.0
     controller = SimpleNamespace(
         cfg=SimpleNamespace(crossing=dict(crossing.DEFAULT_CROSSING, glow_style=style,
-                                          glow_colour="signal", effect_size=size)),
+                                          glow_colour="signal", effect_size=size,
+                                          effect_size_fraction=effects.design_values(size=size)[1])),
         crossing_pressure_now=lambda: pressure,
         _current_desktop_bounds=lambda: (0.0, 0.0, width, height),
     )

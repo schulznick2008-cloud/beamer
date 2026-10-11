@@ -187,6 +187,21 @@ class ReservedGestureTypeTests(unittest.TestCase):
         self.assertEqual(translator.translate(GESTURE_TYPE, FakeNSEvent()), [])
         self.assertEqual(translator.translate(SMART_MAGNIFY_TYPE, FakeNSEvent()), [])
 
+    def test_type_29_zoom_fields_translate_recorded_magnification_and_phase(self):
+        translator = GestureTranslator()
+        recorded_fields = {110: 8, 113: 0.06, 132: 2}
+
+        self.assertEqual(translator.translate_cg_gesture(recorded_fields), zoom_in_triple())
+        self.assertAlmostEqual(translator._magnify_accum, 0.01)
+
+        ended_fields = {110: 8, 113: 0.0, 132: 4}
+        self.assertEqual(translator.translate_cg_gesture(ended_fields), [])
+        self.assertEqual(translator._magnify_accum, 0.0)
+
+    def test_type_29_non_zoom_gestures_are_ignored(self):
+        translator = GestureTranslator()
+        self.assertEqual(translator.translate_cg_gesture({110: 6, 113: 0.5, 132: 2}), [])
+
 
 class FakeDockFields:
     def __init__(self, motion, progress, phase=DOCK_PHASE_ENDED, velocity=0.0, hid=DOCK_SWIPE_HID_TYPE):

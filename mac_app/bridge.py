@@ -23,6 +23,7 @@ import desktop_mac
 from input_injector_mac import INJECTED_MARK
 import gestures
 from core import ignored
+from core import crossing_state
 import keyboard_layout
 import media_keys
 from core import keytable
@@ -30,7 +31,9 @@ from core import link as link_module
 from core import owner as owner_module
 from core import peerlist
 from core import protocol
+from core import special_keys
 from core import receiver
+from core import settings_sync
 from core import ways
 from pointer_hide import PointerHider
 from key_codes import (
@@ -58,14 +61,15 @@ SSH_FALLBACK_HOST = "127.0.0.1"
 SSH_FALLBACK_PORT = 24822
 DESKTOP_BOUNDS_MAX_AGE_SECONDS = 1.0
 CROSSING_RETRY_SECONDS = 30.0
+TAP_HID_STALL_SECONDS = 2.0
 ROUND_TRIP_SAMPLES = 8
 ROUND_TRIP_MAX_AGE_SECONDS = 5.0
 # A driven Mac that is asked to drive waits this long for its owner to let go (the responder ends
 # the ownership by force after one second), then goes ahead.
 LET_GO_WAIT_SECONDS = 1.3
 OWN_PLATFORM = "macos"
-CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync")
-MEDIA_KEY_NAMES = frozenset({"volume_mute", "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause"})
+CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "displays", "ping_rtt")
+MEDIA_KEY_NAMES = frozenset({"volume_mute", "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause", "brightness_up", "brightness_down"})
 
 # Why input came home, in words, for the alert. A why that is not here comes home quietly.
 WHY_TEXT = {
@@ -571,6 +575,8 @@ class KVMController:
         self.last_trigger_down = 0.0
         self.trigger_suppressed = False
         self.redirect_started_at = 0.0
+        self._last_tap_event_at = self.clock()
+        self._move_reason = None
         self.ignore_gate = ignored.Gate(cfg.ignored_inputs)
         # Crossing: the engine is pure and runs on the event-tap thread; the
         # desktop bounds come from CoreGraphics (already in the top-left
@@ -647,8 +653,16 @@ class KVMController:
     # The machines, and which one a shortcut or a status means
 
     def _crossing_engine(self):
-        """This Mac's zones for every machine it sends to (WIRE.md section 8). A controller made from a
-        Config alone has the flat crossing settings for its one machine instead."""
+        """This Mac's zones for every machine it sends to (WIRE.md section 8), keeping the arrival grace
+        of the engine it replaces: a link up or a save just after a landing must not end it."""
+        engine = self._fresh_crossing_engine()
+        previous = getattr(self, "crossing", None)
+        if isinstance(previous, crossing.CrossingEngine):
+            engine.keep_grace(previous)
+        return engine
+
+    def _fresh_crossing_engine(self):
+        """A controller made from a Config alone has the flat crossing settings for its one machine."""
         if self._memory is not None:
             if not self.cfg.send_to_windows:
                 return crossing.CrossingEngine(resistance_px=self.cfg.crossing["resistance_px"],
@@ -661,6 +675,116 @@ class KVMController:
     def zones_changed(self):
         """A machine's side or zones changed in the settings: the engine is built again from them."""
         self.crossing = self._crossing_engine()
+
+    def crossing_capable(self):
+        known = getattr(self, "_crossing_known_caps", {})
+        known.update({peer: frozenset(link.caps) for peer, link in list(self._peers_up.items())})
+        if self.responder is not None:
+            known.update({protocol.id_text(peer): self.responder.caps_of(peer) or frozenset()
+                          for peer in self.responder.links()})
+        with self.book.lock:
+            settings = self.book._load()
+            peers = {entry.get("id") for entry in settings.get("peers", [])}
+            inferred = {entry.get("id") for entry in settings.get("peers", [])
+                        if entry.get("id") not in known and entry.get("from_1_4") is not True
+                        and entry.get("id") in settings.get("layout", {})}
+        self._crossing_known_caps = {peer: caps for peer, caps in known.items() if peer in peers}
+        capable = inferred | {peer for peer, caps in self._crossing_known_caps.items() if "layout" in caps}
+        capable.add(protocol.id_text(self.identity()["id"]))
+        return capable
+
+    def _save_crossing(self, outcome, capable):
+        if not outcome["changed"]:
+            return
+        store = getattr(self.book._save, "__self__", None)
+        if store is not None and hasattr(store, "_config"):
+            store._crossing_capable = capable
+        self.book._save(outcome["settings"])
+        if store is not None and hasattr(store, "_config"):
+            from settings_store import MOVED_CROSSING
+
+            saved = store._config(store.current())
+            # Crossing events own peer ways, not local controls awaiting their debounced save.
+            with self._cfg_lock:
+                self.cfg = dataclasses.replace(self.cfg, crossing={
+                    **self.cfg.crossing,
+                    **{name: saved.crossing[name] for name in MOVED_CROSSING},
+                })
+
+    def crossing_event(self, handler, *args, arrived=None, **kwargs):
+        """Compute and save atomically, releasing the book before taking responder locks."""
+        capable = kwargs.setdefault("capable", self.crossing_capable())
+        with self.book.lock:
+            outcome = handler(self.book._load(), *args, **kwargs)
+            self._save_crossing(outcome, capable)
+        return self.carry_crossing(outcome, source=kwargs.get("source"), arrived=arrived, saved=True)
+
+    def carry_crossing(self, outcome, source=None, arrived=None, saved=False):
+        """Save, rebuild and re-arm before publishing a crossing event's messages."""
+        if not (outcome["changed"] or outcome["tell"] or outcome["send_picture"] or outcome["forward_picture"]):
+            return outcome
+        if outcome["changed"] and not saved:
+            capable = self.crossing_capable()
+            with self.book.lock:
+                self._save_crossing(outcome, capable)
+        self.zones_changed()
+        server = self.responder
+        if server is not None:
+            server.peers_changed()
+            server.rearm()
+        with self.book.lock:
+            held = copy.deepcopy(self.book._load())
+        for peer in outcome["tell"]:
+            entry = ways._entry(held, peer)
+            if entry is None or entry.get("side") not in crossing.EDGES:
+                continue
+            sent = self.send_arrangement(peer, entry["side"], entry.get("side_set_at", 0), entry.get("side_by"))
+            if not sent and server is not None:
+                server.send(protocol.read_id(peer), protocol.arrangement_v6(
+                    entry["side"], int(entry.get("side_set_at", 0)),
+                    protocol.read_id(entry.get("side_by")) or bytes(self.identity()["id"]),
+                    way_back=self.way_back(peer), way_back_by=protocol.read_id(self.way_back_by(peer))))
+        if outcome["send_picture"]:
+            for message in self.announce():
+                if message.get("type") == protocol.MSG_SETTINGS:
+                    self._send_crossing_picture(message["data"])
+        if outcome["forward_picture"] and arrived is not None:
+            self._send_crossing_picture(arrived, source=source)
+        return outcome
+
+    def _send_crossing_picture(self, data, source=None):
+        capable = self.crossing_capable()
+        outbound = set()
+        for peer, link in list(self._peers_up.items()):
+            if peer != source and peer in capable and link.live():
+                link.post(protocol.settings_msg(settings_sync.for_capabilities(data, link.caps)))
+                outbound.add(peer)
+        if self.responder is not None:
+            for ident in self.responder.links():
+                peer = protocol.id_text(ident)
+                if peer != source and peer in capable and peer not in outbound:
+                    caps = self.responder.caps_of(ident) or ()
+                    self.responder.send(ident, protocol.settings_msg(settings_sync.for_capabilities(data, caps)))
+
+    def crossing_link_up(self, peer):
+        return self.crossing_event(crossing_state.link_up, peer, platform="mac",
+            own_displays=self.crossing_display_map(), now=time.time())
+
+    def crossing_display_map(self):
+        try:
+            return desktop_mac.display_map()
+        except RuntimeError:
+            with self.book.lock:
+                return copy.deepcopy(self.book._load().get("layout", {}).get(
+                    protocol.id_text(self.identity()["id"]), {}).get("displays", {}))
+
+    def crossing_displays_changed(self):
+        displays = self.crossing_display_map()
+        if displays == getattr(self, "_crossing_displays", None):
+            return
+        self.crossing_event(crossing_state.displays_changed, platform="mac",
+            own_displays=displays, now=time.time())
+        self._crossing_displays = copy.deepcopy(displays)
 
     def _ready(self, peer):
         """Whether `peer` can take this Mac's input now: its link is up and it accepts input."""
@@ -702,6 +826,38 @@ class KVMController:
             link = self._primary_link
             return link.peer_id if link is not None and link.peer_id else None
         return ways.shortcut_peer(self.book.peers(), self._last_peer, self._ready)
+
+    def _shortcut_cycle(self):
+        peers = self.book.peers()
+        settings = self.book._load() or {}
+        derived = ways.derive_layout(settings, gap=0)
+        layout = derived if not settings.get("layout_set_at", 0) else {
+            **derived, **(settings.get("layout") or {})
+        }
+        shelf = {entry.get("id") for entry in peers if entry.get("left_out") is True
+                 or entry.get("in_use", True) is False
+                 or getattr(self.links.get(entry.get("token")), "kind", "") == "forgotten"}
+        layout = {peer: tile for peer, tile in layout.items() if peer not in shelf}
+        states = ways.compile_layout(settings, layout).get("tiles", {})
+        own = protocol.id_text(self.identity()["id"])
+        positions = {peer: tuple(tile[key] for key in ("x", "y", "w", "h"))
+                     for peer, tile in layout.items() if peer == own or (
+                         states.get(peer, {}).get("state") in ("edge", "part", "corner")
+                         and ways.has_way(settings, peer))
+                     or states.get(peer, {}).get("state") in ("between", "set-elsewhere")}
+        return ways.shortcut_order(peers, own, positions,
+                                   self.cfg.crossing.get("shortcut_goes_to", "last"))
+
+    def _cycle_target(self):
+        order = self._shortcut_cycle()
+        target, skipped = ways.next_target(self.cfg.crossing, order,
+                                           protocol.peer_id_text(self.owner.on) if self.owner.on else None, self._ready)
+        self._announce_shortcut_skips(skipped)
+        return target
+
+    def _announce_shortcut_skips(self, skipped):
+        for ident in skipped:
+            self._alert("Beamer", f"Skipped {self._name_of(ident)}: not connected.")
 
     def _link_of(self, peer):
         """The link to `peer`, up or not; None when this Mac has none to it."""
@@ -962,7 +1118,8 @@ class KVMController:
         self.crossing = self._crossing_engine()
         self._crossing_failed = False
 
-    def set_redirecting(self, value, edge=None, offset=None, came_home=True, peer=None):
+    def set_redirecting(self, value, edge=None, offset=None, came_home=True, peer=None, reason=None,
+                        display=None, side=None):
         """`edge` and `offset` are the edge of the other machine and fraction along it a
         crossing arrives at; absent for the shortcut, when it leaves its pointer where it is.
         `peer` is the machine to send input to: a zone's, or one a menu names; without it, the
@@ -981,7 +1138,7 @@ class KVMController:
         if value:
             # A menu naming another machine while input is away moves it straight there (WIRE.md
             # section 5, "Moving input"): the owner lets go of the one it leaves in the same route.
-            return self._redirect(edge, offset, peer)
+            return self._redirect(edge, offset, peer, reason=reason, display=display, side=side)
         self._return_local()
         self.logger.info("input returned to this Mac")
         if came_home:
@@ -1000,7 +1157,7 @@ class KVMController:
         name = self._name_of(peer) if peer else None
         return status if not name or name in status else f"{name}: {status}"
 
-    def _redirect(self, edge, offset, peer=None):
+    def _redirect(self, edge, offset, peer=None, reason=None, display=None, side=None):
         peer = peer or self._shortcut_peer()
         link = self._peers_up.get(peer) if peer else None
         if link is None or not link.live():
@@ -1012,7 +1169,7 @@ class KVMController:
             # (the responder ends it by force after a second): a machine never does both.
             send_home = self.send_peer_home
             if send_home is not None and send_home():
-                self._go_after_let_go(edge, offset, peer=peer)
+                self._go_after_let_go(edge, offset, peer=peer, display=display, side=side)
                 return True
             self.logger.warning("cannot redirect: another machine is driving this Mac and cannot be reached")
             return False
@@ -1021,7 +1178,11 @@ class KVMController:
             return False
         self.redirect_started_at = self.clock()
         self._note_clipboard()
-        self._step(lambda owner: owner.go(peer, edge, offset))
+        self._move_reason = reason or ("edge" if edge is not None else "shortcut")
+        try:
+            self._step(lambda owner: owner.go(peer, edge, offset, display=display, side=side))
+        finally:
+            self._move_reason = None
         if not self.redirecting or self.owner.on != peer:
             return False
         responder = self.responder
@@ -1033,7 +1194,7 @@ class KVMController:
             return False
         return True
 
-    def _go_after_let_go(self, edge, offset, step=None, peer=None):
+    def _go_after_let_go(self, edge, offset, step=None, peer=None, reason=None, display=None, side=None):
         if self._letting_go:
             return
         self._letting_go = True
@@ -1049,7 +1210,8 @@ class KVMController:
                 if self.receiving or self.stop_event.is_set():
                     self.logger.warning("the machine driving this Mac did not let go; the move is dropped")
                     return
-                if self.set_redirecting(True, edge, offset, peer=peer) and step is not None:
+                if self.set_redirecting(True, edge, offset, peer=peer, reason=reason,
+                                        display=display, side=side) and step is not None:
                     self._notify_crossing("cross", step)
             finally:
                 self._letting_go = False
@@ -1132,6 +1294,7 @@ class KVMController:
         except Exception:
             self.logger.exception("failed to toggle local cursor association")
             return
+        self.logger.debug("CGAssociateMouseAndMouseCursorPosition(%s) returned status %r", follows, status)
         # CGAssociateMouseAndMouseCursorPosition's return value was
         # previously ignored outright, which is how a macOS version where
         # this call is silently ineffective (see _warp_cursor_to_pin, the
@@ -1141,7 +1304,7 @@ class KVMController:
         if not self._cursor_assoc_status_logged:
             self._cursor_assoc_status_logged = True
             self.logger.info(
-                "CGAssociateMouseAndMouseCursorPosition(%s) returned status %r (0 == success)",
+                "CGAssociateMouseAndMouseCursorPosition(%s) returned status %r (0 == success; logged once per run)",
                 follows,
                 status,
             )
@@ -1263,6 +1426,11 @@ class KVMController:
 
     def _event_tap_callback(self, proxy, event_type, event, refcon):
         try:
+            if event_type not in (
+                self.quartz.kCGEventTapDisabledByTimeout,
+                self.quartz.kCGEventTapDisabledByUserInput,
+            ):
+                self._last_tap_event_at = self.clock()
             if event_type in (
                 self.quartz.kCGEventTapDisabledByTimeout,
                 self.quartz.kCGEventTapDisabledByUserInput,
@@ -1522,9 +1690,11 @@ class KVMController:
                 if send_home is None or not send_home():
                     self.logger.warning("cannot cross: another machine is driving this Mac and cannot be reached")
                     return event
-                self._go_after_let_go(step.edge, step.offset, step, peer=self._zone_peer(step))
+                self._go_after_let_go(step.edge, step.offset, step, peer=self._zone_peer(step), reason="edge",
+                                      display=getattr(step, "display", None), side=getattr(step, "side", None))
                 return event
-            if self.set_redirecting(True, edge=step.edge, offset=step.offset, peer=self._zone_peer(step)):
+            if self.set_redirecting(True, edge=step.edge, offset=step.offset, peer=self._zone_peer(step), reason="edge",
+                                    display=getattr(step, "display", None), side=getattr(step, "side", None)):
                 self._notify_crossing("cross", step)
                 return None
             return event
@@ -1574,7 +1744,7 @@ class KVMController:
         if self.owner.on == peer:
             self.set_redirecting(False)
         else:
-            self.set_redirecting(True, peer=peer)
+            self.set_redirecting(True, peer=peer, reason=f"jump chord {chord}")
         return True
 
     def _current_desktop_bounds(self):
@@ -1637,10 +1807,7 @@ class KVMController:
         return self.crossing.pressure_at(self.clock())
 
     def _handle_system_event(self, event):
-        """Forward a media/volume key press. Anything that is not one --
-        brightness, keyboard backlight, and the undocumented subtypes that
-        share NSSystemDefined -- passes through to macOS untouched, as does a
-        media key kept on this Mac and everything when not redirecting."""
+        """Forward recognised media and brightness presses; unrelated system-defined events pass through."""
         if not self.redirecting:
             return event
         try:
@@ -1684,6 +1851,11 @@ class KVMController:
             # the user is looking at Windows.
             fields = self._read_dock_event(event)
             messages = self.dock_classifier.translate(fields) if fields is not None else []
+        elif event_type == gestures.GESTURE_TYPE:
+            fields = self._read_cg_gesture_event(event)
+            if fields is None or fields.get(gestures.GESTURE_FIELD_HID_TYPE) != gestures.GESTURE_ZOOM_HID_TYPE:
+                return event
+            messages = self.gesture_translator.translate_cg_gesture(fields)
         else:
             gesture_view = self._convert_gesture_event(event)
             if gesture_view is None:
@@ -1691,7 +1863,7 @@ class KVMController:
             messages = self.gesture_translator.translate(event_type, gesture_view)
         if not self._gesture_capture_logged:
             self._gesture_capture_logged = True
-            self.logger.info("gesture capture active")
+            self.logger.info("gesture capture active; logged once per run")
         for message in messages:
             try:
                 self.outbound.put_nowait(message)
@@ -1706,8 +1878,8 @@ class KVMController:
         """Counterpart to _handle_gesture_event for gestures captured by the
         overlay NSPanel's ordinary AppKit responder methods (magnifyWithEvent_
         / swipeWithEvent_, see kvm_bridge_app.py) rather than the CGEventTap
-        -- macOS 27 beta was observed to never deliver gesture event types
-        29-32 to the tap at all, so this is the path that actually works.
+        -- macOS 27 beta was observed not to deliver gesture event types 29-32
+        to the tap, so the overlay remains a fallback for those NSEvents.
 
         Called from the AppKit main thread while the tap thread runs
         concurrently; thread-safe for the same reason the tap path is: it
@@ -1720,7 +1892,7 @@ class KVMController:
             return
         if not self._overlay_gesture_capture_logged:
             self._overlay_gesture_capture_logged = True
-            self.logger.info("gesture capture active (overlay)")
+            self.logger.info("gesture capture active (overlay); logged once per run")
         try:
             messages = self.gesture_translator.translate(event_type, gesture_view)
         except Exception:
@@ -1747,6 +1919,24 @@ class KVMController:
             self.logger.debug("failed to read a DockControl event", exc_info=True)
             return None
 
+    def _read_cg_gesture_event(self, event):
+        try:
+            quartz = self.quartz
+            return {
+                gestures.GESTURE_FIELD_HID_TYPE: quartz.CGEventGetIntegerValueField(
+                    event, gestures.GESTURE_FIELD_HID_TYPE
+                ),
+                gestures.GESTURE_FIELD_MAGNIFICATION: quartz.CGEventGetDoubleValueField(
+                    event, gestures.GESTURE_FIELD_MAGNIFICATION
+                ),
+                gestures.GESTURE_FIELD_PHASE: quartz.CGEventGetIntegerValueField(
+                    event, gestures.GESTURE_FIELD_PHASE
+                ),
+            }
+        except Exception:
+            self.logger.debug("failed to read a type-29 gesture event", exc_info=True)
+            return None
+
     def _default_dock_event_reader(self, event):
         quartz = self.quartz
         return types.SimpleNamespace(
@@ -1762,6 +1952,11 @@ class KVMController:
         was_redirecting = self.redirecting
         suppress = was_redirecting or self.trigger_suppressed
         changed = False
+        if result.is_down and not result.is_repeat:
+            # rc14 (10-10-2026): a shortcut that "did not register" left no trace, so whether the key
+            # reached the tap at all could not be told from the log.
+            self.logger.info("shortcut key pressed (%s, input %s)", self.cfg.trigger_style,
+                             f"on {self._name_of(self.owner.on)}" if self.owner.on else "home")
         if self.cfg.trigger_style == "hold":
             # Input is on Windows for exactly as long as the key is down. The
             # key itself never reaches either machine: it would be a stray
@@ -1770,7 +1965,10 @@ class KVMController:
             if result.is_repeat:
                 return None
             if result.is_down:
-                self.set_redirecting(True)
+                target, skipped = ways.hold_target(
+                    self.cfg.crossing, self._shortcut_cycle(), self._last_peer, self._ready)
+                self._announce_shortcut_skips(skipped)
+                self.set_redirecting(True, peer=target, reason="hold")
             else:
                 self.set_redirecting(False)
             return None
@@ -1778,7 +1976,13 @@ class KVMController:
             now = self.clock()
             threshold = self.cfg.double_tap_ms / 1000.0
             if self.last_trigger_down and now - self.last_trigger_down <= threshold:
-                changed = self.set_redirecting(not was_redirecting)
+                mode = self.cfg.crossing.get("shortcut_goes_to", "last")
+                if mode == "last":
+                    changed = self.set_redirecting(not was_redirecting, reason="shortcut double-tap")
+                else:
+                    target = self._cycle_target()
+                    changed = self.set_redirecting(target is not None,
+                                                   peer=target, reason="shortcut double-tap")
                 self.last_trigger_down = 0.0
             else:
                 self.last_trigger_down = now
@@ -1940,33 +2144,20 @@ class KVMController:
 
     def _announce_to(self, link, fields):
         """What this Mac tells a peer the moment the link is up (WIRE.md section 3)."""
-        entry = link.entry() or {}
-        own = bytes(self.identity()["id"])
-        if entry.get("side") in crossing.EDGES:
-            by = protocol.read_id(entry.get("side_by")) or own
-            link.post(protocol.arrangement_v6(
-                entry["side"], entry.get("side_set_at", 0), by, way_back=self.way_back(link.peer_id),
-                way_back_by=protocol.read_id(self.way_back_by(link.peer_id)),
-            ))
-        if "settings" in link.caps:
-            try:
-                announcements = list(self.announce())
-            except Exception:
-                self.logger.exception("announce failed")
-                announcements = []
-            for message in announcements:
-                if message.get("type") == protocol.MSG_SETTINGS:
-                    link.post(message)
+        # `paired` goes before the shared picture: the receiver admits third-party tiles only from
+        # the paired list it holds, and a picture is applied once per stamp.
         self._announce_paired(link)
+        self.crossing_link_up(link.peer_id)
+        if "settings" in link.caps and "layout" not in link.caps:
+            for message in self.announce():
+                if message.get("type") == protocol.MSG_SETTINGS:
+                    link.post(dict(message, data=settings_sync.for_capabilities(message.get("data", {}), link.caps)))
 
     def _pairing_ids(self):
-        return tuple(peer.get("id") for peer in self.book.peers()
-                     if peer.get("in_use", True) is True and protocol.read_id(peer.get("id")) is not None)
+        return tuple(peerlist.paired_ids(self.book.peers()))
 
     def _announce_paired(self, link):
-        ids = [protocol.read_id(peer.get("id")) for peer in self.book.peers()
-               if peer.get("in_use", True) is True and peer.get("id") != link.peer_id]
-        ids = [ident for ident in ids if ident is not None][:protocol.MAX_PEERS]
+        ids = [protocol.read_id(ident) for ident in peerlist.paired_ids(self.book.peers(), exclude=link.peer_id)]
         link.post(protocol.paired_msg(ids))
 
     def _announce_changes(self):
@@ -2070,7 +2261,7 @@ class KVMController:
         sent = False
         for peer, link in list(self._peers_up.items()):
             if peer != source and "settings" in link.caps and link.live():
-                sent = link.post(protocol.settings_msg(data)) or sent
+                sent = link.post(protocol.settings_msg(settings_sync.for_capabilities(data, link.caps))) or sent
         return sent
 
     # The owner
@@ -2208,6 +2399,12 @@ class KVMController:
         if link is None:
             return
         message = send.message
+        if message.get("type") == protocol.MSG_KEYDOWN and message.get("data", {}).get("key") == "tab":
+            for transition in self._switcher_transition(send.peer, link):
+                if not link.send_input(transition):
+                    if link.live():
+                        link.drop("The outbound queue filled")
+                    return
         if message.get("type") == gestures.CHORD:
             receiver = "mac" if keytable.is_mac(link.peer_platform) else "windows"
             for part in gestures.chord_for(message["data"]["action"], receiver):
@@ -2226,6 +2423,13 @@ class KVMController:
         if not sent and link.live():
             link.drop("The outbound queue filled")
 
+    def _switcher_transition(self, peer, link):
+        sent = {physical: name for (sent_peer, physical), name in self._sent_names.items() if sent_peer == peer}
+        messages, held_as = special_keys.switcher_transitions(OWN_PLATFORM, link.peer_platform, sent)
+        for physical, name in held_as.items():
+            self._sent_names[(peer, physical)] = name
+        return messages
+
     def _key_style(self):
         return config_module.key_map_style(self.cfg.key_map) or self.cfg.key_map
 
@@ -2240,13 +2444,18 @@ class KVMController:
             return message if "media_keys" in link.caps else None
         held = (link.peer_id, key)
         if message["type"] == protocol.MSG_KEYUP and held in self._sent_names:
-            name = self._sent_names.pop(held)
-            if any(peer == held[0] and sent == name for (peer, _physical), sent in self._sent_names.items()):
+            sent = {physical: name for (peer, physical), name in self._sent_names.items() if peer == held[0]}
+            name = special_keys.release_key(key, sent)
+            self._sent_names.pop(held)
+            if name is None:
                 return None
         elif message["type"] == protocol.MSG_KEYDOWN and held in self._sent_names:
             name = self._sent_names[held]
         else:
             name = keytable.wire_name(key, OWN_PLATFORM, link.peer_platform, self._key_style())
+            name = special_keys.wire_name(name, OWN_PLATFORM, link.peer_platform)
+            if name is None:
+                return None
             if message["type"] == protocol.MSG_KEYDOWN:
                 self._sent_names[held] = name
         data["key"] = name
@@ -2261,7 +2470,13 @@ class KVMController:
             f" at the {moved.edge} edge" if isinstance(moved.edge, str) else "",
             threading.current_thread().name,
         )
+        if moved.why == "switch":
+            self.logger.info("move started by peer request")
+        elif moved.to is not None:
+            cause = self._move_reason or ("edge" if moved.edge else "shortcut")
+            self.logger.info("move started by %s", cause)
         if moved.to is not None:
+            self._last_tap_event_at = self.clock()
             with self._repair_lock:
                 self._repair_disagreement_seen = False
             if not self.redirecting:
@@ -2273,6 +2488,9 @@ class KVMController:
             self._last_peer = moved.to
             self.logger.info("redirecting input to %s", self._name_of(moved.to))
             return
+        if moved.why == "switch" and moved.edge in crossing.EDGES:
+            # Before the cleanup hands the pointer back to the hand, so no event lands between.
+            self.crossing.start_grace(self.clock())
         self._local_cleanup()
         other = ""
         if isinstance(moved.other, bytes) and moved.other != bytes(self.identity()["id"]):
@@ -2285,9 +2503,9 @@ class KVMController:
             self.logger.warning("%s; input returned to this Mac", text)
             self._alert("Beamer", text)
         if moved.why == "switch":
-            self._arrive(moved.edge, moved.offset)
+            self._arrive(moved.edge, moved.offset, moved.display, moved.side)
 
-    def _arrive(self, edge, offset):
+    def _arrive(self, edge, offset, display=None, side=None):
         """The other machine sent input back: land the pointer where it left, `edge` being the edge
         of this Mac to arrive at and `offset` the fraction along it. Without an edge the pointer
         stays where it was and the arrival says so."""
@@ -2296,7 +2514,8 @@ class KVMController:
         if crossed:
             try:
                 point = crossing.CrossingEngine.arrival_point(
-                    edge, offset, self._current_desktop_bounds(), displays=self._current_displays())
+                    edge, offset, self._current_desktop_bounds(), displays=self._current_displays(),
+                    display=display, side=side)
             except Exception:
                 self.logger.exception("failed to place the pointer on arrival")
             else:
@@ -2395,9 +2614,29 @@ class KVMController:
                 self.logger.exception("outbound worker recovered")
 
     def _owner_tick(self):
+        self._check_tap_watchdog()
         deadline = self.owner.deadline()
         if deadline is not None and self.clock() >= deadline:
             self._step(lambda owner: owner.tick())
+
+    def _check_tap_watchdog(self):
+        if not self.redirecting:
+            return
+        try:
+            seconds_ago = float(self.quartz.CGEventSourceSecondsSinceLastEventType(
+                self.quartz.kCGEventSourceStateHIDSystemState,
+                self.quartz.kCGAnyInputEventType,
+            ))
+        except Exception:
+            self.logger.debug("could not read the last HID event time", exc_info=True)
+            return
+        latest_hid_event = self.clock() - seconds_ago
+        if latest_hid_event - self._last_tap_event_at <= TAP_HID_STALL_SECONDS:
+            return
+        self.logger.warning("the event tap is not receiving input while redirected")
+        self._return_local()
+        if self.event_tap is not None:
+            self.quartz.CGEventTapEnable(self.event_tap, True)
 
     def _process_outbound(self, message):
         """Handle one dequeued item: input the tap captured, which the owner routes (to the machine

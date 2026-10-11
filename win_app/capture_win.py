@@ -17,9 +17,12 @@ callback thread:
   checks whether redirecting is still live, and the moment the sender says it
   is not -- a dropped link, a missed acknowledgement -- it passes the event
   through. Nothing it does can block.
-- Injected events are ignored (LLKHF_INJECTED / LLMHF_INJECTED). Without that,
-  every SendInput this PC makes for the Mac's own input would come straight
-  back round as a captured event. Raw Input has no such flag, so the injector
+- Injected mouse moves are ignored (LLMHF_INJECTED), and injected mouse
+  buttons and wheel only when they carry INJECTED_MARK. Injected keys follow
+  the same mark rule: keys another program types (Logi Options+, a remapper)
+  are the user's and cross. Without that, every SendInput this PC makes for
+  the Mac's own input would come straight back round as a captured event. Raw
+  Input has no such flag, so the injector
   stamps INJECTED_MARK into every SendInput's dwExtraInfo and the WM_INPUT
   reader drops a move carrying it. Without that, the Mac's last deltas after
   a return crossing -- injected here, then reported by Raw Input as the mouse
@@ -46,6 +49,7 @@ import threading
 import unicodedata
 from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
+from core.capture_types import DeadKey, TextInput
 from input_injector import INJECTED_MARK, SCAN_TO_US
 
 LOGGER = logging.getLogger(__name__)
@@ -132,6 +136,50 @@ def mouse_event(message: int, mouse_data: int):
     return None
 
 
+def internal_seam_position(point, monitors, display_map, models):
+    """Return the owning display edge when `point` has crossed an armed internal seam."""
+    x, y = point
+    for model in models:
+        display = getattr(model, "display", None)
+        edge = getattr(model, "edge", None)
+        rect = display_map.get(display) if isinstance(display, str) else None
+        if rect is None or edge not in ("left", "right", "top", "bottom"):
+            continue
+        if edge in ("left", "right"):
+            if not rect.y <= y <= rect.bottom:
+                continue
+            if edge == "left":
+                crossed = x < rect.x and any(
+                    monitor.x + monitor.width == rect.x and monitor.y <= y <= monitor.bottom
+                    and monitor.x <= x <= monitor.right for monitor in monitors
+                )
+                held = (rect.x, y)
+            else:
+                crossed = x > rect.right and any(
+                    monitor.x == rect.x + rect.width and monitor.y <= y <= monitor.bottom
+                    and monitor.x <= x <= monitor.right for monitor in monitors
+                )
+                held = (rect.right, y)
+        else:
+            if not rect.x <= x <= rect.right:
+                continue
+            if edge == "top":
+                crossed = y < rect.y and any(
+                    monitor.y + monitor.height == rect.y and monitor.x <= x <= monitor.right
+                    and monitor.y <= y <= monitor.bottom for monitor in monitors
+                )
+                held = (x, rect.y)
+            else:
+                crossed = y > rect.bottom and any(
+                    monitor.y == rect.y + rect.height and monitor.x <= x <= monitor.right
+                    and monitor.y <= y <= monitor.bottom for monitor in monitors
+                )
+                held = (x, rect.bottom)
+        if crossed and model._at_edge(monitors, held, display_map):
+            return held
+    return None
+
+
 # What the Keyboard page calls a recorded key, in Windows' own words.
 VK_TITLES: Dict[int, str] = {
     0x08: "Backspace", 0x09: "Tab", 0x0D: "Enter", 0x13: "Pause", 0x14: "Caps Lock", 0x1B: "Esc",
@@ -141,8 +189,11 @@ VK_TITLES: Dict[int, str] = {
     0x6D: "Num -", 0x6E: "Num .", 0x6F: "Num /", 0x90: "Num Lock", 0x91: "Scroll Lock",
     0xA0: "Left Shift", 0xA1: "Right Shift", 0xA2: "Left Ctrl", 0xA3: "Right Ctrl",
     0xA4: "Left Alt", 0xA5: "Right Alt", 0xA6: "Browser Back", 0xA7: "Browser Forward",
+    0xA8: "Browser Refresh", 0xA9: "Browser Stop", 0xAA: "Browser Search", 0xAB: "Browser Favourites",
+    0xAC: "Browser Home",
     0xAD: "Mute", 0xAE: "Volume Down", 0xAF: "Volume Up", 0xB0: "Next Track",
-    0xB1: "Previous Track", 0xB2: "Stop", 0xB3: "Play/Pause", 0xBA: ";", 0xBB: "=", 0xBC: ",",
+    0xB1: "Previous Track", 0xB2: "Stop", 0xB3: "Play/Pause", 0xB4: "Mail", 0xB5: "Media Select",
+    0xB6: "Launch App 1", 0xB7: "Launch App 2", 0xBA: ";", 0xBB: "=", 0xBC: ",",
     0xBD: "-", 0xBE: ".", 0xBF: "/", 0xC0: "`", 0xDB: "[", 0xDC: "\\", 0xDD: "]", 0xDE: "'",
 }
 for _index in range(24):
@@ -227,6 +278,11 @@ VK_TO_NAME: Dict[int, str] = {
     0xA5: "alt_r",
     0xA6: "browser_back",
     0xA7: "browser_forward",
+    0xA8: "browser_refresh",
+    0xA9: "browser_stop",
+    0xAA: "browser_search",
+    0xAB: "browser_favourites",
+    0xAC: "browser_home",
     0xAD: "volume_mute",
     0xAE: "volume_down",
     0xAF: "volume_up",
@@ -234,6 +290,10 @@ VK_TO_NAME: Dict[int, str] = {
     0xB1: "media_prev",
     0xB2: "media_stop",
     0xB3: "media_play_pause",
+    0xB4: "mail",
+    0xB5: "media_select",
+    0xB6: "launch_app1",
+    0xB7: "launch_app2",
     # The undifferentiated modifiers, which a low-level hook does not normally
     # report but a synthetic event can.
     0x10: "shift",
@@ -246,9 +306,9 @@ for _index in range(1, 13):
 for _index in range(13, 21):
     VK_TO_NAME[0x7C + (_index - 13)] = f"f{_index}"
 
-# Media and browser keys are never the trigger: they are what the stays-on-this-PC list is for.
+# System and browser keys are never the trigger: they are what the stays-on-this-PC list is for.
 # The undifferentiated 0x10-0x12 never reach the hook.
-NOT_TRIGGER_VKS = {0x10, 0x11, 0x12} | set(range(0xA6, 0xB4))
+NOT_TRIGGER_VKS = {0x10, 0x11, 0x12} | set(range(0xA6, 0xB8))
 # Loaded if a config names them, never offered by the recorder, as on the Mac: Backspace, Tab,
 # Enter, Esc and Space are typing keys a double-tap or a hold would take from every app, and
 # Windows gives a window no key-down for Print Screen, so it cannot be recorded at all.
@@ -284,16 +344,6 @@ class KeyboardState:
     def bytes_for(self) -> Dict[int, int]:
         state = {VK_SHIFT: 0x80 if self.shift_down else 0x00, VK_CAPITAL: 0x01 if self.caps_lock else 0x00}
         return state
-
-
-class DeadKey:
-    def __init__(self, character: str) -> None:
-        self.character = character
-
-
-class TextInput:
-    def __init__(self, text: str) -> None:
-        self.text = text
 
 
 def _compose_dead_key(dead_key: str, character: str) -> Union[str, TextInput]:
@@ -377,9 +427,21 @@ class Trigger:
         self.window_ms = window_ms
         self._last_at: Optional[float] = None
         self._held = False
+        self._down = False
         self._release_owed = False
 
+    def disarmed(self, name: str, down: bool) -> None:
+        """A key while the shortcut is off: no tap may be half-made across it, but the key is
+        still followed, so one held while the shortcut is armed again does not read its next
+        autorepeat as a fresh tap."""
+        self.configure(self.key, self.style, self.window_ms)
+        if name == self.key:
+            self._down = down
+
     def configure(self, key: str, style: str, window_ms: int) -> None:
+        # `_down` is the physical key, so it survives a reconfigure of the same key.
+        if key != self.key:
+            self._down = False
         self.key, self.style, self.window_ms = key, style, int(window_ms)
         self._last_at = None
         self._held = False
@@ -416,7 +478,12 @@ class Trigger:
                 return None
             self._held = down
             return REDIRECT if down else RETURN
-        if not down:
+        was_down, self._down = self._down, down
+        if not down or was_down:
+            # A down while the key is already down is autorepeat, which every capture (the
+            # Windows hook, X11 and the portal) delivers as another down: counting it as a tap
+            # toggled input every 66 ms while the key was held. A lost release (the secure
+            # desktop takes the key-up) costs one tap, since the next release clears it.
             return None
         last = self._last_at
         self._last_at = now
@@ -439,13 +506,15 @@ class Hooks:
     must not reach the rest of Windows. `on_motion(dx, dy)` is called with
     the mouse's own relative counts and consumes nothing -- raw input is a
     listener, never a filter, which is why the hook is still what swallows a
-    move. None of the three may block.
+    move. `on_seam(x, y)` may return a cursor position to hold at an internal display seam; it only
+    reads cached geometry and must stay bounded like the other hook callbacks.
     """
 
-    def __init__(self, on_key, on_mouse, on_motion) -> None:
+    def __init__(self, on_key, on_mouse, on_motion, on_seam=None) -> None:
         self._on_key = on_key
         self._on_mouse = on_mouse
         self._on_motion = on_motion
+        self._on_seam = on_seam
         self._window = None
         self._thread: Optional[threading.Thread] = None
         self._thread_id: Optional[int] = None
@@ -561,7 +630,7 @@ class Hooks:
             return user32.CallNextHookEx(None, code, wparam, lparam)
         try:
             data = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            if data.flags & LLKHF_INJECTED:
+            if data.flags & LLKHF_INJECTED and data.dwExtraInfo == INJECTED_MARK:
                 return user32.CallNextHookEx(None, code, wparam, lparam)
             down = wparam in KEY_DOWN_MESSAGES
             if not down and wparam not in KEY_UP_MESSAGES:
@@ -610,8 +679,14 @@ class Hooks:
             return user32.CallNextHookEx(None, code, wparam, lparam)
         try:
             data = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            if data.flags & LLMHF_INJECTED:
+            if data.flags & LLMHF_INJECTED and (
+                wparam == WM_MOUSEMOVE or data.dwExtraInfo == INJECTED_MARK
+            ):
                 return user32.CallNextHookEx(None, code, wparam, lparam)
+            if wparam == WM_MOUSEMOVE and self._on_seam is not None:
+                position = self._on_seam(data.pt.x, data.pt.y)
+                if position is not None and user32.SetCursorPos(*position):
+                    return 1
             if self._on_mouse(wparam, data.pt.x, data.pt.y, data.mouseData):
                 return 1
         except Exception:

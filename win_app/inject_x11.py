@@ -195,6 +195,8 @@ def plan_key(name: str, down: bool, us: Optional[str], state: KeyState, layout: 
     bits as they are. Updates `state`. Empty for a name this machine cannot press, and for the
     peer's repeat of a key the server is already repeating."""
     lowered = name.lower() if len(name) > 1 else name
+    if lowered in ("search", "spotlight"):
+        lowered = "cmd"
     if lowered in MODIFIER_KEYS:
         if down:
             state.mods_down.add(lowered)

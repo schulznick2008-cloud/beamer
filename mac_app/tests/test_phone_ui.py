@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvm_bridge_app
 import machines
 import pages
+import ledger
 from machines_panel import MachinesPanel
 from core import protocol
 from windows_input import WindowsInput
@@ -51,16 +52,19 @@ class PhoneUiTests(unittest.TestCase):
         self.assertFalse(inbound.send_settings({"on": True}))
         inbound.server.send.assert_not_called()
 
-    def test_crossing_diagram_and_match_caps_exclude_phone(self):
+    def test_crossing_ledger_and_match_caps_exclude_phone(self):
         window = SimpleNamespace(settings_store=SimpleNamespace(current=lambda: {"peers": self.peers, "zones": []}),
-                                 edge_select=SimpleNamespace(value="right"), part_boxes={},
-                                 corner_select=SimpleNamespace(value="top_right"), chosen_peer=self.desktop["id"],
-                                 _shown=lambda text: text,
                                  controller=SimpleNamespace(book=self.book, _peers_up={}), windows_input=mock.Mock())
         window.windows_input.server.links.return_value = [protocol.read_id(self.phone["id"])]
         window.windows_input.server.caps_of.return_value = ["settings", "design_sync"]
-        found = kvm_bridge_app.ControlWindow._diagram_machines(window, ["edge"])
-        self.assertEqual([m["key"] for m in found], [self.desktop["id"]])
+        rows = SimpleNamespace(rows={}, addSubview_=mock.Mock(), reflow=mock.Mock())
+        row = mock.Mock()
+        row.setup.return_value = row
+        with mock.patch.object(ledger, "Row") as constructor:
+            constructor.alloc.return_value.init.return_value = row
+            ledger.Ledger.refresh(rows, window.settings_store.current(), self.desktop["id"])
+        self.assertEqual(rows.order, [self.desktop["id"]])
+        row.refresh.assert_called_once_with(window.settings_store.current(), self.desktop, True)
         self.assertEqual(kvm_bridge_app.ControlWindow._design_peer_caps(window), {})
 
     def test_bulk_send_toggle_excludes_phone(self):
@@ -73,15 +77,17 @@ class PhoneUiTests(unittest.TestCase):
         panel = SimpleNamespace(removing=None, wide=True, directions_open={row.token})
         import widgets
         in_use = widgets.Switch("In use")
+        left_out = widgets.label("Leave out")
         disclosure = widgets.label("Directions")
         remove = widgets.label("Remove")
-        result = MachinesPanel._controls(panel, row, in_use, disclosure,
+        result = MachinesPanel._controls(panel, row, in_use, left_out, disclosure,
                                         widgets.Switch("This Mac drives it"), widgets.Switch("It drives this Mac"), remove)
         self.assertEqual(len(result.arrangedSubviews()), 1)
         views = list(result.arrangedSubviews()[0].arrangedSubviews())
         self.assertIn(in_use.view, views)
         self.assertIn(remove, views)
         self.assertNotIn(disclosure, views)
+        self.assertNotIn(left_out, views)
 
     def test_phone_messages_cannot_set_same_or_match(self):
         window = SimpleNamespace(controller=SimpleNamespace(book=self.book), _design_states={})

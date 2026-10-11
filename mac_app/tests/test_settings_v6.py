@@ -370,13 +370,17 @@ class ReimportTests(Base):
         self.write_settings(settings)
         before = self.path.read_bytes()
         self.store.load()
-        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.settings()["peers"][0]["token"], TOKEN)
+        self.assertTrue(self.settings()["peers"][1]["ways"]["edge"])
+        migrated = self.path.read_bytes()
+        self.store.load()
+        self.assertEqual(self.path.read_bytes(), migrated)
         raw = legacy_1_4_3()
         raw["auth_token"] = OTHER_TOKEN
         self.write_legacy(raw)
         self.store.load()
         peers = self.settings()["peers"]
-        self.assertEqual(peers[1], added)
+        self.assertEqual({key: peers[1][key] for key in added}, added)
         self.assertEqual(peers[0]["token"], OTHER_TOKEN)
 
     def test_a_migrated_peer_the_user_removed_stays_removed_while_config_is_unchanged(self):
@@ -455,6 +459,20 @@ class SavingTests(Base):
             self.assertEqual(self.path.read_bytes(), before)
 
 
+    def test_each_shared_values_stamp_is_saved_and_a_malformed_one_is_dropped(self):
+        stamps = {"glow_colour": [500, PEER_ID], "trigger_key": [400, ""]}
+        self.store.save(config_to_raw(replace(self.cfg, same_stamps=stamps)))
+        self.assertEqual(self.settings()["same_stamps"], stamps)
+        self.assertEqual(self.store.load().same_stamps, stamps)
+        settings = self.settings()
+        settings["same_stamps"] = {"glow_colour": [500, PEER_ID], "trigger_key": ["x", PEER_ID],
+                                   "glow_style": [5, "not an id"], "not_shared": [5, PEER_ID]}
+        self.write_settings(settings)
+        self.assertEqual(SettingsStore(self.path).load().same_stamps, {"glow_colour": [500, PEER_ID]})
+        settings["same_stamps"] = "junk"
+        self.write_settings(settings)
+        self.assertEqual(SettingsStore(self.path).load().same_stamps, {})
+
     def test_saving_keeps_the_machine_id_and_the_id_of_the_peer_and_writes_privately(self):
         settings = self.settings()
         settings["peers"][0].update(id=PEER_ID, linked=True)
@@ -491,7 +509,7 @@ class SavingTests(Base):
         raw["crossing"]["arrangement_set_at"] = 1790000500
         cfg = self.store.save(raw)
         after = self.settings()
-        self.assertEqual(after["peers"][1], added)
+        self.assertEqual({key: after["peers"][1][key] for key in added}, added)
         first = after["peers"][0]
         self.assertEqual((first["host"], first["name"], first["send"]), ("192.0.2.99", "Renamed", False))
         # The side is written by set_ways and arrangement only: a flat view read before another
@@ -534,10 +552,10 @@ class SavingTests(Base):
         self.assertEqual(self.settings()["peers"][0]["side_by"], SECOND_ID)
         self.assertFalse(self.store.set_ways(PEER_ID, side="left", methods=["edge"], parts=["middle"], corner="top_right"))
         self.assertEqual(self.settings()["peers"][0]["side_by"], SECOND_ID)
-        self.assertTrue(self.store.set_ways(PEER_ID, side="top", methods=["edge"], parts=["middle"], corner="top_right"))
+        self.assertFalse(self.store.set_ways(PEER_ID, side="top", methods=["edge"], parts=["middle"], corner="top_right"))
         first = self.settings()["peers"][0]
-        self.assertEqual((first["side"], first["side_by"]), ("top", self.settings()["machine_id"]))
-        self.assertGreater(first["side_set_at"], 1790000000)
+        self.assertEqual((first["side"], first["side_by"]), ("left", SECOND_ID))
+        self.assertEqual(first["side_set_at"], 1790000000)
 
     def test_an_arrangement_from_the_peer_is_stamped_with_the_peers_id_not_this_machines(self):
         self.with_id()
@@ -594,7 +612,7 @@ class SavingTests(Base):
         self.assertFalse(self.settings()["shortcut"])
         self.store.set_ways(PEER_ID, side="left", methods=["part", "notch"], parts=["middle"], corner="top_right")
         zones = {zone["kind"]: zone for zone in self.settings()["zones"]}
-        self.assertTrue(zones["edge"]["off"])
+        self.assertNotIn("edge", zones)
         self.assertNotIn("off", zones["part"])
         self.assertEqual(zones["part"]["parts"], ["middle"])
         self.assertNotIn("off", zones["notch"])
@@ -609,7 +627,7 @@ class SavingTests(Base):
         corner = [z for z in self.settings()["zones"] if z["kind"] == "corner"][0]
         self.assertEqual((corner["corner"], corner["edge"]), ("bottom_left", "left"))
 
-    def test_ways_that_would_clash_with_another_machines_are_refused_with_both_named_and_nothing_written(self):
+    def test_editing_ways_saves_intent_without_moving_the_picture_or_writing_off_flags(self):
         settings = self.with_id()
         second = {**copy.deepcopy(settings["peers"][0]), "id": SECOND_ID, "side": "right", "name": "Second"}
         second["token"] = second["token"][::-1]
@@ -620,11 +638,11 @@ class SavingTests(Base):
         # On the same side as Second, with no way in yet: turning its edge on would cover Second's.
         self.store.set_ways(PEER_ID, side="right", methods=[], parts=["middle"], corner="top_right")
         before = self.settings()
-        with self.assertRaises(SettingsError) as raised:
-            self.store.set_ways(PEER_ID, side="right", methods=["edge"], parts=["middle"], corner="top_right")
-        self.assertIn("Second", str(raised.exception))
-        self.assertIn("right edge of this Mac", str(raised.exception))
-        self.assertEqual(self.settings(), before)
+        self.store.set_ways(PEER_ID, side="right", methods=["edge"], parts=["middle"], corner="top_right")
+        after = self.settings()
+        self.assertTrue(after["peers"][0]["ways"]["edge"])
+        self.assertEqual(after["layout"], before["layout"])
+        self.assertFalse(any(zone.get("off") for zone in after["zones"]))
 
     def second_machine(self, side, zones=None):
         settings = self.with_id()
@@ -641,17 +659,22 @@ class SavingTests(Base):
         self.second_machine("right")
         self.assertIn({"peer": SECOND_ID, "kind": "edge"}, self.store.current()["zones"])
 
-    def test_one_whose_side_is_taken_gets_its_edge_off_and_the_settings_still_read(self):
+    def test_loading_a_taken_side_keeps_edge_intent_without_off_flags_or_a_share_offer(self):
         self.second_machine("left")
-        self.assertIn({"peer": SECOND_ID, "kind": "edge", "off": True}, self.store.current()["zones"])
-        self.assertIn("Second has no way in", ways.blocked_sentence(self.store.current(), SECOND_ID, "this Mac"))
+        second = self.store.current()["peers"][1]
+        self.assertTrue(second["ways"]["edge"])
+        self.assertFalse(any(zone.get("off") for zone in self.store.current()["zones"]))
+        self.assertIsNone(ways.share_offer(self.store.current(), SECOND_ID))
 
-    def test_moving_a_machine_onto_a_taken_side_keeps_the_side_and_turns_its_way_there_off(self):
+    def test_a_side_argument_cannot_move_the_picture_or_disable_edge_intent(self):
         self.second_machine("right", [{"peer": SECOND_ID, "kind": "edge"}])
-        self.assertTrue(self.store.set_ways(SECOND_ID, side="left", methods=["edge"], parts=["middle"], corner="top_right"))
+        self.store.load()
+        before = copy.deepcopy(self.store.current()["layout"])
+        self.assertFalse(self.store.set_ways(SECOND_ID, side="left", methods=["edge"], parts=["middle"], corner="top_right"))
         second = next(entry for entry in self.settings()["peers"] if entry["id"] == SECOND_ID)
-        self.assertEqual(second["side"], "left")
-        self.assertIn({"peer": SECOND_ID, "kind": "edge", "off": True}, self.settings()["zones"])
+        self.assertEqual(second["side"], "right")
+        self.assertEqual(self.settings()["layout"], before)
+        self.assertTrue(second["ways"]["edge"])
 
     def test_ways_for_a_machine_no_longer_paired_are_refused(self):
         with self.assertRaises(SettingsError):
@@ -733,7 +756,7 @@ class PairedAndRemovedTests(Base):
         after = self.settings()
         self.assertEqual([peer["id"] for peer in after["peers"]], [PEER_ID])
         # Only the new machine's own edge, which every machine paired starts with.
-        self.assertEqual(after["zones"], [{"peer": PEER_ID, "kind": "edge"}])
+        self.assertEqual(after["zones"], [{"peer": PEER_ID, "kind": "edge", "side": "right"}])
         self.assertEqual(self.store.load().auth_token, OTHER_TOKEN)
 
     def test_a_pairing_that_cannot_be_written_raises_and_changes_nothing(self):
@@ -755,7 +778,7 @@ class PairedAndRemovedTests(Base):
         self.store.add_peer(self.entry(SECOND_ID, OTHER_TOKEN))
         self.store.remove_peer(TOKEN)
         self.assertEqual(self.store.load().auth_token, OTHER_TOKEN)
-        self.assertEqual(self.settings()["zones"], [{"peer": SECOND_ID, "kind": "edge"}])
+        self.assertEqual(self.settings()["zones"], [{"peer": SECOND_ID, "kind": "edge", "side": "right"}])
 
     def test_removing_the_only_machine_leaves_this_one_unpaired_and_it_stays_so(self):
         self.store.remove_peer(TOKEN)
@@ -1035,15 +1058,36 @@ class OverlapTests(Base):
         self.write_legacy(legacy_1_4_3())
         self.store.load()
 
-    def refused(self, change):
+    def compiled(self, change):
         settings = self.settings()
         change(settings)
+        if settings["peers"][0]["id"] == "":
+            settings["peers"][0]["id"] = PEER_ID
+            settings["zones"] = [{**zone, "peer": PEER_ID} if zone["peer"] == "" else zone
+                                 for zone in settings["zones"]]
+        settings["layout"] = {}
+        for peer in settings["peers"]:
+            peer.pop("ways", None)
         self.write_settings(settings)
-        with self.assertRaises(SettingsError):
-            SettingsStore(self.path).load()
+        self.store = SettingsStore(self.path)
+        self.store.load()
+        saved = self.store.current()
+        self.assertFalse(any(zone.get("off") or zone.get("aside") for zone in saved["zones"]))
+        return saved
 
-    def test_the_edge_and_its_thirds_in_use_together_are_refused(self):
-        self.refused(lambda s: s["zones"][1].pop("off"))
+    def test_legacy_whole_edge_wins_over_thirds_kept_on_an_off_part_zone(self):
+        saved = self.compiled(lambda s: None)
+        self.assertEqual(saved["peers"][0]["ways"]["thirds"], list(ways.PARTS))
+        self.assertEqual([zone["kind"] for zone in saved["zones"]].count("edge"), 1)
+        self.assertNotIn("part", [zone["kind"] for zone in saved["zones"]])
+
+    def test_legacy_edge_and_thirds_both_on_cross_by_the_whole_edge(self):
+        # 1.4.x let both be on and the edge covered the thirds (WIRE.md section 8), as rc12's reader
+        # said too, so what crossed before still crosses: the whole edge, as on the PC.
+        saved = self.compiled(lambda s: s["zones"][1].pop("off"))
+        self.assertEqual(saved["peers"][0]["ways"]["thirds"], list(ways.PARTS))
+        self.assertEqual([zone["kind"] for zone in saved["zones"]].count("edge"), 1)
+        self.assertNotIn("part", [zone["kind"] for zone in saved["zones"]])
 
     def test_the_edge_and_the_notch_stay_together_as_1_4_x_let_them(self):
         settings = self.settings()
@@ -1051,43 +1095,48 @@ class OverlapTests(Base):
         self.write_settings(settings)
         self.assertIn("notch", SettingsStore(self.path).load().crossing["methods"])
 
-    def test_two_part_zones_sharing_a_third_are_refused_and_disjoint_ones_are_not(self):
+    def test_overlapping_and_disjoint_legacy_part_zones_union_their_thirds(self):
         def two_parts(s, second):
             s["zones"][0]["off"] = True
             s["zones"][1].pop("off")
             s["zones"].append({"peer": "", "kind": "part", "parts": second})
-        self.refused(lambda s: two_parts(s, ["end", "middle"]))
+        saved = self.compiled(lambda s: two_parts(s, ["end", "middle"]))
+        self.assertEqual(saved["peers"][0]["ways"]["thirds"], list(ways.PARTS))
         self.path.unlink()
         self.write_legacy(legacy_1_4_3())
         self.store.load()
-        settings = self.settings()
-        two_parts(settings, ["middle"])
-        self.write_settings(settings)
-        SettingsStore(self.path).load()
+        saved = self.compiled(lambda s: two_parts(s, ["middle"]))
+        self.assertEqual(saved["peers"][0]["ways"]["thirds"], list(ways.PARTS))
 
-    def test_two_peers_whose_edges_face_the_same_side_cannot_both_have_the_edge_zone_on(self):
+    def test_same_side_peers_keep_edge_intent_without_a_clash(self):
         def second_peer(s):
             s["peers"][0]["id"] = PEER_ID
             s["zones"] = [{**z, "peer": PEER_ID} for z in s["zones"]]
             s["peers"].append({**s["peers"][0], "id": SECOND_ID, "token": OTHER_TOKEN, "from_1_4": False})
             s["zones"].append({"peer": SECOND_ID, "kind": "edge"})
-        self.refused(second_peer)
+        saved = self.compiled(second_peer)
+        self.assertTrue(all(peer["ways"]["edge"] for peer in saved["peers"]))
+        self.assertIsNone(ways.clash(saved, "this Mac"))
 
-    def test_a_corner_inside_the_edge_is_fine_and_two_of_one_corner_are_not(self):
+    def test_duplicate_legacy_corner_zones_compile_to_one_corner(self):
         settings = self.settings()
         settings["zones"][2]["corner"] = "top_left"
         settings["zones"][2]["edge"] = "left"
         self.write_settings(settings)
         SettingsStore(self.path).load()
-        self.refused(lambda s: s["zones"].append({"peer": "", "kind": "corner", "corner": "top_left", "edge": "left"}))
+        saved = self.compiled(lambda s: s["zones"].append(
+            {"peer": "", "kind": "corner", "corner": "top_left", "edge": "left"}))
+        self.assertEqual([zone["kind"] for zone in saved["zones"]].count("corner"), 1)
 
-    def test_ways_with_the_edge_and_the_thirds_on_write_the_thirds_off(self):
-        self.store.set_ways("", side="left", methods=["edge", "part"], parts=["middle"], corner="top_right")
+    def test_editing_edge_and_thirds_compiles_a_whole_edge_without_a_part_zone(self):
+        self.compiled(lambda _s: None)
+        self.store.set_ways(PEER_ID, side="left", methods=["edge", "part"], parts=["middle"], corner="top_right")
         self.assertEqual(self.store.load().crossing["methods"], ["shortcut", "edge"])
         zones = {z["kind"]: z for z in self.settings()["zones"]}
-        self.assertTrue(zones["part"]["off"])
+        self.assertNotIn("part", zones)
+        self.assertEqual(self.store.current()["peers"][0]["ways"]["thirds"], list(ways.PARTS))
 
-    def test_two_machines_on_one_notch_are_refused(self):
+    def test_two_machines_keep_notch_intent_while_the_picture_compiles_one_notch(self):
         def two_notches(s):
             s["peers"][0]["id"] = PEER_ID
             s["zones"] = [{**z, "peer": PEER_ID} for z in s["zones"]]
@@ -1096,7 +1145,9 @@ class OverlapTests(Base):
             second["token"] = second["token"][::-1]
             s["peers"].append(second)
             s["zones"].append({"peer": SECOND_ID, "kind": "notch"})
-        self.refused(two_notches)
+        saved = self.compiled(two_notches)
+        self.assertTrue(all(peer["ways"]["notch"] for peer in saved["peers"]))
+        self.assertEqual([zone["kind"] for zone in saved["zones"]].count("notch"), 1)
 
 
 if __name__ == "__main__":

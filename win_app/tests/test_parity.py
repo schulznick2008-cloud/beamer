@@ -57,6 +57,7 @@ class TriggerKeyTests(unittest.TestCase):
             self.assertEqual(capture_win.VK_TO_NAME[vk], name)
         trigger = capture_win.Trigger("f13", "double_tap", 300)
         self.assertIsNone(trigger.feed("f13", True, 0.0))
+        self.assertIsNone(trigger.feed("f13", False, 0.05))
         self.assertEqual(trigger.feed("f13", True, 0.1), capture_win.TOGGLE)
 
 
@@ -167,6 +168,8 @@ class HeldEdgeTests(unittest.TestCase):
                 link.handshake()
                 route = link.take()
                 self.assertEqual(link.answer(route)[0], protocol.MSG_ACCEPT)
+                inward = link.move(201, 0)
+                self.assertIsNotNone(link.acked(inward))
                 seq = link.move(-200, 0)
                 self.assertIsNotNone(link.acked(seq))
                 crossed = link.expect(protocol.MSG_SWITCH, timeout=0.2)

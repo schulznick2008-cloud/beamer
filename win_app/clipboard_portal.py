@@ -24,6 +24,9 @@ LOGGER = logging.getLogger(__name__)
 TEXT_MIMES = ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT")
 PNG_MIME = "image/png"
 TIMEOUT_SECONDS = 2.0
+# Each wait in set_contents, which runs on the link's reader: two stay under the sender's 1.5 s
+# wait for an acknowledgement (core/link.py ACK_STALL_SECONDS).
+SET_SECONDS = 0.5
 MAX_BYTES = 64 * 1024 * 1024
 
 _synced: Optional[int] = None
@@ -125,8 +128,13 @@ def forget_sync() -> None:
 
 def set_contents(text: Optional[str], png: Optional[bytes]) -> bool:
     """Offer `text` and/or `png` as this machine's clipboard. False when there is nothing to set or
-    the clipboard cannot be reached. Never raises."""
+    the clipboard cannot be reached. Never raises, and never waits for the session to start: the
+    link's reader calls this, and a consent dialog holding the session up would stop it reading
+    (and acknowledging) input for as long as the sender tolerates."""
     global _synced
+    session = inject_portal._remote
+    if session is None or not session.ready.is_set():
+        return False
     offer = {}
     if text is not None:
         data = text.replace("\r\n", "\n").encode("utf-8")
@@ -136,11 +144,12 @@ def set_contents(text: Optional[str], png: Optional[bytes]) -> bool:
     if not offer:
         return False
     try:
-        written = bool(inject_portal.remote().ask(lambda session: session.set_selection(offer), default=False))
+        written = bool(inject_portal.remote().ask(lambda session: session.set_selection(offer), default=False,
+                                                     timeout=SET_SECONDS))
     except Exception:
         LOGGER.exception("Could not set the clipboard")
         return False
     if written:
-        changes = inject_portal.remote().ask(lambda session: session.changes, default=None)
+        changes = inject_portal.remote().ask(lambda session: session.changes, default=None, timeout=SET_SECONDS)
         _synced = changes
     return written

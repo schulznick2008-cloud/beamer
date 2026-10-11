@@ -28,14 +28,14 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import windows_input
-from bridge import KVMController
+from bridge import KVMController, links_from_store
 import bridge_fakes
 from bridge_fakes import PAIRED_TOKEN, FakeClock, FakeQuartz, crossing_config, quiet_logger
 from core import protocol
 from core.return_edge import OPPOSITE
 from core.return_edge import Rect
 from core.tests.responder_harness import HERE, FakeDesktop, FakeInjector, Initiator, Machine, entry
-from settings_store import SettingsStore
+from settings_store import SettingsStore, config_to_raw
 
 MAC_BOUNDS = (0, 0, 1728, 1117)
 PC_MONITORS = [Rect(0, 0, 1920, 1080)]
@@ -100,17 +100,23 @@ class Duo:
         self.pc_injector = self.pc_responder.injector
 
         settings = copy.deepcopy(self.store.current())
+        settings["port"] = self.mac_port
         settings["peers"] = [entry(HERE, "PC", platform="windows", token=PAIRED_TOKEN, host="127.0.0.1",
                                    port=self.pc_responder.port, side=self.side, side_set_at=side_stamp, side_by=side_by,
                                    allow_drive=allow_drive)]
         settings["zones"] = self._named(mac_zones if mac_zones is not None else self._zones_from(cfg.crossing))
         self.store.save_settings(settings)
+        cfg.port = self.pc_responder.port
+        cfg.allow_windows_to_drive = allow_drive
+        cfg = self.store.save(config_to_raw(cfg))
 
         # The one pasteboard the controller and the Mac's responder share, as on a real Mac.
         self.clipboard = bridge_fakes.FakeClipboard("on the Mac")
+        # Config's port belongs to the peer; the identity advertises this Mac's stored listener.
+        book, identity = links_from_store(self.store, "1.5.2")
         self.mac = KVMController(
             cfg, logger=quiet_logger(), quartz=FakeQuartz, clock=self.clock, desktop_bounds=lambda: self.mac_bounds,
-            book=self.store.book(), socket_factory=socket_factory, clipboard=self.clipboard,
+            book=book, socket_factory=socket_factory, clipboard=self.clipboard, identity=identity,
         )
         self.mac.on_crossing = lambda kind, step: self.feedback.append((kind, step))
         self.mac.on_user_alert = lambda title, message: self.alerts.append(message)

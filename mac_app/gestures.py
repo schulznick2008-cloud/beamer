@@ -18,20 +18,18 @@ raw values:
     32  NSEventTypeSmartMagnify (reserved; not translated)
 
 `DockSwipeClassifier` handles the tap's DockControl events and emits one
-`gesture` message per completed movement. `GestureTranslator` handles the
-overlay's NSEvents, turning a pinch into zoom steps and a page swipe into back
-or forward, each a CHORD that `chord_for` shapes for the machine it is sent to:
+`gesture` message per completed movement. `GestureTranslator` handles the tap's
+raw zoom fields and the overlay's NSEvents, turning a pinch into zoom steps and
+a page swipe into back or forward, each a CHORD shaped for its receiver:
 Ctrl+wheel and Alt+Arrow for a PC, Command with = - [ ] for a Mac, with no
-change on the receiving side. A zoom gesture was never observed to
-reach the tap, so the overlay is the only route for it, and it remains
-best-effort.
+change on the receiving side. Type-29 CGEvents whose HID subtype is zoom (8)
+are read directly from their private fields in the tap; overlay NSEvents still
+use their public magnification accessor.
 
 Everything here is defensive: an unreadable field is logged once and treated
 as "no gesture" rather than raised, so a bug or a changed private field on a
-future macOS can never take down keyboard/mouse capture. Neither class needs
-AppKit or Quartz -- `ns_event` only has to expose `.magnification`,
-`.deltaX`, `.deltaY` and `.phase`, and dock `fields` only `.hid`, `.motion`,
-`.phase`, `.progress` and `.velocity` -- which keeps the tests free of both.
+future macOS can never take down keyboard/mouse capture. Translation tests need
+neither AppKit nor Quartz.
 """
 
 import logging
@@ -55,6 +53,18 @@ DOCK_FIELD_PHASE = 132
 DOCK_FIELD_PROGRESS = 124
 DOCK_FIELD_VELOCITY_X = 129
 DOCK_FIELD_VELOCITY_Y = 130
+
+# Private CGEvent fields for type-29 gesture events. WebKit names field 113
+# kCGEventGestureZoomValue and 132 kCGEventGesturePhase; Mac Mouse Fix reads
+# these on type-29 events with field 110 set to the IOHID zoom subtype (8):
+# https://www.mail-archive.com/webkit-changes%40lists.webkit.org/msg113473.html
+# https://github.com/noah-nuebling/mac-mouse-fix/discussions/366
+GESTURE_FIELD_HID_TYPE = 110
+GESTURE_FIELD_MAGNIFICATION = 113
+GESTURE_FIELD_PHASE = 132
+GESTURE_ZOOM_HID_TYPE = 8
+CG_GESTURE_PHASE_ENDED = 4
+CG_GESTURE_PHASE_CANCELLED = 8
 
 DOCK_SWIPE_HID_TYPE = 23
 MOTION_HORIZONTAL = 1
@@ -185,11 +195,28 @@ class GestureTranslator:
                 return self._translate_magnify(ns_event)
             if event_type == SWIPE_TYPE:
                 return self._translate_swipe(ns_event)
-            # Gesture (29) and SmartMagnify (32) are reserved -- no
-            # translation defined for them yet.
+            # Gesture (29) and SmartMagnify (32) are translated separately
+            # only when the raw CGEvent fields identify a zoom.
             return []
         except Exception:
             self._warn_once(event_type)
+            return []
+
+    def translate_cg_gesture(self, fields):
+        """Translate the raw private fields of a type-29 CGEvent zoom."""
+        try:
+            if int(fields.get(GESTURE_FIELD_HID_TYPE, -1)) != GESTURE_ZOOM_HID_TYPE:
+                return []
+            return self._translate_magnification(
+                float(fields[GESTURE_FIELD_MAGNIFICATION]),
+                int(fields[GESTURE_FIELD_PHASE]),
+                int(fields[GESTURE_FIELD_PHASE]) in (
+                    CG_GESTURE_PHASE_ENDED,
+                    CG_GESTURE_PHASE_CANCELLED,
+                ),
+            )
+        except Exception:
+            self._warn_once(GESTURE_TYPE)
             return []
 
     def _warn_once(self, event_type):
@@ -201,14 +228,21 @@ class GestureTranslator:
         )
 
     def _translate_magnify(self, ns_event):
-        self._magnify_accum += float(ns_event.magnification)
+        phase = int(getattr(ns_event, "phase", 0) or 0)
+        return self._translate_magnification(
+            float(ns_event.magnification),
+            phase,
+            bool(phase & _PHASE_RESET_MASK),
+        )
+
+    def _translate_magnification(self, magnification, phase, reset):
+        self._magnify_accum += magnification
         messages = []
         while abs(self._magnify_accum) >= MAGNIFY_STEP:
             direction = 1 if self._magnify_accum > 0 else -1
             messages.extend(self._zoom_step_messages(direction))
             self._magnify_accum -= direction * MAGNIFY_STEP
-        phase = int(getattr(ns_event, "phase", 0) or 0)
-        if phase & _PHASE_RESET_MASK:
+        if reset:
             self._magnify_accum = 0.0
         return messages
 

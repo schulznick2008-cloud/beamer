@@ -25,6 +25,7 @@ setup(
         "config",
         "crossing",
         "desktop_mac",
+        "dock_visibility",
         "diagram",
         "effects_overlay",
         "gestures",

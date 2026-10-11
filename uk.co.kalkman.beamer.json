@@ -9,7 +9,7 @@
   "separate-locales": false,
   "finish-args": [
     "--socket=wayland",
-    "--socket=fallback-x11",
+    "--socket=x11",
     "--share=ipc",
     "--share=network",
     "--device=dri",
@@ -106,7 +106,8 @@
         "install -Dm644 metainfo.xml /app/share/metainfo/uk.co.kalkman.beamer.metainfo.xml",
         "install -Dm644 Beamer.svg /app/share/icons/hicolor/scalable/apps/uk.co.kalkman.beamer.svg",
         "install -Dm644 LICENSE /app/share/licenses/uk.co.kalkman.beamer/LICENSE",
-        "/app/cleanup-BaseApp.sh"
+        "/app/cleanup-BaseApp.sh",
+        "python3 -m compileall -q /app/share/beamer/core /app/share/beamer/win_app"
       ],
       "sources": [
         {"type": "dir", "path": "core", "dest": "core", "skip": ["tests", "__pycache__"]},

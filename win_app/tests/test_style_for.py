@@ -26,7 +26,7 @@ class StyleForTest(unittest.TestCase):
         self.app = QApplication.instance() or QApplication([])
         theme.init_fonts()
         self.app.setFont(theme.font(theme.TYPE["body"]))
-        scratch = Path(__file__).resolve().parents[2] / "renders" / "test-working"
+        scratch = Path(__file__).resolve().parents[1] / "renders" / "test-working"
         scratch.mkdir(parents=True, exist_ok=True)
         self.folder = tempfile.TemporaryDirectory(dir=scratch)
         folder = Path(self.folder.name)

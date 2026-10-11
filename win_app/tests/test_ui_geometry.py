@@ -63,9 +63,10 @@ class AuditGeometryTests(unittest.TestCase):
         self.assertFalse(measure(module), measure(module))
 
     def peer(self):
-        row = machines_win.PeerRow("synthetic", *([lambda *_: None] * 4))
-        row.refresh({"port": 24820}, "Studio MacBook Pro with an exceptionally long mach", 
-                    SimpleNamespace(tone="off", word="Waiting", detail="Waiting for this machine."), "Mac")
+        row = machines_win.PeerRow("synthetic", *([lambda *_: None] * 5))
+        row.refresh({"port": 24820}, "Studio MacBook Pro with an exceptionally long mach",
+                    SimpleNamespace(tone="off", word="Waiting", detail="Waiting for this machine."), "Mac",
+                    cycle_mode="last")
         return row
 
     def test_direction_switches_have_separate_uncropped_tracks(self):

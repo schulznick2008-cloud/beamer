@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtGui import QAccessible, QAccessibleActionInterface
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QGraphicsBlurEffect, QGraphicsOpacityEffect, QVBoxLayout, QWidget
 
 import theme
 import widgets
@@ -87,6 +87,44 @@ class LayoutPrimitivesTests(unittest.TestCase):
                 self.assertEqual(point.x(), 0)
                 self.assertGreaterEqual(point.y(), row.heading.height() + 8)
 
+    def test_sidebar_response_time_has_connected_pending_and_disconnected_states(self):
+        sidebar = widgets.Sidebar([("home", "Home", "")], lambda _key: None)
+        self.addCleanup(sidebar.deleteLater)
+
+        sidebar.set_link("signal", "Connected", response_time_ms=None, connected=True)
+        self.assertEqual(sidebar.response_time.text(), "Response: —")
+        self.assertEqual(sidebar.response_time.accessibleName(), "Response time: no fresh measurement")
+
+        sidebar.set_link("signal", "Connected", response_time_ms=24, connected=True)
+        self.assertEqual(sidebar.response_time.text(), "Response: 24 ms")
+        self.assertEqual(sidebar.response_time.accessibleName(), "Response time: 24 ms")
+
+        sidebar.set_link("quiet", "Disconnected", response_time_ms=24, connected=False)
+        self.assertFalse(sidebar.response_time.isVisible())
+        self.assertEqual(sidebar.response_time.text(), "")
+
+    def test_sidebar_response_time_fits_the_full_sidebar_at_its_minimum_width(self):
+        sidebar = widgets.Sidebar([("home", "Home", "")], lambda _key: None)
+        self.addCleanup(sidebar.deleteLater)
+        sidebar.set_link("signal", "Connected", "A machine with a long name", response_time_ms=3000, connected=True)
+        sidebar.set_window_width(640)
+        self.mount(sidebar, 640)
+        self.assertLessEqual(sidebar.response_time.fontMetrics().horizontalAdvance(sidebar.response_time.text()),
+                             sidebar.response_time.width())
+        self.assertLessEqual(sidebar.response_time.geometry().right(), sidebar.width())
+
+    def test_sidebar_response_time_keeps_the_value_and_unit_visible_in_the_rail(self):
+        sidebar = widgets.Sidebar([("home", "Home", "")], lambda _key: None)
+        self.addCleanup(sidebar.deleteLater)
+        sidebar.set_window_width(600)
+        self.mount(sidebar, 600)
+        sidebar.set_link("signal", "Connected", "Bee", response_time_ms=3000, connected=True)
+        self.settle()
+        self.assertEqual(sidebar.response_time.text(), "3000 ms")
+        self.assertEqual(sidebar.response_time.accessibleName(), "Response time to Bee: 3000 ms")
+        self.assertLessEqual(sidebar.response_time.fontMetrics().horizontalAdvance(sidebar.response_time.text()),
+                             sidebar.response_time.width())
+
     def test_capped_segments_grow_together_to_keep_full_option_text(self):
         choice = widgets.Choice((("a", "Crossing"), ("b", "Shortcut and menu")), 2, "a")
         choice.set_width(240)
@@ -113,6 +151,35 @@ class LayoutPrimitivesTests(unittest.TestCase):
         self.assertEqual(choice.value, "b")
         self.assertTrue(other.state().checked)
         self.assertFalse(chosen.state().checked)
+
+    def test_set_enabled_on_every_refresh_tick_leaves_no_orphaned_effects(self):
+        choice = widgets.ChoiceTiles(
+            [(key, key, "Quiet", QWidget()) for key in ("a", "b")], "a", responsive=True)
+        for _ in range(500):
+            choice.set_enabled(True)
+        self.assertEqual(choice.view.findChildren(QGraphicsOpacityEffect), [])
+        for _ in range(500):
+            choice.set_enabled(False)
+        self.assertEqual(len(choice.view.findChildren(QGraphicsOpacityEffect)), 1)
+        self.assertEqual(choice.view.graphicsEffect().opacity(), 0.45)
+        choice.set_enabled(True)
+        self.assertIsNone(choice.view.graphicsEffect())
+        self.assertEqual(choice.view.findChildren(QGraphicsOpacityEffect), [])
+        self.assertTrue(all(tile.isEnabled() for tile in choice._tiles.values()))
+
+    def test_disabling_replaces_a_foreign_effect_with_the_fade(self):
+        choice = widgets.ChoiceTiles(
+            [(key, key, "Quiet", QWidget()) for key in ("a", "b")], "a", responsive=True)
+        other = QGraphicsOpacityEffect(choice.view)
+        other.setOpacity(0.8)
+        choice.view.setGraphicsEffect(other)
+        choice.set_enabled(False)
+        self.assertIsInstance(choice.view.graphicsEffect(), QGraphicsOpacityEffect)
+        self.assertEqual(choice.view.graphicsEffect().opacity(), 0.45)
+        choice.view.setGraphicsEffect(QGraphicsBlurEffect(choice.view))
+        choice.set_enabled(False)
+        self.assertIsInstance(choice.view.graphicsEffect(), QGraphicsOpacityEffect)
+        self.assertEqual(choice.view.graphicsEffect().opacity(), 0.45)
 
     def test_family_rows_distribute_rounding_remainder_to_the_final_edge(self):
         choice = widgets.ChoiceTiles(

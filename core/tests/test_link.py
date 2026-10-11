@@ -58,6 +58,81 @@ def machine_with_peer(**kwargs):
     return Machine([make(B, "Peer")], **kwargs).start()
 
 
+class ResponseTimeLinkTests(unittest.TestCase):
+    def test_capable_initiator_keeps_legacy_peer_pings_empty(self):
+        pings = []
+
+        def script(connection):
+            session, _hello = scripted_session(connection, TOKENS[B])
+            protocol.send_msg(connection, session, protocol.welcome_v6(HERE, "Here", "windows", "1.5.1", CAPS, True))
+            connection.settimeout(3)
+            while len(pings) < 2:
+                message = protocol.recv_msg(connection, session)
+                if message["type"] == protocol.MSG_PING:
+                    pings.append(message)
+                protocol.send_msg(connection, session, protocol.ack_v6(0, 0))
+
+        server = Scripted(script)
+        self.addCleanup(server.stop)
+        side = Side(None)
+        side.peer()["port"] = server.port
+        identity = side.identity
+        side.identity = lambda: identity(caps=list(CAPS) + ["ping_rtt"])
+        link = side.link(reconnect_seconds=30)
+        self.addCleanup(link.stop)
+        link.start()
+        self.assertTrue(wait_for(lambda: len(pings) >= 2, 4.0), pings)
+        self.assertTrue(side.ups)
+        self.assertTrue(all(message["data"] == {} for message in pings))
+        self.assertIsNone(link.response_time_ms)
+
+    def test_ping_responses_do_not_credit_or_acknowledge_stalled_input(self):
+        now = [10.0]
+        link = Side(None).link(clock=lambda: now[0])
+        link._live = True
+        link._response_time_enabled = True
+        link._written_seq = 1
+        link._sent_at.append((1, now[0]))
+        probe = link._response_time.new_probe()
+        link._response_time.sent(probe)
+        now[0] += 0.02
+        link._handle_ping(protocol.ping_msg(echo=probe))
+        self.assertEqual(link.response_time_ms, 20)
+        self.assertEqual(link._last_ack_seq, -1)
+        self.assertIsNone(link.last_ack_at)
+        self.assertEqual(link._ack_stall_credit, {})
+        now[0] = 10.0 + link_module.ACK_STALL_SECONDS + 0.01
+        with self.assertRaisesRegex(link_module.LinkEnded, "stopped acknowledging input"):
+            link._tick(now[0])
+
+    def test_negotiated_probes_measure_both_link_directions_and_clear_on_close(self):
+        caps = tuple(CAPS) + ("ping_rtt",)
+        machine = machine_with_peer(caps=caps)
+        self.addCleanup(machine.stop)
+        side = Side(machine)
+        side.identity = lambda: {
+            "id": side.own, "name": "Near", "platform": "macos", "app": "1.5.2",
+            "caps": list(caps), "port": 24820,
+        }
+        link = side.link()
+        self.addCleanup(link.stop)
+        link.start()
+
+        self.assertTrue(wait_for(lambda: link.response_time_ms is not None, 5.0))
+        self.assertIsNotNone(machine.responder.response_time_ms(B))
+
+        deadline = time.monotonic() + 3.2
+        while time.monotonic() < deadline:
+            self.assertTrue(link.send_input(protocol.mousemove_msg(1, 0)))
+            time.sleep(0.02)
+        self.assertIsNotNone(link.response_time_ms)
+        self.assertIsNotNone(machine.responder.response_time_ms(B))
+
+        link.stop()
+        self.assertIsNone(link.response_time_ms)
+        self.assertTrue(wait_for(lambda: machine.responder.response_time_ms(B) is None))
+
+
 class Scripted:
     """A listener that runs `script(connection)` for each connection."""
 
@@ -320,7 +395,8 @@ class LinkRefusalTests(unittest.TestCase):
         side.peer()["port"] = server.port
         link = self.link(side)
         self.assertTrue(wait_for(lambda: side.states))
-        self.assertIn("under another machine: remove it on both and pair again", side.last_text())
+        self.assertIn("under another machine: use Re-pair on Overview", side.last_text())
+        self.assertEqual(side.peer().get("dormant_reason"), "wrong_id")
         seen = server.connections
         time.sleep(0.5)
         self.assertEqual(server.connections, seen)
@@ -351,7 +427,8 @@ class LinkRefusalTests(unittest.TestCase):
         self.assertIn("may have removed this machine", side.states[0][1])
         now[0] += link_module.FORGOTTEN_AFTER_SECONDS
         self.assertTrue(wait_for(lambda: "no longer has this pairing" in (side.last_text() or ""), 5.0), side.states)
-        self.assertEqual(side.last_text(), "Far no longer has this pairing: remove Far here and pair the two again")
+        self.assertEqual(side.last_text(), "Far no longer has this pairing: use Re-pair on Overview")
+        self.assertEqual(side.peer().get("dormant_reason"), "forgotten")
         seen = server.connections
         time.sleep(0.5)
         self.assertEqual(server.connections, seen)
@@ -447,6 +524,26 @@ class LinkLiveTests(unittest.TestCase):
         self.assertIn(("key", "a", True), self.machine.injected())
         self.assertEqual(self.link.last_sent_seq, 2)
 
+    def test_a_slow_injection_logs_the_input_type_and_injection_call(self):
+        self.take()
+        original = self.machine.injector.inject_mouse_move
+
+        def slow_move(dx, dy):
+            time.sleep(0.26)
+            original(dx, dy)
+
+        self.machine.injector.inject_mouse_move = slow_move
+        with self.assertLogs(receiver.LOGGER, level="WARNING") as said:
+            self.assertTrue(self.link.send_input(protocol.mousemove_msg(3, 4)))
+            self.assertTrue(wait_for(lambda: any("slow input injection" in line for line in said.output), 2.0), said.output)
+        self.assertTrue(any("mousemove" in line and "inject_mouse_move" in line for line in said.output), said.output)
+
+    def test_a_shortcut_arrival_without_an_edge_is_logged(self):
+        with self.assertLogs(receiver.LOGGER, level="INFO") as said:
+            self.assertTrue(self.link.post(protocol.focus_v6(1, HERE, resistance_px=120, reach=[])))
+            self.assertTrue(wait_for(lambda: any("input arrived by its shortcut" in line for line in said.output), 2.0), said.output)
+        self.assertTrue(any("pointer stays at" in line for line in said.output), said.output)
+
     def test_acks_give_round_trip_samples_that_are_never_negative(self):
         self.take()
         for _ in range(5):
@@ -473,6 +570,16 @@ class LinkLiveTests(unittest.TestCase):
         self.assertTrue(self.link.post(protocol.settings_msg({"a": 1})))
         time.sleep(0.2)
         self.assertEqual(self.machine.settings_seen, [])
+
+    def test_focus_display_target_is_stripped_for_a_peer_without_displays(self):
+        self.link._caps = frozenset()
+        queued = []
+        self.link._enqueue = lambda message, seq: queued.append(message) or True
+        self.assertTrue(self.link.post(protocol.focus_v6(1, HERE, resistance_px=120, reach=[],
+                                                        display="panel-right", side="bottom")))
+        message = queued[0]
+        self.assertNotIn("display", message["data"])
+        self.assertNotIn("side", message["data"])
 
     def test_the_link_reconnects_after_the_responder_closes_it(self):
         first = len(self.side.ups)
@@ -518,6 +625,7 @@ class LinkLivenessTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: "stopped responding" in (side.last_text() or ""), 5.0), side.states)
         self.assertGreaterEqual(time.monotonic() - began, 1.5)
         self.assertFalse(link.live())
+
 
     def test_an_idle_link_pings_each_second(self):
         pings = []
@@ -612,6 +720,127 @@ class FakeClock:
         return self.now
 
 
+class AckStallTests(unittest.TestCase):
+    def test_a_blocked_clipboard_callback_is_included_in_ack_stall_credit(self):
+        clock = FakeClock()
+
+        def script(connection):
+            session, _hello = scripted_session(connection, TOKENS[B])
+            protocol.send_msg(connection, session, protocol.welcome_v6(HERE, "Here", "windows", "1.5.2", CAPS, True))
+            connection.settimeout(5)
+            while True:
+                message = protocol.recv_msg(connection, session)
+                seq = message.get("data", {}).get("seq")
+                if seq:
+                    break
+            clipboard = session.seal(protocol.clipboard_msg("c" * protocol.CLIPBOARD_MAX_BYTES))
+            acknowledgement = session.seal(protocol.ack_v6(seq, 0))
+            connection.sendall(clipboard + acknowledgement)
+            time.sleep(2)
+
+        server = Scripted(script)
+        self.addCleanup(server.stop)
+        side = Side(None)
+        side.peer()["port"] = server.port
+        link = side.link(clock=clock)
+        self.addCleanup(link.stop)
+        original_call = link._call
+        original_end = link._end_ack_pause
+
+        def advance_during_clipboard(index, *args):
+            if index == 2 and args[0].get("type") == protocol.MSG_CLIPBOARD:
+                clock.now += 2.0
+            original_call(index, *args)
+
+        def check_credit_before_the_queued_ack(ended):
+            original_end(ended)
+            link._tick(clock())
+
+        link._call = advance_during_clipboard
+        link._end_ack_pause = check_credit_before_the_queued_ack
+        link.start()
+        self.assertTrue(wait_for(lambda: side.ups))
+        self.assertTrue(link.send_input(protocol.key_msg("keydown", "a")))
+        self.assertTrue(wait_for(lambda: link._last_ack_seq == 1), side.states)
+        self.assertTrue(link.live())
+
+    def test_a_clipboard_trickling_in_does_not_count_as_an_ack_stall(self):
+        def script(connection):
+            session, _hello = scripted_session(connection, TOKENS[B])
+            protocol.send_msg(connection, session, protocol.welcome_v6(HERE, "Here", "windows", "1.5.2", CAPS, True))
+            connection.settimeout(5)
+            while True:
+                message = protocol.recv_msg(connection, session)
+                seq = message.get("data", {}).get("seq")
+                if seq:
+                    break
+            frame = session.seal(protocol.clipboard_msg("c" * protocol.CLIPBOARD_MAX_BYTES))
+            for offset in range(0, len(frame), 8192):
+                connection.sendall(frame[offset:offset + 8192])
+                time.sleep(0.12)
+            protocol.send_msg(connection, session, protocol.ack_v6(seq, 0))
+            time.sleep(2)
+
+        server = Scripted(script)
+        self.addCleanup(server.stop)
+        side = Side(None)
+        side.peer()["port"] = server.port
+        link = side.link()
+        self.addCleanup(link.stop)
+        link.start()
+        self.assertTrue(wait_for(lambda: side.ups))
+        self.assertTrue(link.send_input(protocol.key_msg("keydown", "a")))
+        self.assertTrue(wait_for(lambda: link._last_ack_seq == 1, 6.0), side.states)
+        self.assertTrue(link.live())
+
+    def test_a_live_heartbeat_cannot_keep_unacknowledged_input_away(self):
+        machine = machine_with_peer()
+        self.addCleanup(machine.stop)
+        side = Side(machine)
+        now = [100.0]
+        link = side.link(clock=lambda: now[0], reconnect_seconds=30)
+        self.addCleanup(link.stop)
+        link.start()
+        self.assertTrue(wait_for(lambda: side.ups), side.states)
+        self.assertTrue(link.post(protocol.focus_v6(1, HERE, resistance_px=120, reach=[])))
+        self.assertTrue(wait_for(lambda: any(m["type"] == protocol.MSG_ACCEPT for m in side.messages)))
+
+        self.assertTrue(link.send_input(protocol.key_msg("keydown", "a")))
+        self.assertTrue(wait_for(lambda: ("key", "a", True) in machine.injected()))
+        self.assertTrue(wait_for(lambda: link._last_ack_seq == 1))
+
+        injecting = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def blocked_move(dx, dy):
+            injecting.set()
+            release.wait(5)
+            machine.injector._add("move", dx, dy)
+
+        machine.injector.inject_mouse_move = blocked_move
+        self.assertTrue(all(link.send_input(protocol.mousemove_msg(1, 1)) for _ in range(50)))
+        self.assertTrue(injecting.wait(2), "the responder never began the blocked injection")
+
+        acknowledgements = []
+        original_ack = link._ack
+
+        def record_ack(ack):
+            acknowledgements.append(ack["seq"])
+            original_ack(ack)
+
+        link._ack = record_ack
+        self.assertTrue(wait_for(lambda: 1 in acknowledgements), acknowledgements)
+        now[0] += 1.51
+        self.assertTrue(wait_for(lambda: side.states and not side.states[-1][0]), side.states)
+        self.assertTrue(any(seq == 1 for seq in acknowledgements), acknowledgements)
+        self.assertIn("stopped acknowledging input", side.last_text())
+
+        release.set()
+        self.assertTrue(wait_for(lambda: ("release_all",) in machine.injector.seen()))
+        self.assertFalse(machine.responder.driven)
+
+
 class LinkFollowTests(unittest.TestCase):
     def link(self, clock, tried):
         side = Side(None)
@@ -652,6 +881,22 @@ class LinkFollowTests(unittest.TestCase):
         clock.now += 30
         link.follow(beacon)
         self.assertTrue(wait_for(lambda: ("192.168.77.9", 24820) in tried), tried)
+
+    def test_discovery_matches_the_machine_name_not_its_local_label(self):
+        clock, tried = FakeClock(), []
+        side, link = self.link(clock, tried)
+        side.peer()["label"] = "Work Mac"
+        link.start()
+        self.assertTrue(wait_for(lambda: tried))
+        tried.clear()
+        clock.now += 11
+
+        link.follow([{"name": "Work Mac", "address": "192.168.77.9"}])
+        time.sleep(0.1)
+        self.assertNotIn(("192.168.77.9", 24820), tried)
+
+        link.follow([{"name": "Far", "address": "192.168.77.10"}])
+        self.assertTrue(wait_for(lambda: ("192.168.77.10", 24820) in tried), tried)
 
     def test_a_beacon_that_names_another_machine_is_never_tried_and_one_at_its_address_is_tried_last(self):
         clock, tried = FakeClock(), []
@@ -1172,6 +1417,15 @@ class RoundTripLogTests(unittest.TestCase):
         with self.assertNoLogs("Beamer", "INFO"):
             self.now[0] = 160.1
             self.link._tick(160.1)
+
+    def test_a_minute_with_input_but_no_advancing_ack_logs_the_pending_input(self):
+        self.link._written_seq = 5
+        self.link._sent_at.extend((seq, 100.0) for seq in range(1, 6))
+        with self.assertLogs("Beamer", "INFO") as logged:
+            self.now[0] = 160.1
+            self.link._log_round_trips()
+        self.assertIn("sent 5, acknowledged 0", logged.output[-1])
+        self.assertIn("oldest unacknowledged seq 1 for 60.1 s", logged.output[-1])
 
     def test_what_was_logged_is_not_counted_again(self):
         self.acks(5)

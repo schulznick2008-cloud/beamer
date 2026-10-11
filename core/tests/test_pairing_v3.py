@@ -325,6 +325,27 @@ class KnownTests(unittest.TestCase):
 
 
 class FullTests(unittest.TestCase):
+    def test_full_requester_repairs_the_matching_dormant_host(self):
+        peers = [entry(bytes([n]) * 16) for n in range(1, 32)]
+        peers.append({**entry(HOST_ID), "dormant": True, "dormant_reason": "forgotten"})
+        rig = Rig(requester_book=Book(peers))
+        rig.begin()
+        client, *_rest, token = rig.exchange()
+        self.assertEqual(client.replaces["id"], b64(HOST_ID))
+        self.assertEqual(client.entry("192.168.77.4")["token"], token)
+
+    def test_full_requester_with_a_dormant_peer_rejects_a_new_host_before_confirmation(self):
+        peers = [entry(bytes([n]) * 16) for n in range(1, 33)]
+        peers[0].update(dormant=True, dormant_reason="forgotten")
+        rig = Rig(requester_book=Book(peers))
+        rig.begin()
+        client = rig.client()
+        answer = rig.host.handle(client.start(), "192.168.77.5")
+        with self.assertRaises(PairingError) as caught:
+            client.accept(answer)
+        self.assertEqual(str(caught.exception), pairing.ERROR_FULL)
+        self.assertEqual(rig.host_book.stored, [])
+
     def test_a_host_with_32_peers_shows_no_code(self):
         rig = Rig(host_book=Book([entry(bytes([n]) * 16) for n in range(1, 33)]))
         with self.assertRaises(PairingError) as caught:

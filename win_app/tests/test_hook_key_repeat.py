@@ -10,6 +10,7 @@ from types import SimpleNamespace
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import capture_win
+from core.capture_types import DeadKey, TextInput
 from core import protocol
 from capture_win import Trigger
 from links_rig import B, Rig, make_config
@@ -74,6 +75,25 @@ class HeldTriggerRepeatTests(unittest.TestCase):
         # A later lone tap at home is an ordinary key again.
         self.assertFalse(dispatch(trigger, self.link_sender, "cmd_r", True))
         self.assertFalse(dispatch(trigger, self.link_sender, "cmd_r", False))
+
+    def test_holding_the_double_tap_trigger_at_home_never_sends_input_away(self):
+        # Before 1.5.2 the second autorepeat inside the window was a double-tap, and every one
+        # after flipped input again. At home the held key is an ordinary key, repeats included.
+        trigger = Trigger("cmd_r", "double_tap", 300)
+        for _ in range(20):
+            self.assertFalse(dispatch(trigger, self.link_sender, "cmd_r", True))
+            self.assertFalse(self.link_sender.redirecting)
+        self.assertFalse(dispatch(trigger, self.link_sender, "cmd_r", False))
+        self.assertEqual(self.rig.sent_home, [])
+
+    def test_holding_the_double_tap_trigger_while_away_keeps_input_away(self):
+        trigger = Trigger("cmd_r", "double_tap", 300)
+        self.link_sender.set_redirecting(True)
+        for _ in range(20):
+            self.assertTrue(dispatch(trigger, self.link_sender, "cmd_r", True))
+            self.assertTrue(self.link_sender.redirecting)
+        self.assertTrue(dispatch(trigger, self.link_sender, "cmd_r", False))
+        self.assertEqual(self.keys(protocol.MSG_KEYDOWN) + self.keys(protocol.MSG_KEYUP), [])
 
     def test_physical_release_never_reaches_on_key_so_no_keyup_is_sent(self):
         dispatch(self.trigger, self.link_sender, "alt_r", True)

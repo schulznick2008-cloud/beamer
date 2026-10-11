@@ -18,13 +18,14 @@ import math
 import sys
 import time
 
-from PySide6.QtCore import QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QCursor, QImage, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QSizePolicy, QWidget
 
 import app_config
 from core import effects
 from core import return_edge as crossing
+from frame_clock import PREVIEW_MAX_RATE, frame_timer, start_paced
 import theme
 import tokens
 
@@ -290,19 +291,20 @@ class EdgeGlow(QWidget):
         self._colour = "signal"
         self._size = "medium"
         self._band = float(BAND_PX)
+        self._size_fraction = None
         self._state = GlowState()
         self._dark = True
         self._updated_at = 0.0
         self._ticked_at = 0.0
-        self._timer = QTimer(self)
-        self._timer.setInterval(16)
-        self._timer.timeout.connect(self._tick)
+        self._timer = frame_timer(self, self._tick, self)
 
-    def configure(self, style: str, colour: str, length: str = "normal", size: str = "medium") -> None:
+    def configure(self, style: str, colour: str, length: str = "normal", size: str = "medium",
+                  effect_pace: float | None = None, size_fraction: float | None = None) -> None:
         self._style = style
         self._colour = colour
         self._size = size
-        self._state.pace = effects.pace(length)
+        self._state.pace = effect_pace if effect_pace is not None else effects.pace(length)
+        self._size_fraction = size_fraction
 
     def set_pressure(self, edge: str, pressure: float, crossed: bool, part=None) -> None:
         """`part` is the third of the edge being pushed for Part of the edge, which lights only
@@ -319,7 +321,7 @@ class EdgeGlow(QWidget):
             self._dark = system_dark()
             self._state.restart()
             self.show()
-            self._timer.start()
+            start_paced(self._timer, self)
         keep_on_top(self)
         self.update()
 
@@ -333,7 +335,7 @@ class EdgeGlow(QWidget):
         cursor = QCursor.pos()
         owner = next((r for r in rects if r.x <= cursor.x() < r.x + r.width and r.y <= cursor.y() < r.y + r.height),
                      None) or crossing.owning_monitor(rects, self._edge)
-        self._band = effects.edge_depth(owner.width, owner.height, self._size)
+        self._band = effects.edge_depth(owner.width, owner.height, self._size, self._size_fraction)
         if self._part in crossing.CORNERS:
             box = corner_of_monitor(owner, self._part, min(CORNER_ARM_PX, owner.width, owner.height))
             self.setGeometry(QRect(box.x, box.y, box.width, box.height))
@@ -439,11 +441,7 @@ class PreviewLoop:
         self._started_at = None
         self._ticked_at = 0.0
         self._phase = None
-        self._timer = QTimer(parent)
-        # Precise: a coarse timer may fire up to 5% either side, which lands frames unevenly.
-        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(16)
-        self._timer.timeout.connect(self._tick)
+        self._timer = frame_timer(parent, self._tick, parent, PREVIEW_MAX_RATE)
 
     def add(self, preview: GlowPreview) -> None:
         self.previews.append(preview)
@@ -455,7 +453,8 @@ class PreviewLoop:
         self.running = wanted
         self._settle()
         if wanted:
-            self._timer.start()
+            if self.hovered is not None:
+                start_paced(self._timer, self._timer.parent(), PREVIEW_MAX_RATE)
         else:
             self._timer.stop()
 
@@ -465,6 +464,10 @@ class PreviewLoop:
             return
         self._settle()
         self.hovered, self._hovered_at = preview, time.monotonic()
+        if self.running and preview in self.previews:
+            start_paced(self._timer, self._timer.parent(), PREVIEW_MAX_RATE)
+        elif preview is None:
+            self._timer.stop()
 
     def playing(self, preview) -> bool:
         return preview is self.hovered and self._started_at is not None
@@ -482,10 +485,14 @@ class PreviewLoop:
 
     def _tick(self) -> None:
         preview = self.hovered
+        if preview is None:
+            self._timer.stop()
+            return
         now = time.monotonic()
-        if preview is None or now - self._hovered_at < self.INTENT_S:
+        if now - self._hovered_at < self.INTENT_S:
             return
         if not preview.isVisible() or preview.visibleRegion().isEmpty():
+            # Kept running: a tile scrolled out and back under a still pointer gets no new Enter.
             self._settle()
             return
         if self._started_at is None:

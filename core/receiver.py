@@ -18,6 +18,7 @@ from typing import Callable, Optional, Tuple
 from . import return_edge as crossing
 from . import peerlist
 from . import protocol
+from .response_time import ResponseTime
 
 
 LOGGER = logging.getLogger(__name__)
@@ -32,6 +33,8 @@ ACK_IDLE_SECONDS = 0.4
 ACK_COALESCE_SECONDS = 0.015
 LOCK_CHECK_SECONDS = 0.5
 INJECTION_ERROR_STATUS_INTERVAL_SECONDS = 5.0
+SLOW_INJECTION_SECONDS = 0.25
+SLOW_INJECTION_LOG_INTERVAL_SECONDS = 1.0
 # Windows hands the port back only when whatever holds it lets go — WinNAT's
 # dynamic reservations move on every reboot and can land on ours — so a bind
 # that fails is waited out rather than ending the listener.
@@ -189,14 +192,26 @@ def zone_models(zones, peers, allowed, resistance_px: int, notch_span=None) -> l
         peer = protocol.read_id(zone.get("peer"))
         if peer is None or peer not in allowed or peer not in sides:
             continue
-        kind, side = zone.get("kind"), sides.get(peer)
+        kind = zone.get("kind")
+        side = zone.get("side", sides.get(peer))
+        display = zone.get("display")
+        target_display = zone.get("target_display")
+        target_side = zone.get("target_side")
+        if display is not None and (not isinstance(display, str) or not display or not display.isascii()):
+            continue
+        if side not in crossing.EDGES and kind in ("edge", "part"):
+            continue
         try:
             if kind == "edge" and side in crossing.EDGES:
-                model = crossing.ReturnEdge(side, resistance_px)
+                model = crossing.ReturnEdge(side, resistance_px, display=display,
+                                            target_display=target_display, target_side=target_side)
             elif kind == "part" and side in crossing.EDGES and isinstance(zone.get("parts"), list):
-                model = crossing.PartEdge(side, [part for part in zone["parts"] if isinstance(part, str)], resistance_px)
+                model = crossing.PartEdge(side, [part for part in zone["parts"] if isinstance(part, str)],
+                                          resistance_px, display=display, target_display=target_display,
+                                          target_side=target_side)
             elif kind == "corner" and isinstance(zone.get("corner"), str) and zone.get("edge") in zone["corner"].split("_"):
-                model = crossing.CornerPush(zone["corner"], zone["edge"], resistance_px)
+                model = crossing.CornerPush(zone["corner"], zone["edge"], resistance_px, display=display,
+                                            target_display=target_display, target_side=target_side)
             elif kind == "notch" and notch_span is not None:
                 model = crossing.SpanEdge("top", notch_span, resistance_px)
             else:
@@ -274,6 +289,19 @@ class PeerBook:
             entry["paired_with"] = list(ids)
             self._save(settings)
 
+    def mark_dormant(self, token: str, reason: str) -> None:
+        """Persist conclusive evidence that a peer no longer recognises this pairing."""
+        if reason not in ("wrong_id", "forgotten"):
+            raise ValueError("unknown dormant reason")
+        with self.lock:
+            settings = copy.deepcopy(self._load() or {})
+            entry = next((item for item in settings.get("peers") or [] if item.get("token") == token), None)
+            if entry is None or (entry.get("dormant") is True and entry.get("dormant_reason") == reason):
+                return
+            entry["dormant"] = True
+            entry["dormant_reason"] = reason
+            self._save(settings)
+
     def find(self, key_id: bytes) -> Optional[dict]:
         """The entry, a copy, whose token (one made by pairing) has `key_id`."""
         for entry in self.peers():
@@ -299,8 +327,14 @@ class PeerBook:
             if entry.get("in_use", True) is not True:
                 return IN_USE_OFF, None
             before = copy.deepcopy(entry)
+            was_dormant = entry.get("dormant") is True
             entry.update(changes)
             entry["linked"] = True
+            entry.pop("dormant", None)
+            entry.pop("dormant_reason", None)
+            if was_dormant:
+                from . import ways
+                ways._turn_off_clashes(settings, entry, "this computer")
             if entry != before:
                 self._save(settings)
             return ADMITTED, copy.deepcopy(entry)
@@ -312,8 +346,9 @@ class _Link:
     the `ack`s when they are due, so nothing that holds the responder's lock ever waits on a
     socket."""
 
-    def __init__(self, sock, session, peer_id, key_id, host, name, caps, own_id, own_caps, allow_drive) -> None:
+    def __init__(self, sock, session, peer_id, key_id, host, name, caps, own_id, own_caps, allow_drive, platform="") -> None:
         self.sock = sock
+        self.peer_platform = platform  # the hello's: the Mac scales a PC's wheel lines by it
         self.session = session
         self.peer_id = peer_id
         self.key_id = key_id
@@ -322,6 +357,9 @@ class _Link:
         self.caps = frozenset(caps)
         self.own_id = own_id
         self.own_caps = frozenset(own_caps)
+        self.response_time_enabled = "ping_rtt" in self.caps and "ping_rtt" in self.own_caps
+        self.response_time = ResponseTime()
+        self.next_response_probe = time.monotonic() + 1.0
         self.allow_drive = allow_drive
         self.route = 0              # the last route accepted on this link
         self.held = {}              # ("key" or "button", name): `us`, what the owner holds down here
@@ -334,6 +372,19 @@ class _Link:
         self.acked = 0
         self.last_ack_at = time.monotonic()
         self.input_error_at = float("-inf")  # when an injection error last reached the status
+        self.slow_injection_at = float("-inf")
+        self.incoming_moves_at = None
+        self.incoming_move_last_at = None
+        self.incoming_move_count = 0
+        self.incoming_dx = 0
+        self.incoming_dy = 0
+        self.incoming_largest = 0
+
+    @property
+    def response_time_ms(self):
+        if self.closed.is_set() or not self.response_time_enabled:
+            return None
+        return self.response_time.response_time_ms
 
     def post(self, message: dict) -> bool:
         with self.cond:
@@ -363,6 +414,7 @@ class _Link:
 
     def _close_locked(self) -> None:
         self.closed.set()
+        self.response_time.reset()
         self.cond.notify_all()
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
@@ -522,6 +574,12 @@ class LinkResponder:
             link = self._links.get(peer)
         return link.caps if link is not None else None
 
+    def response_time_ms(self, peer_id) -> Optional[int]:
+        """A fresh local round-trip sample for this linked peer, or None."""
+        with self._lock:
+            link = self._links.get(peer_id)
+        return link.response_time_ms if link is not None else None
+
     def start(self, port: int) -> None:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -657,6 +715,7 @@ class LinkResponder:
             if entry is None:
                 LOGGER.info("%s named a pairing this machine does not have; closed", host)
                 return None
+            token = entry["token"]
             session = protocol.LinkSession(entry["token"], protocol.ROLE_RESPONDER)
             session.accept_preamble(preamble)
             deadline = accepted + HANDSHAKE_SECONDS
@@ -686,6 +745,10 @@ class LinkResponder:
                 return None
             if outcome == WRONG_ID:
                 LOGGER.warning("%s holds a pairing of this machine's under another machine's id", host)
+                try:
+                    self._book.mark_dormant(token, "wrong_id")
+                except Exception:
+                    LOGGER.exception("Could not save the dormant state for %s", host)
                 self._answer(connection, host, session.seal(protocol.wrong_id_v6()))
                 return None
             if outcome == IN_USE_OFF:
@@ -699,7 +762,8 @@ class LinkResponder:
         except (socket.timeout, protocol.ConnectionClosed, protocol.ProtocolError, OSError) as exc:
             LOGGER.info("Handshake with %s ended: %s", host, exc)
             return None
-        return _Link(connection, session, hello["id"], key_id, host, hello["name"], hello["caps"], own_id, identity["caps"], allow_drive)
+        return _Link(connection, session, hello["id"], key_id, host, hello["name"], hello["caps"], own_id, identity["caps"], allow_drive,
+                     hello["platform"])
 
     def _hardware_towards(self, host, identity):
         """The `hw` for the welcome to `host`, as the initiator's hook does for its hello: the hook is
@@ -824,10 +888,16 @@ class LinkResponder:
                 while True:
                     if link.closed.is_set():
                         return
+                    now = time.monotonic()
+                    if link.response_time_enabled and now >= link.next_response_probe:
+                        link.next_response_probe = now + 1.0
+                        probe = link.response_time.new_probe()
+                        if probe is not None:
+                            message = protocol.ping_msg(probe=probe)
+                            break
                     if link.outbox:
                         message = link.outbox.popleft()
                         break
-                    now = time.monotonic()
                     due = ack_due(link.last_ack_at, link.pending_since)
                     if now >= due:
                         seq = link.dealt
@@ -839,12 +909,16 @@ class LinkResponder:
                         message = protocol.ack_v6(seq, held_us, locked=locked)
                         is_ack = True
                         break
+                    if link.response_time_enabled:
+                        due = min(due, link.next_response_probe)
                     link.cond.wait(due - now)
             try:
                 # Only this thread sends once the link is up, so sealing and sending need not be
                 # one step under the session's lock to keep the counters in order.
                 frame = memoryview(link.session.seal(message))
                 sent = 0
+                if message.get("type") == protocol.MSG_PING and "probe" in (message.get("data") or {}):
+                    link.response_time.sent(message["data"]["probe"])
                 while sent < len(frame):
                     sent += link.sock.send(frame[sent:sent + SEND_CHUNK])
             except (OSError, protocol.ProtocolError, ValueError) as exc:
@@ -871,6 +945,8 @@ class LinkResponder:
                 parsed = protocol.read_message(message)
                 if parsed is not None and "settings" in link.caps:
                     self._callback("settings", link.peer_id, parsed[1])
+            elif kind == protocol.MSG_PING:
+                self._on_ping(link, message)
             elif kind == protocol.MSG_PAIRED:
                 ids = protocol.read_paired(message)
                 if ids is not None:
@@ -878,12 +954,26 @@ class LinkResponder:
         except Exception:
             LOGGER.exception("A %r from %s could not be dealt with", kind, link.name)
 
+    @staticmethod
+    def _on_ping(link: _Link, message) -> None:
+        if not link.response_time_enabled:
+            return
+        read = protocol.read_ping(message)
+        if read is None:
+            return
+        if "echo" in read:
+            link.response_time.echoed(read["echo"])
+        elif "probe" in read:
+            link.post(protocol.ping_msg(echo=read["probe"]))
+
     # Input (sections 3, 4 and 10)
 
     def _on_input(self, link: _Link, message) -> None:
         read = protocol.read_input(message)
         if read is None:
             return
+        if read["type"] == protocol.MSG_MOUSEMOVE:
+            self._record_incoming_move(link, read)
         after = []
         try:
             with self._lock:
@@ -893,15 +983,33 @@ class LinkResponder:
                     # Input that arrives while the lock screen clears is dropped, but a release of
                     # something injected before it still goes, or that key stays down after.
                     if self._releases_held(link, read):
-                        self._inject_locked(link, read)
+                        self._inject_timed_locked(link, read)
                 elif not (read["type"] == protocol.MSG_MOUSEMOVE and self._zones_locked(link, read, after)):
-                    self._inject_locked(link, read)
+                    self._inject_timed_locked(link, read)
         except Exception:
             LOGGER.exception("Input from %s could not be injected", link.name)
             self._input_error_status(link)
         finally:
             link.dealt_with(read["seq"])
         self._run(after)
+
+    def _record_incoming_move(self, link: _Link, read: dict) -> None:
+        now = time.monotonic()
+        if link.incoming_moves_at is None or now - link.incoming_move_last_at > 1.0:
+            link.incoming_moves_at = now
+            link.incoming_move_count = link.incoming_dx = link.incoming_dy = link.incoming_largest = 0
+        dx, dy = abs(int(read["dx"])), abs(int(read["dy"]))
+        link.incoming_move_count += 1
+        link.incoming_dx += dx
+        link.incoming_dy += dy
+        link.incoming_largest = max(link.incoming_largest, dx, dy)
+        link.incoming_move_last_at = now
+        if now - link.incoming_moves_at < 1.0:
+            return
+        LOGGER.debug("incoming moves from %s: %d moves, |dx| sum %d, |dy| sum %d, largest %d in the last second",
+                     link.name, link.incoming_move_count, link.incoming_dx, link.incoming_dy, link.incoming_largest)
+        link.incoming_moves_at = now
+        link.incoming_move_count = link.incoming_dx = link.incoming_dy = link.incoming_largest = 0
 
     def _input_error_status(self, link: _Link) -> None:
         """Says in the status that this peer's input is not being injected, as ReceiverServer did:
@@ -913,6 +1021,30 @@ class LinkResponder:
         link.input_error_at = now
         who = peerlist.label_for(self._settings_now()[0], peer_id=protocol.id_text(link.peer_id)) or link.name
         self._set_status(ServerState.CONNECTED, f"Input error from {who}; see log")
+
+    def _inject_timed_locked(self, link: _Link, read: dict) -> None:
+        began = time.monotonic()
+        try:
+            self._inject_locked(link, read)
+        finally:
+            elapsed = time.monotonic() - began
+            now = time.monotonic()
+            if elapsed >= SLOW_INJECTION_SECONDS and now - link.slow_injection_at >= SLOW_INJECTION_LOG_INTERVAL_SECONDS:
+                link.slow_injection_at = now
+                calls = {
+                    protocol.MSG_KEYDOWN: "inject_key",
+                    protocol.MSG_KEYUP: "inject_key",
+                    protocol.MSG_MOUSEMOVE: "inject_mouse_move",
+                    protocol.MSG_MOUSEDOWN: "inject_mouse_button",
+                    protocol.MSG_MOUSEUP: "inject_mouse_button",
+                    protocol.MSG_SCROLL: "inject_scroll",
+                    protocol.MSG_GESTURE: "inject_gesture",
+                    protocol.MSG_TEXT: "inject_text",
+                }
+                LOGGER.warning(
+                    "slow input injection from %s: %s took %.1f ms in injector.%s",
+                    link.name, read["type"], elapsed * 1000, calls.get(read["type"], "unknown"),
+                )
 
     @staticmethod
     def _releases_held(link: _Link, read: dict) -> bool:
@@ -959,7 +1091,11 @@ class LinkResponder:
             dy, dx = read["dy"], read["dx"]
             if self.input_scale is not None:
                 dy, dx = self.input_scale.wheel(dy, dx)
-            injector.inject_scroll(dy, dx, read["mode"])
+            inject_from_peer = getattr(injector, "inject_scroll_from_peer", None)
+            if inject_from_peer is None:
+                injector.inject_scroll(dy, dx, read["mode"])
+            else:
+                inject_from_peer(dy, dx, read["mode"], link.peer_platform)
         elif kind == protocol.MSG_GESTURE:
             injector.inject_gesture(read["name"])
         elif kind == protocol.MSG_TEXT:
@@ -992,13 +1128,22 @@ class LinkResponder:
 
     # The zones (sections 5 and 8)
 
-    def _arm_locked(self, peers, zones) -> None:
+    def _arm_locked(self, peers, zones, arrival_peer=None, landed=False) -> None:
         owner = self._owner
         if owner is None:
             self._armed, self._zones_live = [], False
             return
         try:
+            previous = self._armed
             self._armed = zone_models(zones, peers, {owner.peer_id} | self._reach, self._resistance, self._notch_span)
+            if arrival_peer is None:
+                crossing.keep_grace(previous, self._armed)
+            # A take that lands the pointer on an edge holds every zone, not only the way back: a hand
+            # still moving from the push that brought it here otherwise crossed the zone beside the
+            # landing to a third machine (rc14, 10-10-2026). A take by the shortcut lands nowhere.
+            for peer, model in self._armed:
+                if arrival_peer is not None and (landed or peer == arrival_peer):
+                    model.start_grace()
         except Exception:
             LOGGER.exception("Could not arm the zones for %s", owner.name)
             self._armed = []
@@ -1013,14 +1158,17 @@ class LinkResponder:
         if not self._armed or self.edges_held():
             return False
         desktop = self._desktop_module()
+        display_map = getattr(desktop, "display_map", lambda: {})()
         monitors, pointer = desktop.monitors(), desktop.cursor_position()
         for peer, model in self._armed:
-            outcome = model.feed(monitors, pointer, float(read["dx"]), float(read["dy"]))
+            outcome = model.feed(monitors, pointer, float(read["dx"]), float(read["dy"]), display_map=display_map)
             if outcome.action == crossing.PASS:
                 continue
             part = None
             if isinstance(model, crossing.PartEdge):
-                part = crossing.part_of(crossing.display_fraction(monitors, model.edge, pointer))
+                target = display_map.get(model.display) if model.display else None
+                fraction = crossing.edge_offset(target, model.edge, pointer) if isinstance(target, crossing.Rect) else crossing.display_fraction(monitors, model.edge, pointer)
+                part = crossing.part_of(fraction)
             elif isinstance(model, crossing.CornerPush):
                 part = model.corner
             if outcome.action == crossing.HOLD:
@@ -1028,10 +1176,24 @@ class LinkResponder:
                 after.append(lambda: self._callback("pressure", model.edge, outcome.pressure, False, part))
                 return True
             offset = corner_offset(model.corner, model.edge) if isinstance(model, crossing.CornerPush) else outcome.offset
+            # Built before disarming: a switch that cannot be built must not leave this machine with
+            # no way out until the next focus (rc12, 10-10-2026).
+            try:
+                message = protocol.switch_v6(link.route, peer, outcome.edge, offset,
+                                             display=outcome.display, side=outcome.side)
+            except ValueError:
+                LOGGER.exception("The zone at this machine's %s edge could not name where it leads", model.edge)
+                try:
+                    message = protocol.switch_v6(link.route, peer, outcome.edge, offset)
+                except ValueError:
+                    LOGGER.exception("The zone at this machine's %s edge could not cross", model.edge)
+                    model.armed = True
+                    model.reset()
+                    return True
             self._disarm_locked()
             LOGGER.info("The pointer pushed through the zone at this machine's %s edge; asking %s to move its input on",
                         model.edge, link.name)
-            link.post(protocol.switch_v6(link.route, peer, outcome.edge, offset))
+            link.post(message)
             after.append(lambda: self._callback("pressure", model.edge, 1.0, True, part))
             return True
         return False
@@ -1145,7 +1307,7 @@ class LinkResponder:
         self._claiming = None
         self._reach = frozenset(peer for peer in focus["reach"] if peer not in (link.peer_id, link.own_id))
         self._resistance = focus["resistance_px"]
-        self._arm_locked(peers, zones)
+        self._arm_locked(peers, zones, link.peer_id if began else None, landed=focus.get("edge") is not None)
         after = []
         if began:
             self._visit += 1
@@ -1296,9 +1458,10 @@ class LinkResponder:
         """A let-go owner gets this machine's clipboard only when something other than its own
         `clipboard` messages changed it during the visit, so an idle machine gives nothing away;
         and never once another ownership has begun or the clipboard changed while it was read, so
-        what it gets is never the next owner's."""
+        what it gets is never the next owner's. Nor when the clipboard could not be read as the
+        visit began (a Wayland session not up yet): what changed during it cannot be told."""
         stamp = self._clipboard_stamp()
-        if stamp is None or stamp == mark:
+        if stamp is None or mark is None or stamp == mark:
             return
         try:
             text, image = self._clipboard_module().get_contents()
@@ -1328,12 +1491,16 @@ class LinkResponder:
                 return
             desktop = self._desktop_module()
             if focus["edge"] is not None:
-                x, y = crossing.arrival_position(desktop.monitors(), focus["edge"], focus["offset"])
+                display_map = getattr(desktop, "display_map", lambda: {})()
+                x, y = crossing.arrival_position(desktop.monitors(), focus["edge"], focus["offset"],
+                                                 focus.get("display"), focus.get("side"), display_map)
                 desktop.set_cursor_position(x, y)
-                LOGGER.info("%s's pointer arrived at this machine's %s edge", link.name, focus["edge"])
+                LOGGER.info("%s's pointer arrived at this machine's %s edge", link.name,
+                            focus.get("side") if focus.get("display") else focus["edge"])
                 self._callback("arrival", focus["edge"], x, y)
             else:
                 x, y = desktop.cursor_position()
+                LOGGER.info("%s's input arrived by its shortcut; pointer stays at (%d, %d)", link.name, x, y)
                 self._callback("arrival", None, x, y)
         except Exception:
             LOGGER.exception("Could not land %s's pointer", link.name)

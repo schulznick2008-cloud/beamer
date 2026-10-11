@@ -199,8 +199,8 @@ def stylesheet() -> str:
         r_field=round(RADIUS["field"]),
         r_button=round(RADIUS["button"]),
         r_keycap=round(RADIUS["keycap"]),
-        selected_bg=tokens.PALETTE["ink"],
-        selected_ink=tokens.PALETTE["ground"],
+        selected_bg=P["ink"],
+        selected_ink=P["ground"],
     )
     return _TEMPLATE.format(**values)
 

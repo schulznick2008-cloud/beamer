@@ -6,6 +6,7 @@ Pure, so the rules are tested without Qt.
 from __future__ import annotations
 
 import re
+import threading
 
 from core import effects
 from core import peerlist
@@ -17,7 +18,7 @@ PAGES = (
      "The machines paired with this PC, where input is right now, and the controls you reach for "
      "every day. Pair a machine here first."),
     ("crossing", "Crossing",
-     "Choose how the pointer or a key moves input to another machine, and how hard the edge "
+     "Choose how the pointer or a key moves input to each machine, and how hard the edge "
      "pushes back first."),
     ("keyboard", "Keyboard",
      "How this PC's Ctrl and Windows keys arrive on another machine, the keys and buttons that stay "
@@ -43,22 +44,76 @@ FOOTER_APPLY = "Changes apply as you make them."
 FOOTER_TRAY = "Closing this window keeps Beamer running in the tray."
 
 
+class LinuxPermissionState:
+    """The two Wayland portal rows, independent of Qt and D-Bus."""
+
+    STATUSES = {"not_requested", "ready", "refused", "unavailable"}
+    DIRECTIONS = {"capture", "remote"}
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._rows = {direction: ("not_requested", "", False) for direction in self.DIRECTIONS}
+        self._requesters = {}
+        self.on_change = None
+
+    def status(self, direction: str) -> tuple[str, str]:
+        with self._lock:
+            return self._rows[direction][:2]
+
+    def can_ask_again(self, direction: str) -> bool:
+        with self._lock:
+            return self._rows[direction][2]
+
+    def bind_requester(self, direction: str, request) -> None:
+        with self._lock:
+            self._requesters[direction] = request
+
+    def report(self, direction: str, status: str, detail: str = "", retryable: bool = False) -> None:
+        if direction not in self.DIRECTIONS or status not in self.STATUSES:
+            raise ValueError("Unknown Linux permission row or status")
+        value = (status, detail if status in ("refused", "unavailable") else "",
+                 status == "refused" or retryable)
+        with self._lock:
+            self._rows[direction] = value
+            changed = self.on_change
+        if changed is not None:
+            changed(direction, *value)
+
+    def ask_again(self, direction: str) -> bool:
+        with self._lock:
+            if not self._rows[direction][2]:
+                return False
+            request = self._requesters.get(direction)
+            if request is None:
+                return False
+        self.report(direction, "not_requested")
+        request()
+        return True
+
+
+def linux_permissions_visible(platform: str, wayland: bool) -> bool:
+    return platform.startswith("linux") and wayland
+
+
 def footer(page: str) -> str:
     return FOOTER_TRAY if page == "connection" else f"{FOOTER_APPLY} {FOOTER_TRAY}"
 
 
-def dots(config_error: bool, firewall_tone: str | None) -> dict:
+def dots(config_error: bool, firewall_tone: str | None, dormant: bool = False) -> dict:
     """Page key to the tone of its sidebar dot, for the pages that need one.
 
     `firewall_tone` is the note tone Connection's firewall module is already showing -- "note" is
     its healthy end-state (the button just offers a manual re-check), so only "note-amber" and
     "note-fault" earn a dot; a plain boolean would also mark the healthy state. Both problems sit
-    on Connection, and a fault outranks amber."""
+    on Connection, and a fault outranks amber. A dormant pairing marks Overview and Crossing amber."""
+    marks = {}
     if config_error or firewall_tone == "note-fault":
-        return {"connection": "fault"}
-    if firewall_tone == "note-amber":
-        return {"connection": "amber"}
-    return {}
+        marks["connection"] = "fault"
+    elif firewall_tone == "note-amber":
+        marks["connection"] = "amber"
+    if dormant:
+        marks.update({"overview": "amber", "crossing": "amber"})
+    return marks
 
 
 # The Design page's styles and colours: Light first, then each crossing effects direction in
@@ -199,7 +254,7 @@ def crossing_state_blocked(paired, mac_heard, sending, connected) -> bool:
 
 
 def crossing_rows(methods) -> frozenset:
-    """Which of the Crossing page's rows the chosen ways use; the rest are hidden."""
+    """The Crossing rows used by these ways; the page may keep the drag guard visible but disabled."""
     methods = set(methods)
     rows = set()
     # Where the Mac sits, which every way in uses: a crossing lands by it, and this PC's edge facing
@@ -220,7 +275,7 @@ def crossing_rows(methods) -> frozenset:
 # stands in for Classic's Glow and Beam, which have no arrival of their own. Named as the Mac's is.
 SIMPLE = "Simple"
 SWITCH_SIMPLE = (
-    ("match", "Same as crossing", "Plays the crossing style"),
+    ("match", "Same as crossing", "Plays Glow"),
     ("locator", "Ring", "Closes onto the pointer"),
 )
 
@@ -239,7 +294,6 @@ SIDE_CHOICES = (("left", "Left"), ("right", "Right"), ("top", "Above"), ("bottom
 # The ways in, as their rows read: the pointer's first, then the shortcut.
 WAY_ROWS = (
     ("edge", "Edge", "One whole side"),
-    ("part", "Part of the edge", "Only the thirds you pick"),
     ("corner", "Corner", "Push diagonally into a corner"),
     ("shortcut", "Shortcut", "Press a key to switch input"),
 )
@@ -287,6 +341,38 @@ def ways_summary(methods, edge, parts, corner, key_name, style, name="the other 
         return f"Nothing moves input to {name}: choose at least one way below."
     joined = ways[0] if len(ways) == 1 else ", ".join(ways[:-1]) + " or " + ways[-1]
     return f"Input moves to {name} when you {joined}.{after}"
+
+
+def ways_note(methods, edge, parts, corner, key_name, style, name, several=False) -> str:
+    methods = set(methods)
+    phrases = []
+    if "shortcut" in methods:
+        phrases.append(f"{'Hold' if style == 'hold' else 'Double-tap'} {key_name}")
+    pointer = []
+    if edge:
+        if "part" in methods:
+            pointer.append(parts_phrase(edge, parts))
+        elif "edge" in methods:
+            pointer.append(f"the {edge} edge")
+    if "corner" in methods:
+        pointer.append(f"the {(corner or 'top_right').replace('_', ' ')} corner")
+    if pointer:
+        joined = pointer[0] if len(pointer) == 1 else ", ".join(pointer[:-1]) + " or " + pointer[-1]
+        phrases.append(f"push through {joined}" + (f" to reach {name}" if several else ""))
+    sentence = ", or ".join(phrases)
+    return sentence[0].upper() + sentence[1:] + "." if sentence else "This PC is always in the shortcut's cycle."
+
+
+def shortcut_destination_note(mode: str, hold: bool) -> str:
+    if mode == "last":
+        note = "With Hold, input goes to the last machine."
+    elif hold:
+        note = "With Hold, input goes to the first ready machine in order."
+    else:
+        note = "The order follows the tiles from top to bottom, then left to right. This PC is always in the cycle."
+    if mode == "ticked":
+        note += " Choose which machines join the cycle with the tick boxes on their tiles."
+    return note
 
 
 # The arrangement diagram. Each side of this PC has an angle, and a machine's screen travels round

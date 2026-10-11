@@ -92,7 +92,8 @@ class WakingController(KVMController):
         peer = self._in_question()
         return bool(self._wake_address(peer)[0]) and not self._awake(peer)
 
-    def set_redirecting(self, value, edge=None, offset=None, came_home=True, peer=None):
+    def set_redirecting(self, value, edge=None, offset=None, came_home=True, peer=None, reason=None,
+                        display=None, side=None):
         target = peer or self._shortcut_peer()
         # From home, or on from the machine input is on to another (a menu naming it): one asleep is woken.
         leaving = not self.redirecting or (peer is not None and peer != self.owner.on)
@@ -100,7 +101,8 @@ class WakingController(KVMController):
                 and not self._refused(target)):
             self.wake(target)
             return False
-        return super().set_redirecting(value, edge, offset, came_home=came_home, peer=peer)
+        return super().set_redirecting(value, edge, offset, came_home=came_home, peer=peer, reason=reason,
+                                       display=display, side=side)
 
     def _refused(self, peer=None) -> bool:
         """A machine that answered and refused -- the pairing, or the protocol version -- is awake,

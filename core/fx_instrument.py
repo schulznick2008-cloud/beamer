@@ -26,15 +26,24 @@ def roles(s):
 # native canvas arc at the dial and reticle radii drawn here. Doubling the density (pi/4 a piece)
 # is the best trade-off found by measurement: finer still fixes some states and reopens others
 # elsewhere in the same sweep, so this is the port's fix, not a tuned-away symptom.
-def detent(u, n, slide=0.4):
-    """n equal detents, each move taking the first `slide` of its slot and then holding."""
+def detent(u, n, slide=0.4, pace=1.0):
+    """n equal detents, each move taking the first `slide` of its slot and then holding.
+
+    A longer Length plays everything slower, `pace` times, and stretched with it the holds became
+    stills: 117ms at 2.5, read as a low frame rate. Past pace 1 every move after the first starts
+    early, into the hold before it, so a hold lasts as long in real time as at pace 1. Each move
+    still ends where it did, so the lock and flash each design times against its last move stay put."""
     if u <= 0:
         return 0.0
     if u >= 1:
         return 1.0
-    k = math.floor(u * n)
-    f = u * n - k
-    return min(1.0, (k + clamp(f / slide)) / n)
+    x = u * n
+    k = math.floor(x)
+    lead = (1.0 - slide) * (1.0 - 1.0 / pace) if pace > 1.0 else 0.0
+    if k + 1 < n and x >= k + 1 - lead:
+        k += 1
+    early = lead if k else 0.0
+    return min(1.0, (k + clamp((x - k + early) / (slide + early))) / n)
 
 
 def ink(ctx, s, colour, w, alpha, build):
@@ -215,9 +224,9 @@ def rule_depart(ctx, s):
             return
         p, done = 1, True
         if s.reduced:
-            alpha = 1 - detent(u, 4, 0.25)
+            alpha = 1 - detent(u, 4, 0.25, pace=getattr(s, "pace", 1.0))
         else:
-            reach = SP * N * (1 - detent(u, 4))
+            reach = SP * N * (1 - detent(u, 4, pace=getattr(s, "pace", 1.0)))
             alpha = 1 - clamp((u - 0.75) / 0.25)
     if alpha <= 0:
         return
@@ -249,7 +258,7 @@ def rule_arrive(ctx, s):
     if t >= 0.6:
         return
     C = roles(s)
-    c = 1 if s.reduced else detent(t / 0.28, 3)
+    c = 1 if s.reduced else detent(t / 0.28, 3, pace=getattr(s, "pace", 1.0))
     locked = t >= 0.26
     flash = clamp(1 - (t - 0.26) / 0.12) if locked else 0
     alpha = 1 if t < 0.38 else 1 - (t - 0.38) / 0.22
@@ -324,7 +333,7 @@ def gauge_notch(ctx, s, k, C):
     if u >= 0.6:
         return
     fade = 1 if u < 0.4 else 1 - (u - 0.4) / 0.2
-    shut = 1 if s.reduced else detent(u / 0.36, 4)
+    shut = 1 if s.reduced else detent(u / 0.36, 4, pace=getattr(s, "pace", 1.0))
     a, b = k.tp * shut, L - (L - k.tp) * shut
 
     def blades():
@@ -397,8 +406,8 @@ def gauge_depart(ctx, s):
     u = s.since
     if u >= 0.6:
         return
-    fade = (1 - detent(u / 0.6, 4, 0.25)) if s.reduced else (1 if u < 0.4 else 1 - (u - 0.4) / 0.2)
-    shut = 1 if s.reduced else detent(u / 0.36, 4)
+    fade = (1 - detent(u / 0.6, 4, 0.25, pace=getattr(s, "pace", 1.0))) if s.reduced else (1 if u < 0.4 else 1 - (u - 0.4) / 0.2)
+    shut = 1 if s.reduced else detent(u / 0.36, 4, pace=getattr(s, "pace", 1.0))
     a = R0 * (1 - shut)
     rot = shut * PI / 6
 
@@ -431,7 +440,7 @@ def gauge_arrive(ctx, s):
     if t >= 0.7:
         return
     C = roles(s)
-    c = 1 if s.reduced else detent(t / 0.34, 4)
+    c = 1 if s.reduced else detent(t / 0.34, 4, pace=getattr(s, "pace", 1.0))
     lock_at = 0.3
     locked = t >= lock_at
     flash = clamp(1 - (t - lock_at) / 0.14) if locked else 0
@@ -564,8 +573,8 @@ def rangefinder_depart(ctx, s):
     if u >= 0.8:
         return
     fade = 1 if u < 0.55 else 1 - (u - 0.55) / 0.25
-    A = 0 if s.reduced else SPAN * (1 - detent(u / 0.42, 4))
-    slit = 70 if s.reduced else 70 * (1 - detent(u / 0.55, 5))
+    A = 0 if s.reduced else SPAN * (1 - detent(u / 0.42, 4, pace=getattr(s, "pace", 1.0)))
+    slit = 70 if s.reduced else 70 * (1 - detent(u / 0.55, 5, pace=getattr(s, "pace", 1.0)))
     blades, on = [], []
     for ray in k.rays:
         lim = min(SPAN, ray.max)
@@ -601,7 +610,7 @@ def rangefinder_arrive(ctx, s):
     if t >= 0.8:
         return
     C = roles(s)
-    c = 1 if s.reduced else detent(t / 0.4, 4)
+    c = 1 if s.reduced else detent(t / 0.4, 4, pace=getattr(s, "pace", 1.0))
     LOCK = 0.34
     locked = t >= LOCK
     flash = clamp(1 - (t - LOCK) / 0.18) if locked else 0

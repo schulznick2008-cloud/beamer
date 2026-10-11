@@ -24,6 +24,7 @@ import time
 from core import peerlist
 from core import protocol
 from core import receiver
+from core.response_time import ResponseTime
 
 LOGGER = logging.getLogger("Beamer")
 
@@ -39,6 +40,7 @@ QUEUE_LIMIT = 2048
 QUEUE_BYTES = 32 * 1024 * 1024
 STALL_SECONDS = 2.0
 SENT_RECORD_LIMIT = 20000
+ACK_STALL_SECONDS = 1.5
 MEDIA_KEYS = frozenset({"volume_mute", "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause"})
 WINDOW_SECONDS = 30.0
 LOG_SECONDS = 60.0
@@ -119,6 +121,9 @@ class OutboundLink:
         self.last_sent_seq = 0
         self._written_seq = 0
         self._sent_at = collections.deque()
+        self._ack_pause_since = None
+        self._ack_stall_credit = {}
+        self._last_logged_sent_seq = 0
         self._samples = collections.deque()
         self._period = []
         self._last_ack_seq = -1
@@ -142,6 +147,9 @@ class OutboundLink:
         self._followed_at = None
         self._followed_to = None
         self._answered = False
+        self._response_time = ResponseTime(clock=clock)
+        self._response_time_enabled = False
+        self._next_response_probe = 0.0
         self._checked_at = 0.0
         self.status = ""
         # What the last report was, for the app to word in its own way: "connected", "removed",
@@ -234,10 +242,11 @@ class OutboundLink:
         """What this link's sentences call the machine: its label, so two of one name are told apart."""
         entry = entry or {}
         try:
-            shown = peerlist.label_for(self._book.peers(), token=entry.get("token"))
+            shown = peerlist.label_for(self._book.peers(), token=entry.get("token"),
+                                       peer_id=entry.get("id"), host=entry.get("host"))
         except Exception:
             shown = ""
-        return shown or entry.get("name") or entry.get("host") or "The other machine"
+        return shown or entry.get("host") or "The other machine"
 
     # The thread
 
@@ -295,15 +304,23 @@ class OutboundLink:
                             closed_since = None
                         if closed_since is not None and now - closed_since >= FORGOTTEN_AFTER_SECONDS:
                             name = self._name(entry)
+                            try:
+                                self._book.mark_dormant(self.token, "forgotten")
+                            except Exception:
+                                LOGGER.exception("Could not save the dormant state for %s", name)
                             if self.kind != "forgotten":
                                 LOGGER.info("%s has closed every handshake for %d seconds; it no longer has this pairing",
                                             name, FORGOTTEN_AFTER_SECONDS)
-                            self._report(False, f"{name} no longer has this pairing: remove {name} here and pair "
-                                         "the two again", "forgotten")
+                            self._report(False, f"{name} no longer has this pairing: use Re-pair on Overview", "forgotten")
                             wait = max(wait, FORGOTTEN_RETRY_SECONDS)
                         else:
                             self._report(False, ended.text, ended.kind)
                         if ended.stop_dialling:
+                            if ended.kind == "wrong_id":
+                                try:
+                                    self._book.mark_dormant(self.token, "wrong_id")
+                                except Exception:
+                                    LOGGER.exception("Could not save the dormant state for %s", self._name(entry))
                             self._blocked_for = shape
                 except Exception:
                     closed_since = None
@@ -442,7 +459,7 @@ class OutboundLink:
             welcome = protocol.read_welcome(protocol.recv_first_msg(sock, session, deadline))
         except protocol.HelloRefused as refused:
             if refused.error == protocol.ERROR_WRONG_ID:
-                raise LinkEnded(f"{name} has this pairing under another machine: remove it on both and pair again.", "wrong_id", stop_dialling=True) from None
+                raise LinkEnded(f"{name} has this pairing under another machine: use Re-pair on Overview.", "wrong_id", stop_dialling=True) from None
             raise LinkEnded(f"{name} could not read what this machine sent first; Beamer on the two machines may differ", "unreadable") from None
         except (protocol.InvalidWelcome, protocol.NotAnObject):
             raise LinkEnded(f"A different Beamer answered at {host}", "different") from None
@@ -461,6 +478,7 @@ class OutboundLink:
         if outcome == receiver.WRONG_ID:
             raise LinkEnded(f"A different Beamer answered at {host}", "different")
         sock.settimeout(READ_SECONDS)
+        welcome["own_caps"] = identity["caps"]
         welcome["session"] = session
         return welcome
 
@@ -468,11 +486,15 @@ class OutboundLink:
 
     def _serve(self, sock, fields):
         session = fields.pop("session")
+        own_caps = fields.pop("own_caps", ())
         entry = self.entry() or {}
         now = self._clock()
         with self._lock:
             self._sock, self._session = sock, session
             self._caps = frozenset(fields["caps"])
+            self._response_time_enabled = "ping_rtt" in self._caps and "ping_rtt" in own_caps
+            self._next_response_probe = now + PING_SECONDS
+            self._response_time.reset()
             self.peer_id = protocol.id_text(fields["id"])
             self.peer_platform = fields["platform"]
             self.peer_name = fields["name"]
@@ -513,12 +535,16 @@ class OutboundLink:
         self._writing = False
         self._seq = self.last_sent_seq = self._written_seq = 0
         self._sent_at.clear()
+        self._ack_pause_since = None
+        self._ack_stall_credit.clear()
+        self._last_logged_sent_seq = 0
         self._samples.clear()
         self._period = []
         self._last_ack_seq = -1
         self.last_ack_at = None
         self._locked = False
         self._drop_reason = None
+        self._response_time.reset()
 
     def _close(self, only=None):
         with self._cond:
@@ -547,6 +573,10 @@ class OutboundLink:
                     began = now
                 buffer.extend(chunk)
                 self._last_rx = now
+                if len(buffer) >= protocol.HEADER_SIZE:
+                    length = int.from_bytes(buffer[:protocol.HEADER_SIZE], "big")
+                    if length - 20 > protocol.SMALL_MESSAGE_BYTES:
+                        self._begin_ack_pause(began or now)
             elif now - self._last_rx > SILENCE_SECONDS:
                 raise LinkEnded(f"{name} stopped responding", "stopped")
             while len(buffer) >= protocol.HEADER_SIZE:
@@ -560,14 +590,22 @@ class OutboundLink:
                 body = bytes(buffer[protocol.HEADER_SIZE:protocol.HEADER_SIZE + length])
                 del buffer[:protocol.HEADER_SIZE + length]
                 plain = session.open_raw(body)
-                if len(plain) > protocol.SMALL_MESSAGE_BYTES and not self._large_due(began or now):
-                    LOGGER.warning("Dropped a %d byte message from %s that no clipboard was due for", len(plain), name)
-                else:
-                    self._deal(protocol.parse_message(plain), began or now)
+                try:
+                    if len(plain) > protocol.SMALL_MESSAGE_BYTES and not self._large_due(began or now):
+                        LOGGER.warning("Dropped a %d byte message from %s that no clipboard was due for", len(plain), name)
+                    else:
+                        self._deal(protocol.parse_message(plain), began or now)
+                finally:
+                    if length - 20 > protocol.SMALL_MESSAGE_BYTES:
+                        self._end_ack_pause(self._clock())
                 began = now if buffer else None
+                if len(buffer) >= protocol.HEADER_SIZE:
+                    next_length = int.from_bytes(buffer[:protocol.HEADER_SIZE], "big")
+                    if next_length - 20 > protocol.SMALL_MESSAGE_BYTES:
+                        self._begin_ack_pause(began or now)
             if buffer and now - began > protocol.FRAME_COMPLETE_SECONDS:
                 raise LinkEnded(f"{name} took too long to send one message", "stopped")
-            self._tick(now)
+            self._tick(self._clock())
 
     def _large_due(self, began):
         if self._large is None:
@@ -578,14 +616,53 @@ class OutboundLink:
             LOGGER.exception("Could not tell whether a large message was due")
             return False
 
+    def _begin_ack_pause(self, began):
+        with self._lock:
+            if self._ack_pause_since is None:
+                self._ack_pause_since = began
+
+    def _end_ack_pause(self, ended):
+        with self._lock:
+            began, self._ack_pause_since = self._ack_pause_since, None
+            if began is not None:
+                for seq, sent in self._sent_at:
+                    self._ack_stall_credit[seq] = self._ack_stall_credit.get(seq, 0.0) + max(
+                        0.0, ended - max(began, sent)
+                    )
+
     def _deal(self, message, began):
         if message.get("type") == protocol.MSG_ACK:
             self._ack(protocol.read_ack(message))
             return
+        if message.get("type") == protocol.MSG_PING:
+            self._handle_ping(message)
         message.began_at = began
         self._call(2, message)
 
+    def _handle_ping(self, message):
+        if not self._response_time_enabled:
+            return
+        read = protocol.read_ping(message)
+        if read is None:
+            return
+        if "echo" in read:
+            self._response_time.echoed(read["echo"])
+        if "probe" in read:
+            self._enqueue(protocol.ping_msg(echo=read["probe"]), seq=False)
+
     def _tick(self, now):
+        with self._lock:
+            oldest = self._sent_at[0] if self._sent_at else None
+            last_acked = self._last_ack_seq
+            pending = len(self._sent_at)
+            ack_paused = self._ack_pause_since is not None
+            oldest_age = now - oldest[1] - self._ack_stall_credit.get(oldest[0], 0.0) if oldest else 0.0
+        if oldest is not None and not ack_paused and oldest_age > ACK_STALL_SECONDS:
+            LOGGER.warning(
+                "%s stopped acknowledging input: oldest seq %d, last acked seq %d, %d unacknowledged",
+                self.peer_name, oldest[0], last_acked, pending,
+            )
+            raise LinkEnded(f"{self.peer_name} stopped acknowledging input", "stalled")
         if self._writing and now - self._last_progress > STALL_SECONDS:
             raise LinkEnded(f"{self._name(self.entry())} stopped accepting data", "stopped")
         if now - self._checked_at >= 1.0:
@@ -595,7 +672,11 @@ class OutboundLink:
                 raise LinkEnded("This pairing was removed", "removed")
             if entry.get("send") is not True:
                 raise LinkEnded("Sending to this machine was switched off", "off")
-        if now - self._last_tx >= PING_SECONDS:
+        if self._response_time_enabled:
+            if now >= self._next_response_probe:
+                self._next_response_probe = now + PING_SECONDS
+                self._tick_response_ping()
+        elif now - self._last_tx >= PING_SECONDS:
             self._tick_ping()
         if now - self._logged_at >= LOG_SECONDS:
             self._logged_at = now
@@ -606,7 +687,20 @@ class OutboundLink:
         was on this link."""
         with self._lock:
             period, self._period = self._period, []
+            sent_seq = self._written_seq
+            sent_count = max(0, sent_seq - self._last_logged_sent_seq)
+            self._last_logged_sent_seq = sent_seq
+            pending = len(self._sent_at)
+            oldest = self._sent_at[0] if self._sent_at else None
+            last_acked = self._last_ack_seq
+        if not period and not sent_count:
+            return
         if not period:
+            LOGGER.info(
+                "round trip to %s: sent %d, acknowledged 0, oldest unacknowledged seq %d for %.1f s (%d pending, last acked seq %d)",
+                self.peer_name, sent_count, oldest[0] if oldest else sent_seq,
+                max(0.0, self._clock() - oldest[1]) if oldest else 0.0, pending, last_acked,
+            )
             return
         ordered = sorted(sample for sample, _held in period)
         count = len(ordered)
@@ -623,6 +717,21 @@ class OutboundLink:
         if not self._enqueue(protocol.ping_msg(), seq=False):
             self._ping_queued = False
 
+    def _tick_response_ping(self):
+        with self._cond:
+            if self._ping_queued:
+                return
+            self._ping_queued = True
+        probe = self._response_time.new_probe()
+        if probe is None or not self._enqueue(protocol.ping_msg(probe=probe), seq=False):
+            self._ping_queued = False
+
+    @property
+    def response_time_ms(self):
+        if not self._live or not self._response_time_enabled:
+            return None
+        return self._response_time.response_time_ms
+
     # Sending
 
     def post(self, message):
@@ -631,6 +740,11 @@ class OutboundLink:
         if not self._live:
             return False
         kind = message.get("type")
+        if kind in (protocol.MSG_FOCUS, protocol.MSG_SWITCH) and "displays" not in self._caps:
+            data = dict(message.get("data") or {})
+            data.pop("display", None)
+            data.pop("side", None)
+            message = {"type": kind, "data": data}
         if kind == protocol.MSG_CLIPBOARD:
             data = dict(message.get("data") or {})
             if "clipboard" not in self._caps:
@@ -685,8 +799,6 @@ class OutboundLink:
                         return
                     message = self._outbox.popleft()
                     self._queued_bytes = max(0, self._queued_bytes - _weight(message))
-                    if message.get("type") == protocol.MSG_PING:
-                        self._ping_queued = False
                     self._writing = True
                     self._last_progress = self._clock()
                 seq = message.get("data", {}).get("seq")
@@ -696,9 +808,14 @@ class OutboundLink:
                     with self._lock:
                         self._written_seq = seq
                         self._sent_at.append((seq, self._clock()))
+                        self._ack_stall_credit[seq] = 0.0
                     self._check_sent_record()
                 frame = memoryview(session.seal(message))
                 sent = 0
+                if message.get("type") == protocol.MSG_PING:
+                    probe = (message.get("data") or {}).get("probe")
+                    if probe is not None and self._response_time_enabled:
+                        self._response_time.sent(probe)
                 while sent < len(frame):
                     try:
                         sent += sock.send(frame[sent:sent + SEND_CHUNK])
@@ -706,6 +823,9 @@ class OutboundLink:
                     except socket.timeout:
                         if self._sock is not sock:
                             return
+                if message.get("type") == protocol.MSG_PING and "echo" not in (message.get("data") or {}):
+                    with self._cond:
+                        self._ping_queued = False
                 self._last_tx = self._clock()
                 self._writing = False
         except (OSError, protocol.ProtocolError, ValueError) as exc:
@@ -732,6 +852,7 @@ class OutboundLink:
             sent = None
             while self._sent_at and self._sent_at[0][0] <= seq:
                 sent_seq, at = self._sent_at.popleft()
+                self._ack_stall_credit.pop(sent_seq, None)
                 if sent_seq == seq:
                     sent = at
             if advanced and sent is not None:

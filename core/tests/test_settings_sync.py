@@ -20,6 +20,7 @@ def mac_raw(**crossing):
         "corner": "top_right", "resistance_px": 120, "block_while_dragging": True, "glow": True,
         "glow_style": "glow", "glow_colour": "signal", "effect_length": "normal", "effect_size": "medium",
         "shortcut_arrival": True,
+        "shortcut_goes_to": "last",
         "shortcut_arrival_style": "match", "notch_style": "beam", "notch_after_ms": 1200, "haptics": True,
         "hold_full_screen": False,
     }
@@ -32,6 +33,7 @@ def pc_config(**fields):
     base = dict(
         crossing_methods=["edge", "shortcut"], crossing_edge_parts=["middle"], crossing_corner="top_left",
         crossing_resistance_px=120, block_while_dragging=True, trigger_key="cmd_r", trigger_style="double_tap",
+        shortcut_goes_to="last",
         double_tap_ms=300, glow_style="glow", glow_colour="signal", effect_length="normal", effect_size="medium",
         shortcut_arrival=True, shortcut_arrival_style="match", mac_return_edge="left", edge_glow=True,
         appearance="light",
@@ -43,6 +45,11 @@ def pc_config(**fields):
 class MessageTests(unittest.TestCase):
     def test_pc_modifier_style_is_local_and_not_part_of_same_on_all_machines(self):
         self.assertNotIn("modifier_style", settings_sync.CROSSING_KEYS + settings_sync.DESIGN_KEYS)
+
+    def test_left_out_peer_fields_are_not_carried_by_same_on_all_machines(self):
+        data = settings_sync.message_data(True, 7, {"left_out": True, "left_out_ways": ["edge"]})
+
+        self.assertEqual(data, {"on": True, "set_at": 7, "by": "", "crossing": {}, "design": {}})
 
     def test_new_design_choices_survive_the_settings_message_round_trip(self):
         from core import effects
@@ -62,6 +69,102 @@ class MessageTests(unittest.TestCase):
                     self.assertEqual(received["shortcut_arrival_style"], style)
         self.assertTrue(set(styles) <= set(effects.EFFECT_IDS))
         self.assertTrue(set(colours) <= set(effects.PACK_IDS))
+
+    def test_names_keep_the_newest_stamp_per_machine(self):
+        first, second = b64(b"\x01" * 16), b64(b"\x02" * 16)
+        held = {first: {"label": "Old", "set_at": 20, "by": first}}
+        data = settings_sync.message_data(True, 10, names={
+            first: {"label": "Older", "set_at": 19, "by": second},
+            second: {"label": "New", "set_at": 21, "by": second},
+        })
+
+        self.assertEqual(settings_sync.names_arrived(data, held, now=NOW),
+                         ({second: {"label": "New", "set_at": 21, "by": second}}, None))
+
+    def test_names_from_settings_includes_unlabelled_peers_for_revert(self):
+        own, peer = b64(b"\x01" * 16), b64(b"\x02" * 16)
+        settings = {"machine_id": own, "name": "", "peers": [{"id": peer}]}
+
+        names = settings_sync.names_from_settings(settings)
+
+        self.assertEqual(names[peer], {"label": "", "set_at": 0, "by": own})
+
+    def test_an_untouched_empty_own_name_cannot_be_attributed_to_a_peer(self):
+        own, peer = b64(b"\x01" * 16), b64(b"\x02" * 16)
+        settings = {"machine_id": own, "name": "", "name_set_at": 0, "name_by": peer, "peers": []}
+
+        self.assertEqual(settings_sync.names_from_settings(settings)[own],
+                         {"label": "", "set_at": 0, "by": own})
+
+    def test_a_name_for_this_machine_is_returned_as_its_own_name(self):
+        own = b64(b"\x01" * 16)
+        settings = {"machine_id": own, "name": "", "peers": []}
+        data = settings_sync.message_data(True, 10, names={
+            own: {"label": "This Mac", "set_at": 21, "by": own},
+        })
+
+        updates, own_name = settings_sync.names_arrived(data, {}, own_id=own, now=NOW)
+        self.assertEqual((updates, own_name),
+                         ({own: {"label": "This Mac", "set_at": 21, "by": own}}, "This Mac"))
+        self.assertTrue(settings_sync.apply_names(settings, updates))
+        self.assertEqual(settings["name"], "This Mac")
+
+    def test_names_are_ignored_when_same_is_off(self):
+        own = b64(b"\x01" * 16)
+        data = settings_sync.message_data(False, 10)
+        data["names"] = {
+            own: {"label": "Ignored", "set_at": 21, "by": own},
+        }
+
+        self.assertEqual(settings_sync.names_arrived(data, {}, own_id=own, now=NOW), ({}, None))
+
+    def test_names_follow_the_selected_group_and_legacy_peers_use_local_selection(self):
+        own = b64(b"\x01" * 16)
+        data = settings_sync.message_data(True, 10, names={
+            own: {"label": "Incoming", "set_at": 21, "by": own},
+        })
+
+        self.assertEqual(settings_sync.names_arrived(data, {}, own_id=own, now=NOW,
+                                                       current_groups=["crossing"]), ({}, None))
+        legacy = {key: value for key, value in data.items() if key != "groups"}
+        self.assertEqual(settings_sync.names_arrived(legacy, {}, own_id=own, now=NOW,
+                                                       current_groups=["names"])[1], "Incoming")
+
+    def test_name_entries_with_bad_stamps_or_authors_are_ignored(self):
+        ident = b64(b"\x01" * 16)
+        data = settings_sync.message_data(True, 10, names={
+            ident: {"label": "Too far", "set_at": NOW + 86401, "by": ident},
+            "bad-id": {"label": "Bad id", "set_at": 21, "by": ident},
+            b64(b"\x02" * 16): {"label": "Bad author", "set_at": 21, "by": "bad"},
+        })
+
+        self.assertEqual(settings_sync.names_arrived(data, {}, now=NOW), ({}, None))
+
+    def test_synced_name_is_trimmed_before_the_64_character_limit(self):
+        ident = b64(b"\x01" * 16)
+        label = "  " + "x" * 64 + "  "
+        data = settings_sync.message_data(True, 10, names={
+            ident: {"label": label, "set_at": 21, "by": ident},
+        })
+
+        updates, _own_name = settings_sync.names_arrived(data, {}, now=NOW)
+        self.assertEqual(updates[ident]["label"], "x" * 64)
+
+    def test_rename_peer_trims_limits_and_stamps_the_label(self):
+        peer = {"label": "Old", "label_set_at": 20}
+
+        renamed = settings_sync.rename_peer(peer, "  " + "x" * 70 + "  ", "author", now=19.8)
+
+        self.assertEqual(renamed, {"label": "x" * 64, "label_set_at": 21, "label_by": "author"})
+
+    def test_restored_names_get_new_stamps_for_peer_acceptance(self):
+        own = b64(b"\x01" * 16)
+        settings = {"machine_id": own, "name": "Current", "name_set_at": 40,
+                    "name_by": own, "peers": []}
+        restored = settings_sync.restamp_names(settings,
+            {own: {"label": "Before sync", "set_at": 20, "by": own}}, own, now=30)
+
+        self.assertEqual(restored[own], {"label": "Before sync", "set_at": 41, "by": own})
     def test_an_optional_design_state_keeps_its_own_stamp_and_effect_size(self):
         values = {**settings_sync.mac_values(mac_raw()), "effect_size": "large"}
         design_state = {"set_at": 63, "by": b64(b"\x03" * 16), "values": values}
@@ -82,7 +185,8 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(settings_sync.read_design_state(
             {"on": False, "set_at": NOW, "by": b64(bytes(16)), "design_sync": state}, KEYS),
                          {"set_at": NOW, "by": state["by"],
-                          "values": {"effect_size": "medium", "glow_style": "beam"}})
+                          "values": {"effect_size": "medium", "effect_size_fraction": 0.045,
+                                     "glow_style": "beam"}})
 
     def test_an_invalid_effect_size_is_ignored_but_a_missing_one_defaults_to_medium(self):
         state = {"set_at": NOW, "by": b64(bytes(16)),
@@ -132,11 +236,12 @@ class MessageTests(unittest.TestCase):
         self.assertEqual((b["set_at"], b["by"], c["set_at"], c["by"]),
                          (100, a_id, 100, a_id))
 
-    def test_explicit_follow_adopts_all_six_values_despite_a_newer_local_stamp(self):
+    def test_explicit_follow_adopts_all_design_values_despite_a_newer_local_stamp(self):
         peer = b64(bytes([2]) * 16)
         current = settings_sync.mac_values(mac_raw())
         desired = dict(glow_style="beam", glow_colour="ocean", effect_length="long",
-                       effect_size="large", shortcut_arrival=False, shortcut_arrival_style="locator")
+                       effect_size="large", effect_pace=2.0, effect_size_fraction=0.06,
+                       shortcut_arrival=False, shortcut_arrival_style="locator")
         state = {"set_at": 10, "by": peer, "values": desired}
         taken = settings_sync.followed_design(current, state, peer, peer, False, 500, "", force=True)
         self.assertEqual({key: taken["values"][key] for key in settings_sync.DESIGN_KEYS}, desired)
@@ -264,6 +369,105 @@ class MessageTests(unittest.TestCase):
                     "methods", "edge_parts", "corner"):
             self.assertNotIn(own, flat)
 
+    def test_groups_filter_values_and_layout_always_travels(self):
+        values = settings_sync.mac_values(mac_raw())
+        groups = ("crossing", "shortcut")
+        data = settings_sync.message_data(True, 50, values, groups=groups,
+                                          layout_state={"set_at": 3, "by": "", "tiles": {"x": {}}})
+
+        self.assertEqual(data["groups"], list(groups))
+        self.assertEqual(set(data["crossing"]),
+                         set(settings_sync.GROUP_KEYS["crossing"] + settings_sync.GROUP_KEYS["shortcut"]))
+        self.assertEqual(set(data["design"]), set())
+        self.assertEqual(set(settings_sync.read(data, KEYS)[2]),
+                         set(settings_sync.GROUP_KEYS["crossing"] + settings_sync.GROUP_KEYS["shortcut"]))
+        self.assertIn("layout", data)
+
+    def test_old_peer_values_use_only_groups_selected_here_and_never_change_them(self):
+        data = settings_sync.message_data(True, 50, settings_sync.mac_values(mac_raw(glow_style="beam")))
+        data.pop("groups", None)
+
+        self.assertEqual(set(settings_sync.read(data, KEYS, current_groups=("design",))[2]),
+                         set(settings_sync.GROUP_KEYS["design"]))
+        # None chosen here: Same was off, and a 1.5.1 peer turning it on means every group, as here.
+        self.assertEqual(set(settings_sync.read(data, KEYS, current_groups=())[2]),
+                         set(settings_sync.CROSSING_KEYS + settings_sync.DESIGN_KEYS))
+        self.assertEqual(settings_sync.arrival_groups(data, ()), settings_sync.ALL_GROUPS)
+        self.assertEqual(settings_sync.arrival_groups(dict(data, on=False), ()), ())
+
+    def test_legacy_off_keeps_local_group_selection_and_transmitted_off_state(self):
+        data = {"on": False, "set_at": 50, "by": b64(bytes([1]) * 16)}
+
+        self.assertEqual(settings_sync.arrival_groups(data, ("design",)), ("design",))
+        self.assertEqual(settings_sync.read(data, KEYS, current_groups=("design",)), (False, 50, {}))
+
+    def test_everything_expands_to_all_four_groups(self):
+        self.assertEqual(settings_sync.groups_for_choice(("everything",)), settings_sync.ALL_GROUPS)
+
+    def test_snapshot_revert_and_expiry(self):
+        snapshot = settings_sync.same_snapshot(("crossing", "design"), {"resistance_px": 40}, now=100)
+
+        self.assertTrue(settings_sync.snapshot_available(snapshot, now=100 + settings_sync.SNAPSHOT_TTL))
+        self.assertFalse(settings_sync.snapshot_available(snapshot, now=101 + settings_sync.SNAPSHOT_TTL))
+        self.assertEqual(settings_sync.restore_snapshot(snapshot, now=200),
+                         {"groups": ["crossing", "design"], "values": {"resistance_px": 40}})
+
+    def test_snapshot_is_taken_only_before_an_accepted_change(self):
+        groups = ("crossing",)
+        current = {"resistance_px": 120, "glow_style": "glow"}
+        data = settings_sync.message_data(True, 101, {"resistance_px": 60}, by=b64(bytes([1]) * 16),
+                                          groups=("crossing",))
+
+        saved = settings_sync.snapshot_for_arrival(data, 100, KEYS, "", groups, current, now=NOW)
+        stale = settings_sync.snapshot_for_arrival(data, 101, KEYS, data["by"], groups, current, now=NOW)
+        self.assertEqual(saved["values"], {"resistance_px": 120})
+        self.assertIsNone(stale)
+
+    def test_a_group_selection_only_update_still_saves_the_previous_selection(self):
+        current = {"resistance_px": 120, "glow_style": "glow"}
+        data = settings_sync.message_data(True, 101, current, by=b64(bytes([1]) * 16),
+                                          groups=("design",))
+
+        saved = settings_sync.snapshot_for_arrival(data, 100, KEYS, "", ("crossing",), current, now=NOW)
+
+        self.assertEqual(saved["groups"], ["crossing"])
+        self.assertEqual(saved["values"], {"glow_style": "glow"})
+
+    def test_snapshot_can_keep_the_local_names_group(self):
+        names = {b64(bytes([2]) * 16): {"label": "Old", "set_at": 2, "by": b64(bytes([1]) * 16)}}
+        snapshot = settings_sync.same_snapshot(("names",), {}, now=100, names=names)
+
+        self.assertEqual(settings_sync.restore_snapshot(snapshot, now=100)["names"], names)
+
+    def test_selection_only_revert_keeps_values_edited_since_the_update(self):
+        current = {"resistance_px": 120, "glow_style": "glow"}
+        data = settings_sync.message_data(True, 101, current, groups=["design"])
+        snapshot = settings_sync.snapshot_for_arrival(data, 100, KEYS, "", ["crossing"], current, now=NOW)
+        self.assertEqual(settings_sync.restore_snapshot(snapshot, now=NOW)["values"], {})
+        self.assertEqual(settings_sync.revert_groups(snapshot, ["design"]), ["crossing"])
+
+    def test_value_revert_keeps_the_current_policy_on(self):
+        data = settings_sync.message_data(True, 101, {"resistance_px": 60}, groups=["crossing"])
+        snapshot = settings_sync.snapshot_for_arrival(data, 100, KEYS, "", [], {"resistance_px": 120}, now=NOW)
+        self.assertEqual(settings_sync.revert_groups(snapshot, ["crossing"]), ["crossing"])
+
+    def test_a_refused_trigger_does_not_replace_a_previous_undo_snapshot(self):
+        data = settings_sync.message_data(True, 101, {"trigger_key": "f13"}, groups=["shortcut"])
+        self.assertIsNone(settings_sync.snapshot_for_arrival(
+            data, 100, KEYS, "", ["shortcut"], {"trigger_key": "alt_r"}, now=NOW, applied_values={}))
+
+    def test_an_update_without_design_values_does_not_advance_direct_design(self):
+        current = settings_sync.mac_values(mac_raw())
+        self.assertIsNone(settings_sync.design_change_stamp(current, {"resistance_px": 60}, 10, None, ""))
+        self.assertIsNone(settings_sync.design_change_stamp(current, {}, 10, None, ""))
+
+    def test_names_obey_the_accepted_policy_when_an_old_selection_arrives_late(self):
+        own = b64(b"\x01" * 16)
+        data = settings_sync.message_data(True, 10, groups=["names"],
+            names={own: {"label": "Delayed", "set_at": 30, "by": own}})
+        self.assertEqual(settings_sync.names_arrived(data, {}, own_id=own, now=NOW,
+                                                   policy_groups=["crossing"]), ({}, None))
+
     def test_jump_keys_are_not_sent_by_same_on_all_machines(self):
         values = settings_sync.mac_values(mac_raw())
         values["jump_key"] = "ctrl+alt+2"
@@ -358,6 +562,16 @@ class MessageTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_left_out_fields_are_ignored_when_applying_synced_values(self):
+        raw = mac_raw()
+        applied = settings_sync.apply_mac(raw, {"left_out": True, "left_out_ways": ["edge"]})
+        config = pc_config()
+
+        settings_sync.apply_pc(config, {"left_out": True, "left_out_ways": ["edge"]})
+
+        self.assertEqual(applied, raw)
+        self.assertFalse(hasattr(config, "left_out"))
+
     def test_size_is_read_applied_and_transmitted_on_both_machines(self):
         mac = mac_raw(effect_size="large")
         values = settings_sync.mac_values(mac)
@@ -396,6 +610,12 @@ class AdapterTests(unittest.TestCase):
     def test_the_shortcut_is_read_from_the_ways(self):
         self.assertIs(settings_sync.mac_values(mac_raw(methods=["edge"]))["shortcut"], False)
         self.assertIs(settings_sync.pc_values(pc_config(crossing_methods=["edge", "shortcut"]))["shortcut"], True)
+
+    def test_older_pc_config_reads_presets_when_continuous_fields_are_absent(self):
+        config = pc_config(crossing_methods=["edge", "shortcut"])
+        values = settings_sync.pc_values(config)
+        self.assertEqual((values["effect_pace"], values["effect_size_fraction"], values["shortcut"]),
+                         (1.0, 0.045, True))
 
     def test_a_values_dict_has_no_zones(self):
         for values in (settings_sync.mac_values(mac_raw()), settings_sync.pc_values(pc_config())):

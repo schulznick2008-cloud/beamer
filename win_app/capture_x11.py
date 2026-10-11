@@ -75,6 +75,7 @@ from capture_win import (  # noqa: F401  (re-exported for the bridge, which read
     wheel_notches,
 )
 from core import keytable
+import x11_seams
 
 LOGGER = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ XI_HIERARCHY_CHANGED = 11
 XI_RAW_KEY_PRESS, XI_RAW_KEY_RELEASE = 13, 14
 XI_RAW_BUTTON_PRESS, XI_RAW_BUTTON_RELEASE = 15, 16
 XI_RAW_MOTION = 17
+XI_BARRIER_HIT, XI_BARRIER_LEAVE = x11_seams.XI_BARRIER_HIT, x11_seams.XI_BARRIER_LEAVE
 XI_ALL_DEVICES, XI_ALL_MASTER_DEVICES = 0, 1
 XI_MASTER_POINTER, XI_MASTER_KEYBOARD, XI_SLAVE_POINTER = 1, 2, 3
 XI_KEY_REPEAT = 1 << 16
@@ -128,7 +130,10 @@ _TITLES = {
     "insert": "Insert", "home": "Home", "end": "End", "page_up": "Page Up", "page_down": "Page Down", "left": "Left",
     "right": "Right", "up": "Up", "down": "Down", "menu": "Menu", "print_screen": "Print Screen", "pause": "Pause",
     "num_lock": "Num Lock", "scroll_lock": "Scroll Lock", "browser_back": "Browser Back",
-    "browser_forward": "Browser Forward", "volume_mute": "Mute", "volume_down": "Volume Down", "volume_up": "Volume Up",
+    "browser_forward": "Browser Forward", "browser_stop": "Browser Stop", "browser_home": "Browser Home",
+    "browser_refresh": "Browser Refresh", "search": "Search", "mail": "Mail", "calculator": "Calculator",
+    "brightness_up": "Brightness Up", "brightness_down": "Brightness Down", "mic_mute": "Microphone Mute",
+    "volume_mute": "Mute", "volume_down": "Volume Down", "volume_up": "Volume Up",
     "media_next": "Next Track", "media_prev": "Previous Track", "media_stop": "Stop", "media_play_pause": "Play/Pause",
 }
 _TITLES.update({f"f{index}": f"F{index}" for index in range(1, 25)})
@@ -138,7 +143,9 @@ VK_TITLES[96] = "Num Enter"
 # Offered by the recorder or not, as app_config reads capture_win's: media and browser keys are for
 # the stays-here list, and typing keys a double-tap or a hold would take from every app. On X the
 # trigger also reaches apps at home, so Print Screen stays out as on Windows.
-NOT_TRIGGER_VKS = {code for code, physical in keytable.EVDEV_NAMES.items() if physical.startswith(("media_", "volume_", "browser_"))}
+NOT_TRIGGER_VKS = {code for code, physical in keytable.EVDEV_NAMES.items()
+                    if physical.startswith(("media_", "volume_", "browser_", "brightness_", "mic_"))
+                    or physical in ("search", "mail", "calculator")}
 UNRECORDABLE_TRIGGER_VKS = {code for code, physical in keytable.EVDEV_NAMES.items()
                             if physical in ("backspace", "tab", "enter", "esc", "space", "print_screen")}
 
@@ -289,14 +296,17 @@ class _Connection:
             if not self.display.has_extension("XTEST"):
                 raise RuntimeError("This X server has no XTEST extension")
             self._opcode = self.display.display.get_extension_major("XInputExtension")
-            # python-xlib's xinput_query_version announces 2.0, and a 2.0 client is sent raw events
-            # only while nothing is grabbed.
-            reply = xinput.XIQueryVersion(display=self.display.display, opcode=self._opcode, major_version=2, minor_version=2)
+            # XI 2.3 adds barrier-hit events and the release request used for seam resistance.
+            # Older servers negotiate down and retain the existing 2.1 capture behaviour.
+            reply = xinput.XIQueryVersion(display=self.display.display, opcode=self._opcode, major_version=2, minor_version=3)
+            self._xi_version = (reply.major_version, reply.minor_version)
             if (reply.major_version, reply.minor_version) < (2, 1):
                 raise RuntimeError(f"This X server has XInput {reply.major_version}.{reply.minor_version}; Beamer needs 2.1")
             self.keymap = xkb_x11.Keymap(self.display.get_display_name())
             self.root = self.display.screen().root
             self.root.xinput_select_events([(XI_ALL_MASTER_DEVICES, RAW_MASK), (XI_ALL_DEVICES, 1 << XI_HIERARCHY_CHANGED)])
+            self._seam_controller = None
+            self._seam_unavailable = False
             # An invisible cursor for the pointer grab: a 1x1 pixmap with an empty mask.
             pixmap = self.root.create_pixmap(1, 1, 1)
             gc = pixmap.create_gc(foreground=0)
@@ -332,6 +342,8 @@ class _Connection:
 
     def _generic(self, event) -> list:
         kind = event.evtype
+        if kind in (XI_BARRIER_HIT, XI_BARRIER_LEAVE):
+            return [x11_seams.parse_barrier_event(kind, event.data)]
         if XI_RAW_KEY_PRESS <= kind <= XI_RAW_MOTION:
             deviceid, detail, sourceid, flags, raw = parse_raw(event.data)
             return [("raw", kind, detail, sourceid, flags, raw, deviceid, event.sequence_number)]
@@ -402,9 +414,59 @@ class _Connection:
 
     def close(self) -> None:
         try:
+            if self._seam_controller is not None:
+                self._seam_controller.close()
+                self._seam_controller = None
             self.keymap.close()
         finally:
             self.display.close()
+
+    def configure_seams(self, monitors, resistance_px: int, enabled: bool = True) -> bool:
+        """Configure XFixes holds on internal RandR monitor seams."""
+        if self._seam_unavailable:
+            return False
+        try:
+            if self._seam_controller is None:
+                if self._xi_version < (2, 3) or not self.display.has_extension("XFIXES"):
+                    self._seam_unavailable = True
+                    LOGGER.info("X11 seam holds need XInput 2.3 and XFixes 5; leaving this desktop unchanged")
+                    return False
+                from Xlib.ext import xfixes
+
+                # python-xlib's convenience method asks for 4.0, so query 5.0 explicitly here.
+                version = xfixes.QueryVersion(
+                    display=self.display.display,
+                    opcode=self.display.display.get_extension_major("XFIXES"),
+                    major_version=5,
+                    minor_version=0,
+                )
+                if (version.major_version, version.minor_version) < (5, 0):
+                    self._seam_unavailable = True
+                    LOGGER.info("X11 seam holds need XFixes 5; leaving this desktop unchanged")
+                    return False
+                self.root.xinput_select_events([
+                    (XI_ALL_MASTER_DEVICES, RAW_MASK | x11_seams.XI_BARRIER_EVENTS),
+                    (XI_ALL_DEVICES, 1 << XI_HIERARCHY_CHANGED),
+                ])
+                self.display.sync()
+                self._seam_controller = x11_seams.Controller(x11_seams.XlibBackend(self.display, self.root))
+            self._seam_controller.configure(monitors, resistance_px, enabled)
+            self.display.flush()
+            return True
+        except Exception:
+            LOGGER.exception("X11 seam holds are unavailable; disabling them for this session")
+            self._seam_unavailable = True
+            if self._seam_controller is not None:
+                try:
+                    self._seam_controller.close()
+                except Exception:
+                    LOGGER.exception("Could not remove X11 seam barriers after setup failed")
+                self._seam_controller = None
+            return False
+
+    def handle_seam_event(self, event: tuple) -> None:
+        if self._seam_controller is not None:
+            self._seam_controller.handle(event)
 
 
 class Hooks:
@@ -424,6 +486,8 @@ class Hooks:
         self._stopping = threading.Event()
         self._failure: Optional[BaseException] = None
         self._predicate: Optional[Callable[[], bool]] = None
+        self._seam_lock = threading.Lock()
+        self._seam_config = None
         # The proof harness turns this off to read its own injection back.
         self.drop_injected = True
         self._masters: List[Device] = []
@@ -454,6 +518,15 @@ class Hooks:
         events and at least every TICK_SECONDS. It runs on the capture thread, so it must be cheap
         and never block."""
         self._predicate = predicate
+
+    def configure_seams(self, monitors, resistance_px: int) -> None:
+        """Enable X11 internal-monitor seam holds using X root-pixel rectangles.
+
+        Call again when the monitor layout or crossing resistance changes. Barriers are managed
+        on the capture thread, and are suspended while a peer is driving this machine.
+        """
+        with self._seam_lock:
+            self._seam_config = (tuple(monitors), max(0, int(resistance_px)))
 
     @property
     def grabbed(self) -> bool:
@@ -552,10 +625,28 @@ class Hooks:
                 want = bool(predicate())
             except Exception:
                 LOGGER.exception("Could not tell whether input is away; letting go")
+        self._sync_seams(not want)
         if want and not self._grabbed:
             self._take()
         elif not want and self._grabbed:
             self._let_go()
+
+    def _sync_seams(self, enabled: bool) -> None:
+        configure = getattr(self._connection, "configure_seams", None)
+        if not callable(configure):
+            return
+        with self._seam_lock:
+            config = self._seam_config
+        if config is None:
+            return
+        try:
+            configure(config[0], config[1], enabled=enabled)
+        except Exception:
+            LOGGER.exception("Could not update X11 seam barriers; disabling them")
+            try:
+                configure((), 0, enabled=False)
+            except Exception:
+                LOGGER.exception("Could not clear X11 seam barriers")
 
     def _take(self) -> None:
         self._taking = True
@@ -669,7 +760,11 @@ class Hooks:
 
     def _handle(self, event: tuple) -> None:
         kind = event[0]
-        if kind == "raw":
+        if kind == "barrier":
+            handle = getattr(self._connection, "handle_seam_event", None)
+            if callable(handle):
+                handle(event)
+        elif kind == "raw":
             _, evtype, detail, sourceid, flags, raw, master, sequence = event
             if self.drop_injected and sourceid in self._xtest:
                 return

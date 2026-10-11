@@ -32,6 +32,7 @@ _zones: List[Rect] = []      # the InputCapture session's
 _regions: List[Rect] = []    # the RemoteDesktop absolute pointer's
 _mover: Optional[Callable[[int, int], None]] = None
 _captured = False
+_screens: List[Rect] = []
 
 
 def set_zones(zones: List[Rect]) -> None:
@@ -89,16 +90,27 @@ def clamp_to(displays: List[Rect], x: float, y: float) -> Tuple[int, int]:
     return best[1]
 
 
-def _qt_screens() -> List[Rect]:
+def refresh_qt_screens() -> None:
+    """Capture Qt geometry on the GUI thread for link and input threads."""
+    global _screens
     try:
+        from PySide6.QtCore import QThread
         from PySide6.QtGui import QGuiApplication
 
-        if QGuiApplication.instance() is None:
-            return []
-        return [Rect(g.x(), g.y(), g.width(), g.height()) for g in (screen.geometry() for screen in QGuiApplication.screens())]
+        app = QGuiApplication.instance()
+        if app is None or QThread.currentThread() != app.thread():
+            return
+        screens = [Rect(g.x(), g.y(), g.width(), g.height())
+                   for g in (screen.geometry() for screen in app.screens())]
+        with _lock:
+            _screens = screens
     except Exception:
         LOGGER.exception("Could not read the displays from Qt")
-        return []
+
+
+def _qt_screens() -> List[Rect]:
+    with _lock:
+        return list(_screens)
 
 
 def _displays() -> List[Rect]:
@@ -109,6 +121,10 @@ def _displays() -> List[Rect]:
 
 def monitors() -> List[Rect]:
     return _displays() or [Rect(0, 0, 1920, 1080)]
+
+
+def display_map() -> dict:
+    return {str(index): rect for index, rect in enumerate(_qt_screens())}
 
 
 def cursor_position() -> Tuple[int, int]:

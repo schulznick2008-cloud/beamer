@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -144,7 +145,7 @@ class SettingsLayoutAcceptance(unittest.TestCase):
     def setUp(self):
         self.assertTrue(self.effective_font.family().lower().startswith("hanken"),
                         f"tests must use the bundled Hanken Grotesk font, got {self.effective_font.family()!r}")
-        scratch = ROOT / "renders" / "test-working"
+        scratch = ROOT / "win_app" / ".test-tmp"
         scratch.mkdir(parents=True, exist_ok=True)
         self.folder = tempfile.TemporaryDirectory(prefix="beamer-layout-acceptance-", dir=scratch)
         folder = Path(self.folder.name)
@@ -179,6 +180,10 @@ class SettingsLayoutAcceptance(unittest.TestCase):
         self.window._select_page(key)
         self.settle()
         return self.window.stack.currentWidget()
+
+    def test_trayless_window_exposes_quit_button_and_control_q(self):
+        self.assertEqual(self.window.quit_shortcut.key().toString(), "Ctrl+Q")
+        self.assertTrue(self.window.quit_button.isVisible())
 
     def test_window_accepts_320_dip_minimum_at_every_matrix_cell(self):
         width = int(os.environ.get("BEAMER_LAYOUT_WIDTH", "320"))
@@ -245,7 +250,22 @@ class SettingsLayoutAcceptance(unittest.TestCase):
                         continue
                     with self.subTest(width=width, page=key, button=text):
                         self.assertTrue(self.paints_on_one_line(button), "the label wraps or clips inside its button")
-                        self.assertGreaterEqual(button.height(), 30)
+                        self.assertGreaterEqual(button.height(), 24 if button.property("ledger_quiet") else 30)
+
+    def test_send_destination_refits_when_the_column_shrinks_and_grows(self):
+        full_text = "Send input to Synthetic workstation with a long machine name"
+        with mock.patch.object(self.window, "_redirect_text", return_value=full_text):
+            self.window._refresh_window()
+            self.page_scroll("overview")
+            labels = []
+            for width in (320, 1100, 320):
+                self.set_size(width)
+                button = self.window.redirect_button
+                self.assertTrue(self.paints_on_one_line(button))
+                self.assertEqual(button.toolTip(), full_text)
+                labels.append(button.text())
+            self.assertGreater(len(labels[1]), len(labels[0]))
+            self.assertEqual(labels[2], labels[0])
 
     def test_no_wrapping_label_is_a_horizontally_aligned_layout_item(self):
         # An aligned layout item gets its size hint's width, about 20 average characters for a
@@ -296,8 +316,10 @@ class SettingsLayoutAcceptance(unittest.TestCase):
                                  f"{key} document width {page.width()} exceeds viewport {scroll.viewport().width()}")
 
     def test_form_labels_keep_a_180_dip_track_without_wrapping_in_normal_windows(self):
-        self.assertEqual(self.window.edge_heading.text(), "Where the other machine is")
-        self.assertIn("Synthetic workstation", self.window.edge_heading.accessibleName())
+        first = self.window._peer_entries[0]["id"]
+        self.assertIn("Synthetic workstation", self.window.crossing_ledger.rows[first].name.full_text)
+        self.assertEqual(self.window.crossing_ledger.accessibleName(), "How each machine is reached")
+        self.assertEqual(self.window.atlas_canvas.accessibleName(), "Crossing layout")
         self.set_size(int(os.environ.get("BEAMER_LAYOUT_WIDTH", "900")))
         for key in PAGE_KEYS:
             scroll = self.page_scroll(key)
@@ -398,8 +420,8 @@ class SettingsLayoutAcceptance(unittest.TestCase):
         self.set_size(int(os.environ.get("BEAMER_LAYOUT_WIDTH", "900")))
         self.page_scroll("design")
         capped = {
-            "Length": (self.window.length_choice.view, self.window.length_choice.view.cap),
-            "Size": (self.window.size_choice.view, self.window.size_choice.view.cap),
+            "Length": (self.window.length_choice.view, 240),
+            "Size": (self.window.size_choice.view, 240),
             "Style for": (self.window.design_mode_choice.view, self.window.design_mode_choice.view.cap),
             "Show at": (self.window.effect_method_choice.view, self.window.effect_method_choice.view.cap),
             "Match design with": (self.window.design_follow_choice, 320),
@@ -408,12 +430,15 @@ class SettingsLayoutAcceptance(unittest.TestCase):
             with self.subTest(control=label):
                 self.assertLessEqual(control.width(), maximum,
                                      f"{label} is {control.width()} DIP; cap is {maximum}")
-        for control_name in ("length_choice", "size_choice", "design_mode_choice", "effect_method_choice"):
+        for control_name in ("design_mode_choice", "effect_method_choice"):
             choice = getattr(self.window, control_name)
             for value, button in choice._buttons.items():
                 with self.subTest(choice=control_name, option=value):
                     self.assertLessEqual(button.width(), choice.view.cell_width(),
                                          f"{control_name}.{value} segment exceeds its measured label width")
+        for control in (self.window.length_choice.view, self.window.size_choice.view):
+            self.assertLessEqual(control.width(), control.parentWidget().width())
+            self.assertGreaterEqual(control.width(), control.minimumSizeHint().width())
         self.assertLessEqual(self.window.design_follow_choice.width(), 320)
 
     def test_effect_preview_cache_uses_ceil_logical_size_at_effective_dpr(self):
@@ -505,7 +530,7 @@ class SettingsLayoutAcceptance(unittest.TestCase):
 
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--matrix":
-        log_root = ROOT / "renders" / "acceptance-matrix"
+        log_root = ROOT / "win_app" / "renders" / "acceptance-matrix"
         log_root.mkdir(parents=True, exist_ok=True)
 
         def run_cell(cell):

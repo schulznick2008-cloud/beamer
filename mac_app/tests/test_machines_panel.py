@@ -20,8 +20,9 @@ AppKit.NSApplication.sharedApplication()
 import bridge  # noqa: E402
 import kvm_bridge_app  # noqa: E402
 import settings_store  # noqa: E402
+import widgets  # noqa: E402
 from bridge_fakes import PAIRED_TOKEN  # noqa: E402
-from core import feature_flags, pairing  # noqa: E402
+from core import feature_flags, pairing, ways  # noqa: E402
 from fake_link import FakeLink  # noqa: E402
 from wake import WakingController  # noqa: E402
 
@@ -92,6 +93,9 @@ def heard(name="Laptop", pair_id="abc", **extra):
 
 class Base(unittest.TestCase):
     def setUp(self):
+        capture = mock.patch.object(WakingController, "start_input_capture")
+        capture.start()
+        self.addCleanup(capture.stop)
         self.directory = tempfile.TemporaryDirectory()
         path = Path(self.directory.name) / "config.json"
         raw = settings_store.config_to_raw(settings_store.editable_default_config())
@@ -111,6 +115,8 @@ class Base(unittest.TestCase):
         self.panel.service = self.service
         self.directions = []
         self.window.direction_handler = lambda token, **change: self.directions.append((token, change))
+        self.left_out = []
+        self.window.left_out_handler = lambda token, enabled: self.left_out.append((token, enabled))
 
     def tearDown(self):
         self.window.appearance_watch.stop()
@@ -123,6 +129,16 @@ class Base(unittest.TestCase):
     def rows(self):
         return [view for view in self.panel.list.arrangedSubviews()]
 
+    def row_with_control(self, token, control_name):
+        for row in self.rows():
+            stack = [row]
+            while stack:
+                view = stack.pop()
+                if getattr(view, "focus_id", None) == (token, control_name):
+                    return row
+                stack.extend(view.subviews())
+        raise AssertionError(f"no {control_name} control for {token}")
+
     def texts(self, view):
         found = []
         if isinstance(view, AppKit.NSTextField):
@@ -133,6 +149,70 @@ class Base(unittest.TestCase):
 
 
 class ListTests(Base):
+    def test_renaming_a_machine_saves_on_return_and_escape_cancels(self):
+        self.pair(FIRST, SECOND_TOKEN, "Studio")
+        self.panel.refresh()
+        name, button, _box, edit, note, delegate = self.panel._rename_views[SECOND_TOKEN]
+        button.press()
+        self.assertFalse(note.view.isHidden())
+        edit.setStringValue_("  Work Mac  ")
+        delegate.control_textView_doCommandBySelector_(edit, None, "insertNewline:")
+        self.assertEqual(self.store.current()["peers"][1]["label"], "Work Mac")
+        self.assertIn("Work Mac", self.rows()[1].accessibilityLabel())
+
+        name, button, box, edit, _note, delegate = self.panel._rename_views[SECOND_TOKEN]
+        button.press()
+        edit.setStringValue_("Discard this")
+        delegate.control_textView_doCommandBySelector_(edit, None, "cancelOperation:")
+        self.assertEqual(self.store.current()["peers"][1]["label"], "Work Mac")
+        self.assertTrue(box.isHidden())
+        self.assertFalse(name.isHidden())
+
+        button.press()
+        self.assertEqual(edit.stringValue(), "Work Mac")
+
+    def test_desktop_row_offers_leave_out_and_names_the_shortcut_when_left_out(self):
+        self.pair(FIRST, SECOND_TOKEN, "Studio")
+        row = self.row_with_control(SECOND_TOKEN, "left_out")
+        controls = []
+        def collect(view):
+            if isinstance(view, widgets.Pressable):
+                controls.append(view)
+            for subview in view.subviews():
+                collect(subview)
+        collect(row)
+
+        self.window.left_out_handler = self._toggle_left_out
+        leave_out = next(control for control in controls if control.focus_id == (SECOND_TOKEN, "left_out"))
+        leave_out.press()
+        row = self.row_with_control(SECOND_TOKEN, "left_out")
+        self.assertIn("Left out of the layout. The shortcut and the menu still reach it.", self.texts(row))
+        controls = []
+        collect(row)
+        put_back = next(control for control in controls if control.focus_id == (SECOND_TOKEN, "left_out"))
+        self.assertEqual(put_back.accessibilityLabel(), f"Put back Studio ({FIRST[-4:]})")
+        put_back.press()
+        row = self.row_with_control(SECOND_TOKEN, "left_out")
+        self.assertNotIn("Left out of the layout. The shortcut and the menu still reach it.", self.texts(row))
+        self.assertIn(f"Leave out Studio ({FIRST[-4:]})", self.accessibility_labels(row))
+        self.assertEqual(self.left_out, [(SECOND_TOKEN, True), (SECOND_TOKEN, False)])
+
+    def _toggle_left_out(self, token, enabled):
+        self.left_out.append((token, enabled))
+        settings = self.store.current()
+        peer = next(item for item in settings["peers"] if item["token"] == token)
+        (ways.leave_out if enabled else ways.put_back)(settings, peer["id"])
+        self.store.save_settings(settings)
+        self.window.peers_changed()
+
+    def accessibility_labels(self, view):
+        labels = []
+        if isinstance(view, widgets.Pressable):
+            labels.append(view.accessibilityLabel())
+        for subview in view.subviews():
+            labels.extend(self.accessibility_labels(subview))
+        return labels
+
     def test_the_migrated_machine_is_listed_by_its_name_and_where_it_is(self):
         self.panel.refresh()
         self.assertEqual(len(self.rows()), 1)
@@ -337,7 +417,9 @@ class ShowingACodeTests(Base):
 
     @mock.patch.object(feature_flags, "PAIRING_QR_VISIBLE", True)
     def test_the_code_is_shown_in_two_groups_with_its_address_and_a_qr(self):
-        with mock.patch.object(kvm_bridge_app.machines_panel.pairing, "pairing_address", return_value="192.0.2.9"):
+        image = AppKit.NSImage.alloc().initWithSize_((180, 180))
+        with mock.patch.object(kvm_bridge_app.machines_panel.pairing, "pairing_address", return_value="192.0.2.9"), \
+                mock.patch.object(kvm_bridge_app.machines_panel.qr, "image", return_value=image) as render:
             self.panel._toggle_sheet()
             self.panel._show_code()
             self.panel.refresh()
@@ -347,6 +429,7 @@ class ShowingACodeTests(Base):
         self.assertIn("192.0.2.9", self.panel.code_address.text)
         self.assertFalse(self.panel.qr_view.isHidden())
         self.assertIsNotNone(self.panel.qr_view.image())
+        self.assertEqual(render.call_args.args[0], self.service.qr)
         self.assertTrue(self.panel.show_button.view.isHidden())
 
     @mock.patch.object(feature_flags, "PAIRING_QR_VISIBLE", True)
@@ -510,6 +593,17 @@ class EnteringACodeTests(Base):
         self.assertEqual(self.said[-1], ("Paired with Laptop. Connecting…", "signal"))
         self.assertEqual(len(self.controller.links), 2)
 
+    def test_pairing_success_uses_the_disambiguated_peer_label(self):
+        self.store.current()["peers"][0]["label"] = "Laptop"
+        self.store.add_peer(entry(FIRST, SECOND_TOKEN, "Laptop"))
+        self.window.peers_changed()
+        result = entry(THIRD, THIRD_TOKEN, "Laptop")
+        self.store.add_peer(result)
+        self.window.peers_changed()
+        self.panel._finished("Laptop", result)
+
+        self.assertEqual(self.said[-1], (f"Paired with Laptop ({THIRD[-4:]}). Connecting…", "signal"))
+
     def test_a_typed_address_pairs_by_address_and_beats_a_chosen_machine(self):
         self.service.result = entry(FIRST, SECOND_TOKEN, "Laptop")
         self.store.add_peer(self.service.result)
@@ -610,7 +704,7 @@ class EnteringACodeTests(Base):
 
 
 class CodeBoxCentringTests(Base):
-    """beta.4 on Toby's Mac: each typed digit sat left of the middle of its box. Measured on the real
+    """beta.4 on a test Mac: each typed digit sat left of the middle of its box. Measured on the real
     window's boxes, drawn offscreen at the 773-point width it had, never put on screen."""
 
     def ink_offsets(self):
@@ -761,7 +855,6 @@ class TrayTests(Base):
         tray._direction_items = lambda: None
         kvm_bridge_app.TrayApp.refresh_status(tray, None)
         self.assertNotIn("192.0.2", tray.toggle_item.title)
-        self.assertNotIn("192.0.2", tray.status_item.title)
 
     def test_a_pairing_this_mac_hosted_reaches_the_window_on_the_main_thread(self):
         tray = self.tray()

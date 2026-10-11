@@ -517,6 +517,16 @@ class ZoneModels(unittest.TestCase):
         self.assertEqual({model.resistance_px for _, model in found}, {150})
         self.assertEqual(found[2][1].parts, frozenset({"start", "end"}))
 
+    def test_one_peer_can_hold_edges_on_multiple_displays(self):
+        zones = [
+            {"peer": protocol.id_text(B), "kind": "edge", "display": "panel-left", "side": "right"},
+            {"peer": protocol.id_text(B), "kind": "part", "parts": ["middle"],
+             "display": "panel-right", "side": "bottom"},
+        ]
+        found = self.models(zones, allowed=(B,))
+        self.assertEqual([(model.edge, model.display) for _, model in found],
+                         [("right", "panel-left"), ("bottom", "panel-right")])
+
     def test_what_is_left_out(self):
         zones = [
             {"peer": protocol.id_text(B), "kind": "edge", "off": True},

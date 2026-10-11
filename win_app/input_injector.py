@@ -190,6 +190,15 @@ VK_MAP = {
     "volume_up": 0xAF,
     "browser_back": 0xA6,
     "browser_forward": 0xA7,
+    "browser_refresh": 0xA8,
+    "browser_stop": 0xA9,
+    "browser_search": 0xAA,
+    "browser_favourites": 0xAB,
+    "browser_home": 0xAC,
+    "mail": 0xB4,
+    "media_select": 0xB5,
+    "launch_app1": 0xB6,
+    "launch_app2": 0xB7,
 }
 
 for _index in range(1, 13):
@@ -225,6 +234,15 @@ EXTENDED_KEYS = {
     "volume_up",
     "browser_back",
     "browser_forward",
+    "browser_refresh",
+    "browser_stop",
+    "browser_search",
+    "browser_favourites",
+    "browser_home",
+    "mail",
+    "media_select",
+    "launch_app1",
+    "launch_app2",
 }
 
 # Modifier key names that participate in chording with character keys.
@@ -394,6 +412,20 @@ def _locked(function):
 def inject_key(name: str, down: bool, us: Optional[str] = None) -> None:
     LOGGER.debug("key %s %s (mods held: %s)", name, "down" if down else "up", sorted(_mods_down))
     lowered = name.lower()
+    chords = {"search": (0x5B, 0x53), "dictation": (0x5B, 0x48), "mic_mute": (0x5B, 0x12, 0x4B)}
+    if lowered in chords:
+        if down:
+            sequence = chords[lowered]
+            plan = [(vk, 0, 0) for vk in sequence]
+            plan += [(vk, 0, KEYEVENTF_KEYUP) for vk in reversed(sequence)]
+            _send_input(*(_keybd_input(vk, scan, flags) for vk, scan, flags in plan))
+        return
+    if lowered in ("brightness_up", "brightness_down"):
+        from brightness_worker import submit
+
+        if down:
+            submit(1 if lowered == "brightness_up" else -1)
+        return
     held = _named_down.get(lowered) if lowered in VK_MAP and lowered not in MODIFIER_KEYS else None
     if held is not None:
         vk, scan, flags = held
