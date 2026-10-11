@@ -1,0 +1,83 @@
+# Schlankes CI für die Teleport-Teile des Forks. Jeder Schritt läuft nur, wenn sein Teil schon existiert.
+name: teleport
+
+on:
+  push:
+    branches: [teleport, "claude/**", "cursor/**"]
+  pull_request:
+    branches: [teleport]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: teleport-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verträge vorhanden
+        run: |
+          for f in docs/teleport/SCHNITTSTELLEN.md docs/teleport/AUFTEILUNG.md docs/teleport/DEPENDENCIES.md docs/teleport/M0-TEST.md; do
+            test -f "$f" || { echo "fehlt: $f"; exit 1; }
+          done
+      - name: Keine verbotenen Lizenzen in DEPENDENCIES.md
+        run: |
+          if grep -inE '\|\s*(AGPL|SSPL|proprietär|proprietary)' docs/teleport/DEPENDENCIES.md; then
+            echo "Verbotene Lizenz eingetragen"; exit 1
+          fi
+
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: transport testen
+        if: hashFiles('teleport/transport/Cargo.toml') != ''
+        working-directory: teleport/transport
+        shell: bash
+        run: |
+          rustup component add clippy rustfmt
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+      - name: win-Helfer testen
+        if: runner.os == 'Windows' && hashFiles('teleport/win/Cargo.toml') != ''
+        working-directory: teleport/win
+        shell: bash
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+  swift:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: mac-Helfer bauen und testen
+        if: hashFiles('teleport/mac/Package.swift') != ''
+        working-directory: teleport/mac
+        run: |
+          if [ -x build.sh ]; then ./build.sh; else swift build; fi
+          swift test
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Teleport-Python-Tests
+        shell: bash
+        run: |
+          shopt -s nullglob
+          tests=(core/tests/test_teleport*.py)
+          if [ ${#tests[@]} -eq 0 ]; then echo "noch keine Teleport-Tests"; exit 0; fi
+          pip install pynacl pytest
+          python -m pytest -q "${tests[@]}"

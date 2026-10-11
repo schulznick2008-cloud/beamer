@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- M0-Test: Millisekunden-Stoppuhr für die Glass-to-Glass-Messung. Auf dem Mac im Vollbild öffnen. -->
+<html lang="de"><head><meta charset="utf-8"><title>M0 Stoppuhr</title>
+<style>
+ html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Menlo,Consolas,monospace}
+ #t{font-size:18vw;text-align:center;margin-top:18vh;letter-spacing:.02em}
+ #f{font-size:4vw;text-align:center;color:#8f8}
+ #bar{position:fixed;left:0;bottom:0;height:6vh;background:#0f0;width:0}
+</style></head><body>
+<div id="t">0.000</div><div id="f">Frame 0</div><div id="bar"></div>
+<script>
+ const t=document.getElementById('t'),f=document.getElementById('f'),bar=document.getElementById('bar');
+ const start=performance.now(); let n=0;
+ function tick(now){const ms=now-start; t.textContent=(ms/1000).toFixed(3); f.textContent='Frame '+(++n);
+   bar.style.width=((ms%1000)/10)+'vw'; requestAnimationFrame(tick);}
+ requestAnimationFrame(tick);
+</script></body></html>

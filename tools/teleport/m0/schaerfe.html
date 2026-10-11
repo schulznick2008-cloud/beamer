@@ -1,0 +1,38 @@
+<!doctype html>
+<!-- M0-Test: Schärfe-/Farb-Testbild. Auf dem Mac öffnen (100 % Zoom), auf dem PC im Stream bewerten. -->
+<html lang="de"><head><meta charset="utf-8"><title>M0 Schärfe</title>
+<style>
+ body{margin:24px;font-family:-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;background:#fff;color:#111}
+ h2{font-size:14px;margin:18px 0 6px;color:#555}
+ .row{display:flex;gap:12px;flex-wrap:wrap}
+ .c{padding:6px 10px;border-radius:4px}
+ .lines{width:240px;height:60px;background:repeating-linear-gradient(90deg,#000 0 1px,#fff 1px 2px)}
+ .lines2{width:240px;height:60px;background:repeating-linear-gradient(0deg,#000 0 1px,#fff 1px 2px)}
+ table{border-collapse:collapse;font-size:12px} td,th{border:1px solid #ccc;padding:3px 8px;text-align:right}
+</style></head><body>
+<h2>Textgrößen (Ziel: 11 px noch flüssig lesbar)</h2>
+<div style="font-size:9px">9 px – Kontoauszug 07.10.2026 Revolut −9,65 € McFIT (Restzahlung) iIl1|O0 ÄÖÜß</div>
+<div style="font-size:10px">10 px – Kontoauszug 07.10.2026 Revolut −9,65 € McFIT (Restzahlung) iIl1|O0 ÄÖÜß</div>
+<div style="font-size:11px">11 px – Kontoauszug 07.10.2026 Revolut −9,65 € McFIT (Restzahlung) iIl1|O0 ÄÖÜß</div>
+<div style="font-size:12px">12 px – Kontoauszug 07.10.2026 Revolut −9,65 € McFIT (Restzahlung) iIl1|O0 ÄÖÜß</div>
+<div style="font-size:14px">14 px – Kontoauszug 07.10.2026 Revolut −9,65 € McFIT (Restzahlung) iIl1|O0 ÄÖÜß</div>
+<h2>Farbiger Text auf Farbe (zeigt Farb-Unterabtastung 4:2:0)</h2>
+<div class="row">
+ <span class="c" style="background:#d00;color:#00f">Blau auf Rot 12px</span>
+ <span class="c" style="background:#00a;color:#f33">Rot auf Blau 12px</span>
+ <span class="c" style="background:#0a0;color:#f0f">Magenta auf Grün</span>
+ <span class="c" style="background:#222;color:#e33">Rot auf Dunkel (Minusbeträge)</span>
+ <span class="c" style="background:#fff;color:#2a2">Grün auf Weiß (Plusbeträge)</span>
+</div>
+<h2>1-Pixel-Linien (senkrecht / waagerecht)</h2>
+<div class="row"><div class="lines"></div><div class="lines2"></div></div>
+<h2>Tabelle wie in der Finanz-App</h2>
+<table><tr><th>Datum</th><th>Händler</th><th>Kategorie</th><th>Betrag</th></tr>
+<tr><td>06.10.</td><td>Revolut 7781691</td><td>Freizeit</td><td style="color:#c00">−9,65 €</td></tr>
+<tr><td>05.10.</td><td>Zeabur</td><td>Abos &amp; Software</td><td style="color:#c00">−5,20 €</td></tr>
+<tr><td>01.10.</td><td>BAföG</td><td>Einnahme</td><td style="color:#080">+812,00 €</td></tr></table>
+<h2>Bewegung (Scroll-/Animationstest)</h2>
+<div style="width:300px;height:20px;background:#eee;position:relative;overflow:hidden">
+ <div id="m" style="position:absolute;width:40px;height:20px;background:#06c"></div></div>
+<script>let x=0;setInterval(()=>{x=(x+4)%260;document.getElementById('m').style.left=x+'px'},16)</script>
+</body></html>

@@ -1,0 +1,192 @@
+# Beamer-Teleport – Schnittstellen-Verträge (v1)
+
+Verbindlich für alle Beteiligten (Claude Code und Cursor). Liegt im Fork unter
+`docs/teleport/SCHNITTSTELLEN.md`. Änderungen nur per PR mit dem Label `vertrag`, und beide Seiten
+passen dann an. Unklarheiten nicht selbst auflösen, sondern im PR als Frage melden.
+
+Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zeiten sind in µs
+(monotone Uhr des Senders).
+
+## 0. Begriffe und Komponenten
+
+| Name | Sprache | Ort im Repo | Aufgabe |
+|---|---|---|---|
+| Beamer (Python) | Python | `core/`, `mac_app/`, `win_app/` | Kopplung, Schlüssel, Steuerung, Beamer-Link (TCP), UI |
+| `beamer-transport` | Rust (lib, `staticlib` + `rlib`) | `teleport/transport/` | UDP-Medienstrom: Verschlüsselung, Fragmentierung, NACK, FEC, Statistik |
+| Mac-Helfer `BeamerTeleport` | Swift (SwiftPM, CLI-Executable) | `teleport/mac/` | Capture/Encode/Senden, Empfangen/Decode/Anzeige, Fenstersteuerung, Eingabe einspielen |
+| Win-Helfer `beamer-teleport.exe` | Rust (windows-rs) | `teleport/win/` | dasselbe für Windows |
+
+- **Sender** ist die Seite, auf der das echte Fenster läuft. **Empfänger** ist die Seite, die das Stellvertreter-Fenster (Proxy) zeigt.
+- `tid`: Teleport-ID, eine u32 ungleich 0. Die Sender-Seite vergibt sie und hält sie pro Link eindeutig. Sie ist gleichzeitig die `stream_id` im UDP-Header.
+- Koordinaten für die Eingabe sind **Stream-Pixel** (float, Ursprung oben links im übertragenen Bild).
+
+## 1. IPC Python ↔ Helfer
+
+- Python startet den Helfer als Kindprozess: `BeamerTeleport --ipc stdio` bzw. `beamer-teleport.exe --ipc stdio`.
+- **stdin/stdout: JSON Lines** (eine Nachricht pro Zeile, `\n`). **stderr: nur Log-Text.** Auf stdout darf nichts außer Protokollzeilen stehen.
+- Endet stdin (EOF), räumt der Helfer innerhalb von 2 s auf (Fenster zurückschieben, virtuelle Monitore entfernen) und beendet sich mit Code 0.
+- Befehl: `{"v":1,"id":<int>,"cmd":"<name>", ...}`
+  Antwort: `{"v":1,"re":<id>,"ok":true, ...}` oder `{"v":1,"re":<id>,"ok":false,"error":{"code":"<code>","msg":"..."}}`.
+- Ereignis (vom Helfer, ohne Anfrage): `{"v":1,"ev":"<name>", ...}`.
+- Fehlercodes: `bad_request`, `not_found`, `permission` (Bildschirmaufnahme/Accessibility fehlt), `unsupported`, `busy`, `internal`.
+- Binärwerte als Base64 (Standard-Alphabet, mit Padding).
+
+### 1.1 Befehle (Python → Helfer)
+
+| cmd | Felder | Antwort-Felder | Seite |
+|---|---|---|---|
+| `hello` | `beamer_version` | `helper_version`, `platform` (`mac`/`win`), `caps` (Liste aus `send_window`,`send_display`,`recv`,`inject`,`audio`) | beide |
+| `transport.open` | `local_port` (0 = beliebig), `peer_host`, `peer_port` (0 = später) | `local_port` | beide |
+| `transport.peer` | `peer_host`, `peer_port` | – | beide |
+| `transport.close` | – | – | beide |
+| `windows.list` | – | `windows`: `[{wid,pid,app,title,x,y,w,h,display,scale}]` (x..h in Punkten bzw. logischen Pixeln) | Sender |
+| `send.start` | `tid`, `mode` (`window`/`display`), `wid` oder `display`, `codec` (`hevc`/`h264`), `max_fps`, `bitrate_kbps`, `keys` (siehe 4.2), `virtual_display` (bool) | `width`, `height` (Stream-Pixel), `scale` | Sender |
+| `send.stop` | `tid`, `restore` (bool: Fenster zurück auf echten Monitor) | – | Sender |
+| `send.resize` | `tid`, `w`, `h` (Punkte) | `width`, `height` | Sender |
+| `send.activate` | `tid` | – | Sender |
+| `send.keyframe` | `tid` | – | Sender |
+| `inject` | `tid`, `input` (siehe 3) | – | Sender |
+| `recv.open` | `tid`, `title`, `app`, `icon_png` (b64, optional), `w`, `h` (Punkte), `scale`, `codec`, `fullscreen` (bool), `keys` | – | Empfänger |
+| `recv.update` | `tid`, optional `title`, `w`, `h` | – | Empfänger |
+| `recv.close` | `tid` | – | Empfänger |
+| `shutdown` | – | – | beide |
+
+### 1.2 Ereignisse (Helfer → Python)
+
+| ev | Felder | Bedeutung |
+|---|---|---|
+| `proxy.input` | `tid`, `input` (siehe 3) | Eingabe im Proxy-Fenster, die Python an den Sender weiterleitet |
+| `proxy.focus` | `tid`, `focused` | Proxy hat den Fokus bekommen oder verloren |
+| `proxy.resize` | `tid`, `w`, `h` | Nutzer hat die Proxy-Größe geändert (Punkte) |
+| `proxy.closed` | `tid` | Nutzer hat den Proxy geschlossen (bedeutet: zurückholen) |
+| `send.gone` | `tid`, `reason` | Fenster geschlossen bzw. Capture beendet |
+| `send.size` | `tid`, `width`, `height`, `scale` | Stream-Größe hat sich geändert |
+| `stats` | `tid`, `fps`, `kbps`, `rtt_ms`, `loss_pct`, `latency_ms` (geschätzt) | alle 1 s |
+| `error` | `code`, `msg`, optional `tid` | asynchroner Fehler |
+
+## 2. Beamer-Link: neue Nachrichten (Python ↔ Python, über den bestehenden verschlüsselten TCP-Link)
+
+- Fähigkeit: Im `hello`/`welcome` kommt das Feld `"teleport":1` dazu. Ohne dieses Feld werden keine `tp_*`-Nachrichten gesendet. Die Wire-Version bleibt 6.
+- Nachrichten (JSON wie die übrigen Beamer-Nachrichten, `type`-Feld):
+
+| type | Richtung | Felder |
+|---|---|---|
+| `tp_offer` | Sender→Empf. | `tid`, `app`, `title`, `icon_png`, `w`, `h`, `scale`, `codec`, `mode`, `udp_port`, `salt` (b64, 16 B zufällig) |
+| `tp_accept` | Empf.→Sender | `tid`, `udp_port` |
+| `tp_reject` | Empf.→Sender | `tid`, `reason` |
+| `tp_input` | Empf.→Sender | `tid`, `input` |
+| `tp_resize` | Empf.→Sender | `tid`, `w`, `h` |
+| `tp_focus` | Empf.→Sender | `tid` |
+| `tp_update` | Sender→Empf. | `tid`, optional `title`, `w`, `h`, `scale` |
+| `tp_close` | beide | `tid`, `reason` (`user`,`gone`,`error`,`return`) |
+
+## 3. Fenster-Eingabe (`input`-Objekt)
+
+```json
+{"k":"move","x":512.0,"y":300.5}
+{"k":"down","x":512.0,"y":300.5,"b":"left","n":1}
+{"k":"up","x":512.0,"y":300.5,"b":"left"}
+{"k":"scroll","x":512.0,"y":300.5,"dx":0,"dy":-3.0,"unit":"line"}
+{"k":"key","key":"a","down":true}
+{"k":"text","text":"ä"}
+```
+
+- `b`: `left`/`right`/`middle`/`back`/`forward`. `n`: Klickzahl (1/2/3). `unit`: `line` oder `px`.
+- `key`: **Beamer-Tastennamen**, also dieselben Namen wie bei `keydown`/`keyup` in `core/protocol.py` und `core/keytable.py`. Die Modifier-Umsetzung Cmd↔Strg macht **Python** nach Beamers Tastatur-Einstellung, bevor `inject` an den Helfer geht. Der Helfer spielt die Namen 1:1 ein.
+- Der Sender rechnet Stream-Pixel in Bildschirmkoordinaten des echten bzw. virtuellen Monitors um. Liegt eine Eingabe außerhalb des Bildes, wird sie verworfen.
+- Vor `down`, `key` und `text` aktiviert der Sender das Fenster, falls es nicht vorne ist.
+
+## 4. UDP-Medienstrom
+
+### 4.1 Paket
+
+```
+Offset Größe Feld (Header = AAD, unverschlüsselt)
+0      1     version = 1
+1      1     type: 1=video 2=audio 3=fec 4=nack 5=keyframe_req 6=feedback 7=ping 8=pong
+2      2     flags (reserviert, 0)
+4      4     stream_id (= tid)
+8      8     seq (u64, pro Richtung und stream_id ab 1, +1 je Paket)
+16     ...   ChaCha20-Poly1305-IETF-Ciphertext inkl. 16-B-Tag
+```
+
+- Nonce (12 B) = `prefix_dir` (4 B) ‖ `seq` (8 B, Big-Endian). AAD = die 16 Header-Bytes.
+- Ein Paket ist höchstens **1200 Byte** groß, inklusive Header und Tag.
+- Replay-Schutz: Fenster von 4096 seq-Werten, Duplikate und zu alte Pakete werden verworfen. Pakete, die die Authentifizierung nicht bestehen, werden still verworfen und gezählt.
+- Medien laufen vom Sender zum Empfänger (Richtung `s2r`). `nack`, `keyframe_req`, `feedback`, `ping` und `pong` laufen in Gegenrichtung (`r2s`), `pong` als Antwort auch `s2r`.
+
+Klartext je Typ:
+- **video/audio**: `frame_id` u32 ‖ `frag_idx` u16 ‖ `frag_cnt` u16 ‖ `pts_us` u64 ‖ `fflags` u8 (Bit0 = Keyframe, Bit1–3 Codec: 1=h264, 2=hevc, 3=opus) ‖ Nutzdaten. Video ist Annex-B. Jeder Keyframe enthält VPS/SPS/PPS inline.
+- **fec**: `frame_id` u32 ‖ `group_start` u16 ‖ `group_len` u16 ‖ XOR-Parität über die Klartexte der Gruppe (auf die gleiche Länge mit Nullen aufgefüllt, dazu die Länge als u16 je Quelle in der Parität). Standard ist eine Parität je 8 Fragmente, abschaltbar.
+- **nack**: Anzahl u16 ‖ n × seq u64.
+- **keyframe_req**: leer.
+- **feedback**: `recv_kbps` u32 ‖ `loss_permille` u16 ‖ `jitter_us` u32 ‖ `last_frame_id` u32.
+- **ping/pong**: `t_us` u64 (pong spiegelt das t_us des pings).
+
+Verhalten:
+- Der Empfänger schickt bei Lücken einen NACK. Ist ein Frame nach 2 × RTT noch unvollständig, wird er verworfen und ein `keyframe_req` geschickt (höchstens alle 300 ms).
+- Der Sender hält einen Puffer zum erneuten Senden von 300 ms.
+- Bitratenregelung (Sender): bei `loss_permille` > 20 oder steigendem Jitter um 15 % pro Sekunde senken, sonst um 5 % pro Sekunde anheben, bis zu `bitrate_kbps`.
+
+### 4.2 Schlüssel
+
+Python leitet die Schlüssel ab. Die Helfer bekommen nur fertige Schlüssel, im Feld `keys` von `send.start`/`recv.open`:
+
+```json
+"keys": {"s2r_key":"<b64 32B>","s2r_prefix":"<b64 4B>","r2s_key":"<b64 32B>","r2s_prefix":"<b64 4B>"}
+```
+
+Ableitung (Python, `core/teleport_keys.py`, HKDF-SHA256 wie `protocol.hkdf_sha256`):
+- `T` = `link_info(key_id, prefix_i, prefix_r, share_i, share_r, 1)` ohne das führende `b"beamer-frames"` und ohne das letzte Richtungs-Byte. Das ist das Handshake-Transkript des aktuellen Links.
+- `master = HKDF(ikm = link_ikm(token, shared), salt = b"beamer-teleport-v1", info = b"tp-master" + T)`. Wird beim Link-Aufbau einmal berechnet und gehalten. `shared` wird danach verworfen. Daraus folgt: Fällt der Link weg, enden alle Teleports.
+- Pro Teleport, mit `salt16` aus `tp_offer` und `sid = tid` als u32 BE:
+  - `s2r_key = HKDF(master, salt16 + sid, b"tp-key-s2r")`
+  - `r2s_key = HKDF(master, salt16 + sid, b"tp-key-r2s")`
+  - `s2r_prefix = HKDF(master, salt16 + sid, b"tp-pfx-s2r")[:4]`
+  - `r2s_prefix = HKDF(master, salt16 + sid, b"tp-pfx-r2s")[:4]`
+- Testvektoren legt Cursor in `docs/teleport/vectors.json` ab.
+
+## 5. Rust-API `beamer-transport` (C-ABI, Header per cbindgen: `teleport/transport/include/beamer_transport.h`)
+
+```c
+typedef struct BtSession BtSession;
+typedef enum { BT_ROLE_SENDER = 1, BT_ROLE_RECEIVER = 2 } BtRole;
+typedef struct { const uint8_t *data; size_t len; uint64_t pts_us; uint8_t fflags; uint32_t frame_id; } BtFrame;
+typedef void (*BtOnFrame)(void *ctx, uint32_t stream_id, uint8_t kind /*1 video 2 audio*/, const BtFrame *f);
+typedef void (*BtOnControl)(void *ctx, uint32_t stream_id, uint8_t type /*5 keyframe_req*/);
+typedef void (*BtOnStats)(void *ctx, uint32_t stream_id, const char *json);
+
+BtSession *bt_open(uint16_t local_port, BtOnFrame, BtOnControl, BtOnStats, void *ctx); // NULL bei Fehler
+uint16_t   bt_local_port(const BtSession *);
+int        bt_set_peer(BtSession *, const char *host, uint16_t port);
+int        bt_add_stream(BtSession *, uint32_t stream_id, BtRole role,
+                         const uint8_t s2r_key[32], const uint8_t s2r_prefix[4],
+                         const uint8_t r2s_key[32], const uint8_t r2s_prefix[4],
+                         uint32_t max_kbps);
+int        bt_remove_stream(BtSession *, uint32_t stream_id);
+int        bt_send_frame(BtSession *, uint32_t stream_id, uint8_t kind, const uint8_t *data, size_t len,
+                         uint64_t pts_us, uint8_t fflags);               // fragmentiert, FEC, Puffer
+int        bt_request_keyframe(BtSession *, uint32_t stream_id);
+uint32_t   bt_target_kbps(const BtSession *, uint32_t stream_id);       // für den Encoder
+void       bt_close(BtSession *);
+const char*bt_last_error(void);                                         // thread-lokal
+```
+
+- Rückgabe 0 bedeutet OK, <0 einen Fehler.
+- Die Callbacks kommen aus einem Transport-Thread. Der Aufrufer muss sie schnell verarbeiten (in eine Queue legen).
+- Ein Socket pro Session, beliebig viele Streams.
+
+## 6. Repo-Struktur und Branches
+
+```
+teleport/transport/   Rust-Crate beamer-transport (+ include/, tests/, examples/)
+teleport/mac/         SwiftPM-Paket BeamerTeleport
+teleport/win/         Rust-Crate beamer-teleport-win
+core/teleport*.py     Python-Seite (Cursor)
+docs/teleport/        SCHNITTSTELLEN.md, AUFTEILUNG.md, DEPENDENCIES.md, M0-TEST.md, vectors.json
+tools/teleport/       Test-/Demo-Skripte
+```
+
+- Integrations-Branch: `teleport`. Upstream-`main` bleibt unverändert, damit Upstream-Releases sauber gemergt werden können.
+- Arbeits-Branches: `claude/NN-kurzname` bzw. `cursor/kurzname`. PR immer nach `teleport`. **Kein Force-Push, kein Rebase von gepushten Commits, kein Push auf `main` oder `teleport` direkt.**
+- Lizenz: Der Fork bleibt GPL-3.0. Erlaubt sind nur GPL-3-kompatible Abhängigkeiten (MIT, BSD, Apache-2.0, MPL-2.0, ISC, Zlib, LGPL, GPL-2.0-or-later, GPL-3.0). **Verboten** sind AGPL, proprietäre Teile, SSPL und „source-available“. Neue Abhängigkeiten kommen mit Lizenz in `docs/teleport/DEPENDENCIES.md`.
