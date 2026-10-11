@@ -488,3 +488,176 @@ fn send_queue_is_limited_by_time_not_bytes() {
         .expect("Stats nach 1 s");
     assert!(json.contains("\"pace_queue_ms\":"), "{json}");
 }
+
+fn assert_drop_sum(s: &Stream) {
+    let c = &s.c;
+    assert_eq!(
+        c.frames_dropped,
+        c.dropped_incomplete + c.dropped_overflow + c.dropped_gap + c.dropped_audio,
+        "Ursachen ergeben nicht frames_dropped: {c:?}"
+    );
+}
+
+#[test]
+fn drop_causes_incomplete_gap_and_late_packets_are_counted() {
+    let mut p = pair(false);
+    let (_, got) = {
+        let k = p.send(&blob(3000), 1);
+        p.feed_rx(&k)
+    };
+    assert_eq!(got, vec![1]);
+    // Frame 2: nur ein Teil kommt rechtzeitig (Jitter-Spitze), Frame 3 und 4 vollstaendig.
+    let f2 = p.send(&blob(3000), 0);
+    p.feed_rx(&f2[..1]);
+    let f3 = p.send(&blob(2000), 0);
+    p.feed_rx(&f3);
+    p.advance(40);
+    p.tick_rx();
+    assert_eq!(p.rx.c.dropped_incomplete, 1);
+    assert_eq!(p.rx.c.gaps_incomplete, 1);
+    assert_eq!(p.rx.c.gaps_blocked, 0);
+    // Der Rest von Frame 2 kommt zu spaet.
+    p.feed_rx(&f2[1..]);
+    assert!(p.rx.c.late_packets >= 1);
+    let f4 = p.send(&blob(2000), 0);
+    p.feed_rx(&f4);
+    // Keyframe 5: Frames 3 und 4 waren fertig, werden aber nach der Luecke nicht mehr gezeigt.
+    let k5 = p.send(&blob(3000), 1);
+    let (_, got) = p.feed_rx(&k5);
+    assert_eq!(got, vec![5]);
+    assert_eq!(p.rx.c.dropped_gap, 2);
+    assert_eq!(p.rx.c.frames_dropped, 3);
+    assert_drop_sum(&p.rx);
+}
+
+#[test]
+fn missing_whole_frame_counts_as_blocked_gap() {
+    let mut p = pair(false);
+    let k = p.send(&blob(3000), 1);
+    p.feed_rx(&k);
+    let _f2_lost_completely = p.send(&blob(3000), 0);
+    let f3 = p.send(&blob(2000), 0);
+    p.feed_rx(&f3);
+    p.advance(40);
+    p.tick_rx();
+    assert_eq!(p.rx.c.gaps_blocked, 1);
+    assert_eq!(p.rx.c.dropped_incomplete, 0);
+    assert_drop_sum(&p.rx);
+}
+
+/// Hoechster Wert eines Zahlenfelds ueber alle Stats-Zeilen.
+fn max_field(stats: &[String], key: &str) -> f64 {
+    stats
+        .iter()
+        .filter_map(|s| {
+            s.split(&format!("\"{key}\":"))
+                .nth(1)
+                .and_then(|r| r.split([',', '}']).next())
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .fold(0.0, f64::max)
+}
+
+struct ReorderRun {
+    raw_rx: f64,
+    raw_tx: f64,
+    target: u32,
+    delivered: u64,
+}
+
+/// 4,5 s, 60 fps, 5000 Byte je Frame, Hinrichtung mit 0..10 ms zufaelliger Verzoegerung (Umordnung,
+/// kein Verlust), Rueckrichtung ohne Stoerung. Simulierte Uhr in 1-ms-Schritten, fester Seed.
+fn reorder_run(fec: bool, seed: u64) -> ReorderRun {
+    use beamer_transport::netem::Rng;
+    use beamer_transport::stream::TickInfo;
+    let mut p = pair(fec);
+    let t0 = p.now;
+    let mut rng = Rng::new(seed);
+    let info = TickInfo::default();
+    let mut to_rx: Vec<(Instant, u64, Vec<u8>)> = Vec::new();
+    let mut to_tx: Vec<Vec<u8>> = Vec::new();
+    let (mut rx_stats, mut tx_stats) = (Vec::new(), Vec::new());
+    let mut order = 0u64;
+    let mut frame = 0u64;
+    let jitter =
+        |rng: &mut Rng, now: Instant| now + Duration::from_secs_f64(rng.next_f64() * 0.010);
+    for ms in 0..4500u64 {
+        let now = t0 + Duration::from_millis(ms);
+        let mut io = Io::default();
+        if ms % 16 == 0 {
+            let _ = p.tx.send_frame(
+                now,
+                1,
+                &blob(5000),
+                ms * 1000,
+                frame.is_multiple_of(120) as u8,
+                &mut io,
+            );
+            frame += 1;
+        }
+        p.tx.tick(now, &info, &mut io);
+        for d in to_tx.drain(..) {
+            let h = decode_header(&d).unwrap();
+            p.tx.receive(now, &d, &h, &mut io);
+        }
+        for d in io.out.drain(..) {
+            order += 1;
+            to_rx.push((jitter(&mut rng, now), order, d));
+        }
+        for e in io.events.drain(..) {
+            if let Event::Stats { json, .. } = e {
+                tx_stats.push(json);
+            }
+        }
+        // Faellige Pakete in Ankunftsreihenfolge an den Empfaenger.
+        to_rx.sort_by_key(|(due, o, _)| (*due, *o));
+        let n = to_rx.iter().take_while(|(due, _, _)| *due <= now).count();
+        let mut rio = Io::default();
+        for (_, _, d) in to_rx.drain(..n) {
+            let h = decode_header(&d).unwrap();
+            p.rx.receive(now, &d, &h, &mut rio);
+        }
+        p.rx.tick(now, &info, &mut rio);
+        to_tx.append(&mut rio.out);
+        for e in rio.events.drain(..) {
+            if let Event::Stats { json, .. } = e {
+                rx_stats.push(json);
+            }
+        }
+    }
+    assert!(rx_stats.len() >= 3 && tx_stats.len() >= 3);
+    ReorderRun {
+        raw_rx: max_field(&rx_stats, "loss_pct"),
+        raw_tx: max_field(&tx_stats, "loss_pct"),
+        target: p.tx.target_kbps(),
+        delivered: p.rx.c.frames_delivered,
+    }
+}
+
+#[test]
+fn reordering_without_loss_is_not_raw_loss() {
+    // 0 % Verlust, aber bis zu 10 ms Umordnung: Rohverlust < 1 %, Zielbitrate bleibt am Maximum.
+    // Deterministisch (simulierte Uhr, feste Seeds) statt Sockets und Wall-Clock wie frueher in
+    // tests/session.rs; mehrere Seeds decken verschiedene Umordnungsmuster ab.
+    for fec in [true, false] {
+        for seed in 1..=4 {
+            let r = reorder_run(fec, seed);
+            assert!(
+                r.raw_rx < 1.0 && r.raw_tx < 1.0,
+                "FEC {fec}, Seed {seed}: Umordnung zaehlt als Verlust: {} / {}",
+                r.raw_rx,
+                r.raw_tx
+            );
+            assert!(
+                r.target >= 7600,
+                "FEC {fec}, Seed {seed}: Zielbitrate muss (fast) am Maximum bleiben: {}",
+                r.target
+            );
+            assert!(
+                r.delivered >= 270,
+                "FEC {fec}, Seed {seed}: nur {} Frames",
+                r.delivered
+            );
+        }
+    }
+}
