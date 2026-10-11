@@ -125,6 +125,10 @@ fn roundtrip_various_sizes() {
         30_000,
         250_000,
     ];
+    // Der 250-KB-Frame braucht durch das Pacing einige 100 ms; steht der Scheduler eines kleinen Runners dabei
+    // einmal 30 ms still, wuerde die Vertragsfrist (30 ms ab dem letzten Paket) den Frame verwerfen. Das
+    // prueft dieser Test nicht, deshalb die Frist hier auf das Maximum.
+    l.rx.set_min_deadline_ms(SID, 250.0).unwrap();
     for (i, n) in sizes.iter().enumerate() {
         l.tx.send_frame(
             SID,
@@ -136,7 +140,7 @@ fn roundtrip_various_sizes() {
         .unwrap();
         std::thread::sleep(Duration::from_millis(5));
     }
-    let ok = wait_until(3.0, || {
+    let ok = wait_until(10.0, || {
         l.rx_sink.frames.lock().unwrap().len() == sizes.len()
     });
     if !ok {
