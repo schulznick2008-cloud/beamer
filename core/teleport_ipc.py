@@ -212,6 +212,7 @@ class TeleportHelper:
         if not ev.wait(timeout):
             with self._lock:
                 self._pending.pop(req_id, None)
+                self._replies.pop(req_id, None)
             raise TeleportIPCTimeout(cmd, timeout)
         with self._lock:
             if req_id not in self._replies:
