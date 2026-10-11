@@ -1,0 +1,17 @@
+language = "C"
+include_guard = "BEAMER_TRANSPORT_H"
+style = "type"
+pragma_once = false
+cpp_compat = true
+usize_is_size_t = true
+includes = []
+header = "/* beamer-transport C-ABI (SCHNITTSTELLEN.md 5). Erzeugt von cbindgen, nicht von Hand aendern. */"
+
+[parse]
+parse_deps = false
+
+[export]
+include = ["BtFrame", "BtRole", "BtOnFrame", "BtOnControl", "BtOnStats"]
+
+[fn]
+args = "horizontal"
