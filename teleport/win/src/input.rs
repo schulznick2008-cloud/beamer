@@ -117,10 +117,12 @@ pub struct InputState {
     pub dbl_time: Duration,
     /// Halbe Breite/Hoehe des Doppelklick-Rechtecks in Client-Pixeln.
     pub dbl_slop: (f64, f64),
-    /// Das naechste WM_CHAR gehoert zu einer schon als `key` gemeldeten Taste.
-    pub swallow_char: bool,
     /// Erste Haelfte eines UTF-16-Surrogatpaars aus WM_CHAR.
     high_surrogate: Option<u16>,
+    /// AltGr gedrueckt (rechtes Alt mit kuenstlichem linkem Strg davor): Zeichen gehen als `text`.
+    pub altgr: bool,
+    /// Das kuenstliche linke Strg von AltGr ist gedrueckt (wird nicht gemeldet).
+    pub fake_ctrl: bool,
 }
 
 impl Default for InputState {
@@ -132,8 +134,9 @@ impl Default for InputState {
             last_click: None,
             dbl_time: Duration::from_millis(500),
             dbl_slop: (2.0, 2.0),
-            swallow_char: false,
             high_surrogate: None,
+            altgr: false,
+            fake_ctrl: false,
         }
     }
 }
@@ -202,19 +205,21 @@ impl InputState {
         json!({"k": "scroll", "x": r2(s.0), "y": r2(s.1), "dx": dx, "dy": dy, "unit": "line"})
     }
 
-    /// Taste gedrueckt/losgelassen. Wiederholungen (gedrueckt halten) gehen als weitere `down` raus.
-    /// Ein `up` ohne vorheriges `down` wird verworfen.
+    /// Taste gedrueckt/losgelassen. Gedrueckt halten meldet nur ein `down` (die Wiederholung macht der
+    /// Sender selbst). Ein `up` ohne vorheriges `down` wird verworfen.
     pub fn key(&mut self, name: &str, down: bool) -> Option<Value> {
         if down {
-            self.keys.insert(name.to_owned());
+            if !self.keys.insert(name.to_owned()) {
+                return None;
+            }
         } else if !self.keys.remove(name) {
             return None;
         }
         Some(json!({"k": "key", "key": name, "down": down}))
     }
 
-    /// Ein WM_CHAR-Zeichen (UTF-16-Einheit). Liefert `text`, wenn es nicht schon als Taste gemeldet wurde:
-    /// zusammengesetzte Zeichen (Akzent-Tasten), IME, Alt+Ziffern.
+    /// Ein WM_CHAR-Zeichen (UTF-16-Einheit) als `text`: zusammengesetzte Zeichen (Akzent-Tasten), IME,
+    /// Alt+Ziffern. Zeichen, die schon als Taste gemeldet wurden, entfernt das Fenster vorher aus der Queue.
     pub fn char_unit(&mut self, unit: u16) -> Option<Value> {
         if (0xD800..0xDC00).contains(&unit) {
             self.high_surrogate = Some(unit);
@@ -225,10 +230,6 @@ impl InputState {
             String::from_utf16(&[hi, unit]).ok()?
         } else {
             self.high_surrogate = None;
-            if self.swallow_char {
-                self.swallow_char = false;
-                return None;
-            }
             let c = char::from_u32(unit as u32)?;
             if c.is_control() {
                 return None;
@@ -250,9 +251,10 @@ impl InputState {
                 .into_iter()
                 .map(|k| json!({"k": "key", "key": k, "down": false})),
         );
-        self.swallow_char = false;
         self.high_surrogate = None;
         self.last_click = None;
+        self.altgr = false;
+        self.fake_ctrl = false;
         out
     }
 }
@@ -399,7 +401,7 @@ mod tests {
         let t = Instant::now();
         s.key("ctrl", true);
         s.key("a", true);
-        s.key("a", true); // Wiederholung
+        assert!(s.key("a", true).is_none()); // Wiederholung: kein zweites down
         s.button(Button::Right, true, (5.0, 6.0), (1.0, 1.0), t);
         let ups = s.release_all();
         assert_eq!(ups.len(), 3);
@@ -417,12 +419,7 @@ mod tests {
 
     #[test]
     fn text_from_wm_char() {
-        // Zur Taste gehoeriges Zeichen wird nicht doppelt gemeldet.
-        let mut s = InputState {
-            swallow_char: true,
-            ..Default::default()
-        };
-        assert!(s.char_unit('a' as u16).is_none());
+        let mut s = InputState::default();
         // Zusammengesetztes Zeichen (Akzent-Taste) oder IME: als Text.
         assert_eq!(s.char_unit(0xE9), Some(json!({"k":"text","text":"\u{e9}"})));
         // Steuerzeichen (Strg+C liefert 0x03) nie als Text.

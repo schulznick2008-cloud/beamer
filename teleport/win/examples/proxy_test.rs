@@ -134,6 +134,30 @@ fn xy(x: i32, y: i32) -> isize {
     ((y as u16 as isize) << 16) | (x as u16 as isize)
 }
 
+/// lParam einer Tastennachricht: Scan-Code, Bit 24 erweitert, Bit 30 vorher gedrueckt (Wiederholung).
+fn key_lp_ext(scan: u32, extended: bool, repeat: bool) -> isize {
+    let mut v = 1 | ((scan as isize) << 16);
+    if extended {
+        v |= 1 << 24;
+    }
+    if repeat {
+        v |= 1 << 30;
+    }
+    v
+}
+
+/// Zeichen, das das aktuelle Layout fuer AltGr+Taste liefert (None: kein AltGr-Zeichen).
+fn altgr_char(vk: u32, scan: u32) -> Option<String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, ToUnicodeEx};
+    let mut state = [0u8; 256];
+    for k in [0x11usize, 0x12, 0xA2, 0xA5] {
+        state[k] = 0x80;
+    }
+    let mut buf = [0u16; 8];
+    let n = unsafe { ToUnicodeEx(vk, scan, &state, &mut buf, 4, Some(GetKeyboardLayout(0))) };
+    (n == 1).then(|| String::from_utf16_lossy(&buf[..1]))
+}
+
 fn key_lp(scan: u32, up: bool) -> isize {
     let mut v = 1 | ((scan as isize) << 16);
     if up {
@@ -280,13 +304,13 @@ fn main() {
     // --- Tastatur (roh, Strg = "ctrl"), Text, Loslassen bei Fokusverlust
     post(hw, WM_KEYDOWN, 0x11, key_lp(0x1D, false)); // Strg links
     post(hw, WM_KEYDOWN, 0x41, key_lp(0x1E, false)); // A
-    post(hw, WM_CHAR, 0x01, key_lp(0x1E, false)); // Strg+A erzeugt 0x01
     post(hw, WM_KEYUP, 0x41, key_lp(0x1E, true));
     post(hw, WM_KEYDOWN, 0x0D, key_lp(0x1C, false)); // Enter
     post(hw, WM_CHAR, 0xE9, 0); // zusammengesetztes "e" mit Akut (tote Taste/IME)
     post(hw, WM_KEYDOWN, 0x5B, key_lp(0x5B, false)); // Windows-Taste: bleibt bei Windows
     post(hw, WM_KILLFOCUS, 0, 0); // Alt+Tab: alles loslassen
     let ev = inputs(&h.collect(Duration::from_millis(400)));
+    println!("  Tastatur: {ev:?}");
     let keys: Vec<(String, bool)> = ev
         .iter()
         .filter(|v| v["k"] == "key")
@@ -321,6 +345,58 @@ fn main() {
         "Fokusverlust: ctrl und enter bekommen up (kein haengender Modifier)",
         &mut fails,
     );
+
+    // WM_CHAR erzeugt der Helfer selbst (TranslateMessage in seiner Nachrichtenschleife), hier nicht posten.
+    // --- Gedrueckt halten: nur ein down (Wiederholung macht der Sender)
+    post(hw, WM_ACTIVATE, 1, 0);
+    post(hw, WM_KEYDOWN, 0x42, key_lp_ext(0x30, false, false)); // B
+    post(hw, WM_KEYDOWN, 0x42, key_lp_ext(0x30, false, true)); // Wiederholung
+    post(hw, WM_KEYDOWN, 0x42, key_lp_ext(0x30, false, true));
+    post(hw, WM_KEYUP, 0x42, key_lp(0x30, true));
+    let ev = inputs(&h.collect(Duration::from_millis(300)));
+    println!("  Halten: {ev:?}");
+    let b: Vec<&Value> = ev.iter().filter(|v| v["key"] == "b").collect();
+    check(
+        b.len() == 2
+            && b[0]["down"] == true
+            && b[1]["down"] == false
+            && !ev.iter().any(|v| v["k"] == "text"),
+        &format!(
+            "Gedrueckt halten: ein down, ein up, kein Text ({} Ereignisse)",
+            ev.len()
+        ),
+        &mut fails,
+    );
+
+    // --- AltGr: kuenstliches linkes Strg + rechtes Alt (erweitert), dann Q -> Text (z. B. "@" auf Deutsch)
+    match altgr_char(0x51, 0x10) {
+        Some(want) => {
+            post(hw, WM_KEYDOWN, 0x11, key_lp_ext(0x1D, false, false));
+            post(hw, WM_KEYDOWN, 0x12, key_lp_ext(0x38, true, false));
+            post(hw, WM_KEYDOWN, 0x51, key_lp_ext(0x10, false, false));
+            post(hw, WM_KEYUP, 0x51, key_lp(0x10, true));
+            post(hw, WM_KEYUP, 0x11, key_lp(0x1D, true));
+            post(hw, WM_KEYUP, 0x12, key_lp(0x38, true) | (1 << 24));
+            post(hw, WM_KEYDOWN, 0x41, key_lp(0x1E, false)); // danach normal: a
+            post(hw, WM_KEYUP, 0x41, key_lp(0x1E, true));
+            let ev = inputs(&h.collect(Duration::from_millis(300)));
+            println!("  AltGr+Q: {ev:?}");
+            let texts: Vec<&Value> = ev.iter().filter(|v| v["k"] == "text").collect();
+            check(
+                texts.len() == 1
+                    && texts[0]["text"] == want.as_str()
+                    && !ev
+                        .iter()
+                        .any(|v| v["key"] == "ctrl" || v["key"] == "alt_r" || v["key"] == "q")
+                    && ev.iter().any(|v| v["key"] == "a" && v["down"] == true),
+                &format!(
+                    "AltGr+Q als text {want:?}, ohne ctrl/alt_r/q; danach wieder normale Tasten"
+                ),
+                &mut fails,
+            );
+        }
+        None => println!("  (AltGr-Test uebersprungen: Layout ohne AltGr-Zeichen auf Q)"),
+    }
 
     // --- Fokus
     post(hw, WM_ACTIVATE, 1, 0);

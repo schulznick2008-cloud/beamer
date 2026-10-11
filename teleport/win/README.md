@@ -112,12 +112,17 @@ Bildes (der Sender verwirft sie).
   Doppelklick-Zeit und dem Doppelklick-Rechteck von Windows). Während ein Button gedrückt ist, hält das Fenster
   die Maus fest (Ziehen über den Rand hinaus).
 - Rad: `scroll` mit `unit: "line"` in Rastungen (`WHEEL_DELTA` = 1); positiv = vom Nutzer weg bzw. nach rechts,
-  wie Beamers Python-Seite (`wheel_notches` in `win_app/capture_win.py`).
+  wie Beamers Python-Seite (`wheel_notches` in `win_app/capture_win.py`; so kommt es in §3).
 - Tasten: `key` mit Beamer-Namen, **roh** (physisch: Strg = `ctrl`, Windows-Taste = `cmd`, Alt = `alt`, links/
   rechts getrennt); die Cmd/Strg-Umsetzung macht Python. Zeichentasten melden ihr Zeichen mit nur Shift und
-  Feststelltaste (wie `capture_win.py`), z. B. Strg+C als `ctrl` + `c`. Gedrückt halten erzeugt weitere `down`.
+  Feststelltaste (wie `capture_win.py`), z. B. Strg+C als `ctrl` + `c`. Gedrückt halten meldet nur **ein**
+  `down` (die Wiederholung macht der Sender selbst).
+- AltGr (rechtes Alt mit dem künstlichen linken Strg, das Windows bei AltGr-Layouts davor schickt): das Paar
+  wird nicht gemeldet, das erzeugte Zeichen geht als `text` (AltGr+Q auf Deutsch → `text` „@“). Auf Layouts
+  ohne AltGr (US) bleibt rechtes Alt `alt_r`.
 - Text: `text` für alles, was keine eigene Taste ist: Akzente über tote Tasten, IME,
-  Alt+Ziffern. Zeichen, die schon als Taste gemeldet wurden, kommen nicht doppelt.
+  Alt+Ziffern. Das `WM_CHAR`, das Windows zu einer schon gemeldeten Taste erzeugt (gleicher Scan-Code), wird
+  aus der Queue entfernt; fremde Zeichen bleiben unberührt.
 - Bleibt bei Windows: Windows-Taste (Start, Win+…), Alt+Tab, Strg+Alt+Entf, Alt+Leertaste (Systemmenü),
   Alt+F4 (schließt den Proxy → `proxy.closed`). Alt allein öffnet kein Menü.
 - Fokusverlust (Alt+Tab, Klick woanders): alle gedrückten Buttons und Tasten bekommen ein `up`.

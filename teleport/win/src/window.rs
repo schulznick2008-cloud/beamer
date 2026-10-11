@@ -552,12 +552,18 @@ fn key_down(vk: u32) -> bool {
 }
 
 /// Zeichen einer Zeichentaste: nur Shift und Feststelltaste zaehlen (wie win_app/capture_win.py),
-/// Strg/Alt nicht. Tote Tasten (Akzente) liefern nichts; ihr Ergebnis kommt als WM_CHAR -> `text`.
-fn key_char(vk: u32, scan: u32) -> Option<String> {
+/// Strg/Alt nicht. Mit `altgr` zusaetzlich Strg+Alt (so erzeugt Windows AltGr-Zeichen wie "@").
+/// Tote Tasten (Akzente) liefern nichts; ihr Ergebnis kommt als WM_CHAR -> `text`.
+fn key_char(vk: u32, scan: u32, altgr: bool) -> Option<String> {
     unsafe {
         let mut state = [0u8; 256];
         if key_down(input::VK_SHIFT) {
             state[input::VK_SHIFT as usize] = 0x80;
+        }
+        if altgr {
+            for k in [input::VK_CONTROL, input::VK_MENU, 0xA2, 0xA5] {
+                state[k as usize] = 0x80;
+            }
         }
         if GetKeyState(VK_CAPITAL.0 as i32) & 1 != 0 {
             state[VK_CAPITAL.0 as usize] = 0x01;
@@ -575,7 +581,53 @@ fn key_char(vk: u32, scan: u32) -> Option<String> {
     }
 }
 
+/// AltGr: Windows schickt ein kuenstliches linkes Strg (nicht erweitert) mit derselben Nachrichtenzeit
+/// unmittelbar vor dem rechten Alt (erweitert). Auf Layouts ohne AltGr (US) fehlt dieses Strg.
+fn is_altgr_fake_ctrl(hwnd: HWND) -> bool {
+    unsafe {
+        let mut m = MSG::default();
+        if !PeekMessageW(&mut m, Some(hwnd), WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE).as_bool() {
+            return false;
+        }
+        (m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN)
+            && m.wParam.0 as u32 == input::VK_MENU
+            && (m.lParam.0 >> 24) & 1 == 1
+            && (m.time as i64 - GetMessageTime() as i64).abs() <= 1
+    }
+}
+
+/// Entfernt das WM_CHAR, das TranslateMessage zu dieser Taste schon in die Queue gelegt hat (gleicher
+/// Scan-Code im lParam): die Taste wurde als `key` bzw. AltGr-`text` gemeldet, das Zeichen soll nicht noch
+/// einmal als `text` kommen. Fremde Zeichen (IME, zusammengesetzte Akzente) bleiben unberuehrt.
+/// Ohne gehaltene Sperren aufrufen: PeekMessage kann gesendete Nachrichten zustellen.
+fn drop_translated_char(hwnd: HWND, scan: u32) {
+    unsafe {
+        let mut m = MSG::default();
+        if PeekMessageW(&mut m, Some(hwnd), WM_CHAR, WM_CHAR, PM_NOREMOVE).as_bool()
+            && ((m.lParam.0 >> 16) & 0xff) as u32 == scan
+        {
+            let _ = PeekMessageW(&mut m, Some(hwnd), WM_CHAR, WM_CHAR, PM_REMOVE);
+        }
+    }
+}
+
 fn on_key(hwnd: HWND, s: &Shared, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    let mut drop_char = false;
+    let r = on_key_inner(hwnd, s, msg, wp, lp, &mut drop_char);
+    if drop_char {
+        drop_translated_char(hwnd, ((lp.0 >> 16) & 0xff) as u32);
+    }
+    r
+}
+
+fn on_key_inner(
+    hwnd: HWND,
+    s: &Shared,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    drop_char: &mut bool,
+) -> Option<LRESULT> {
     let vk = wp.0 as u32;
     let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
     let scan = ((lp.0 >> 16) & 0xff) as u32;
@@ -593,7 +645,7 @@ fn on_key(hwnd: HWND, s: &Shared, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LR
             let on = s.windowed.lock().unwrap().is_none();
             set_fullscreen(hwnd, on, None);
         }
-        s.input.lock().unwrap().swallow_char = true;
+        *drop_char = true;
         return Some(LRESULT(0));
     }
     // Alt+F4 schliesst den Proxy (proxy.closed), F4 geht nicht zum Sender.
@@ -601,14 +653,47 @@ fn on_key(hwnd: HWND, s: &Shared, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LR
         return None;
     }
     let svk = input::sided_vk(vk, scan, extended);
+    let repeat = down && (lp.0 >> 30) & 1 == 1;
+    // Vor der Sperre: PeekMessage kann gesendete Nachrichten zustellen (Wiedereintritt).
+    let altgr_ctrl = svk == 0xA2 && down && is_altgr_fake_ctrl(hwnd);
+    let mut st = s.input.lock().unwrap();
+    // AltGr-Paar (kuenstliches Strg + rechtes Alt) nicht melden; Zeichen mit AltGr gehen als `text`.
+    if svk == 0xA2 {
+        if altgr_ctrl && !st.fake_ctrl {
+            st.fake_ctrl = true;
+            return Some(LRESULT(0));
+        }
+        if st.fake_ctrl {
+            if !down {
+                st.fake_ctrl = false;
+            }
+            return Some(LRESULT(0));
+        }
+    }
+    if svk == 0xA5 && (st.fake_ctrl || st.altgr) {
+        st.altgr = down;
+        return Some(LRESULT(0));
+    }
+    if st.altgr && input::named_key(svk).is_none() {
+        if down {
+            let c = key_char(vk, scan, true);
+            // Das WM_CHAR zur Taste darf nicht doppelt als Text raus. Tote Taste (kein Zeichen): nichts
+            // entfernen, das zusammengesetzte Zeichen kommt spaeter als WM_CHAR.
+            *drop_char = c.is_some();
+            drop(st);
+            if let Some(c) = c.filter(|_| !repeat) {
+                s.send_input(json!({"k": "text", "text": c}));
+            }
+        }
+        return Some(LRESULT(0));
+    }
     let name = match input::named_key(svk) {
         Some(n) => Some(n.to_owned()),
-        None => key_char(vk, scan),
+        None => key_char(vk, scan, false),
     };
-    let mut st = s.input.lock().unwrap();
     if let Some(name) = name {
         if down && input::named_key(svk).is_none() {
-            st.swallow_char = true;
+            *drop_char = true;
         }
         let ev = st.key(&name, down);
         drop(st);
@@ -767,9 +852,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_SYSCHAR => {
                 // Alt+Taste wurde schon als Taste gemeldet; kein Menue-Kuerzel (Piepton). Alt+Leertaste:
                 // Systemmenue bleibt bei Windows.
-                if let Some(s) = shared_of(hwnd) {
-                    s.input.lock().unwrap().swallow_char = false;
-                }
                 if wp.0 == 0x20 {
                     DefWindowProcW(hwnd, msg, wp, lp)
                 } else {
