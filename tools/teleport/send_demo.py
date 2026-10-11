@@ -90,7 +90,7 @@ def main():
 
     h = Helper(a.helper)
     r = h.call("hello", beamer_version="demo")
-    print("hello:", r)
+    print("hello:", r, "(Energiesparmodus: %s)" % r.get("low_power"))
     host, port = a.peer.rsplit(":", 1)
     r = h.call("transport.open", local_port=0, peer_host=host, peer_port=int(port))
     print("transport.open:", r)
@@ -131,9 +131,11 @@ def main():
         time.sleep(1)
         for e in h.drain_events():
             if e.get("ev") == "stats":
-                print("stats: fps=%s kbps=%s capture_fps=%s encode_ms=%s cpu=%s%% state=%s target=%s rtt=%s loss=%s" % (
+                print("stats: fps=%s kbps=%s capture_fps=%s encode_ms=%s cpu=%s%% state=%s target=%s rtt=%s loss=%s "
+                      "eff_fps=%s slow=%s lowpower=%s drops=%s" % (
                     e["fps"], e["kbps"], e.get("capture_fps"), e.get("encode_ms"), e.get("cpu_pct"),
-                    e.get("state"), e.get("target_kbps"), e["rtt_ms"], e["loss_pct"]))
+                    e.get("state"), e.get("target_kbps"), e["rtt_ms"], e["loss_pct"],
+                    e.get("effective_fps"), e.get("encoder_slow"), e.get("low_power"), e.get("backlog_drops")))
             else:
                 print("event:", e)
                 if e.get("ev") == "send.gone":

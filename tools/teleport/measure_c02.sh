@@ -19,5 +19,9 @@ tools/teleport/send_demo.py --helper "$BIN" --app teleport_anim --peer 127.0.0.1
 wait %2 2>/dev/null || sleep 7
 echo "--- Empfaenger (Capture bis dekodiert, gleiche Host-Uhr) ---"
 tail -3 /tmp/c02_recv.out
-echo "--- Sender-CPU (Mittel ab Sekunde 3, Prozent eines Kerns) ---"
-grep '^stats' /tmp/c02_send.out | tail -n +3 | sed -E 's/.*cpu=([0-9.]+)%.*/\1/' | awk '{s+=$1;n++} END {printf "%.1f %% (n=%d)\n", s/n, n}'
+echo "--- Sender (Mittel ab Sekunde 3): CPU in Prozent eines Kerns, gesendete fps, effektive fps, encode_ms ---"
+grep '^stats' /tmp/c02_send.out | tail -n +3 | awk '{
+  for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2]; sub(/%/, "", v[kv[1]]) }
+  cpu += v["cpu"]; fps += v["fps"]; eff += v["eff_fps"]; ms += v["encode_ms"]; n++ }
+  END { printf "CPU %.1f %%  fps %.1f  effektive fps %.0f  encode_ms %.1f  (n=%d)\n", cpu/n, fps/n, eff/n, ms/n, n }'
+grep -m1 "^hello" /tmp/c02_send.out

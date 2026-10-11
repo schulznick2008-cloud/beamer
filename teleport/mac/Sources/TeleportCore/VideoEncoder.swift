@@ -15,20 +15,51 @@ public struct EncoderError: Error, CustomStringConvertible {
     public var description: String { message }
 }
 
+/// Was die Senderpipeline vom Encoder braucht. Die Tests setzen einen langsamen Attrappen-Encoder ein.
+/// `onDone` kommt je `encode`-Aufruf genau einmal (mit `nil`, wenn kein Frame entstanden ist).
+public protocol FrameEncoder: AnyObject {
+    var width: Int { get }
+    var height: Int { get }
+    func encode(_ pixelBuffer: CVPixelBuffer, hostTime: CMTime, forceKeyframe: Bool)
+    func setBitrate(kbps: Int)
+    func setFrameRate(_ fps: Int)
+    func flush()
+    func invalidate()
+}
+
+extension FrameEncoder {
+    /// Fertig kodieren und freigeben, aber hoechstens `timeout` Sekunden warten: Ein haengender VideoToolbox-Encoder
+    /// darf weder `send.stop` noch das Beenden bei EOF aufhalten (Vorgabe: unter 2 s).
+    public func retire(timeout: TimeInterval = 0.5) {
+        let sem = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.flush()
+            self.invalidate()
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            logErr("teleport: Encoder reagiert nicht, wird ohne Abschluss freigegeben")
+        }
+    }
+}
+
+public typealias EncoderFactory = (_ width: Int, _ height: Int, _ codec: Codec, _ fps: Int, _ kbps: Int,
+                                   _ onDone: @escaping (EncodedFrame?) -> Void) throws -> FrameEncoder
+
 /// VideoToolbox-Kompression: Hardware-Encoder Pflicht, Low-Latency-Ratenregelung, keine B-Frames,
 /// Keyframe alle 2 s und auf Anfrage. Ausgabe als Annex-B mit Parametersaetzen vor jedem Keyframe.
-public final class VideoEncoder {
+public final class VideoEncoder: FrameEncoder {
     private var session: VTCompressionSession?
     private let codec: Codec
     public let width: Int
     public let height: Int
-    private let fps: Int
-    private let onFrame: (EncodedFrame) -> Void
+    private var fps: Int
+    private let onFrame: (EncodedFrame?) -> Void
     public private(set) var usesHardware = false
     private var bitrateKbps: Int
 
     public init(width: Int, height: Int, codec: Codec, fps: Int, bitrateKbps: Int,
-                onFrame: @escaping (EncodedFrame) -> Void) throws {
+                onFrame: @escaping (EncodedFrame?) -> Void) throws {
         self.width = width
         self.height = height
         self.codec = codec
@@ -103,8 +134,18 @@ public final class VideoEncoder {
         applyBitrate(kbps: kbps)
     }
 
+    public func setFrameRate(_ fps: Int) {
+        guard let sess = session, fps != self.fps, fps > 0 else { return }
+        self.fps = fps
+        // Nur die erwartete Bildrate; der Keyframe-Abstand ist zeitbasiert (2 s) und bleibt unangetastet.
+        _ = VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
+    }
+
     public func encode(_ pixelBuffer: CVPixelBuffer, hostTime: CMTime, forceKeyframe: Bool) {
-        guard let sess = session else { return }
+        guard let sess = session else {
+            onFrame(nil)
+            return
+        }
         var props: CFDictionary?
         if forceKeyframe {
             props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
@@ -119,12 +160,15 @@ public final class VideoEncoder {
             duration: .invalid, frameProperties: props, infoFlagsOut: &flags
         ) { status, _, sample in
             guard status == noErr, let sample = sample,
-                  let enc = VideoEncoder.annexB(from: sample, codec: codec, ptsUS: ptsUS) else { return }
+                  let enc = VideoEncoder.annexB(from: sample, codec: codec, ptsUS: ptsUS) else {
+                onFrame(nil) // Frame verworfen oder Fehler: der Aufrufer zaehlt den Platz trotzdem frei
+                return
+            }
             var e = enc
             e.encodeMS = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
             onFrame(e)
         }
-        _ = st
+        if st != noErr { onFrame(nil) }
     }
 
     public func flush() {

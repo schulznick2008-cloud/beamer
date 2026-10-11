@@ -148,3 +148,44 @@ final class EngineTests: XCTestCase {
         engine.shutdown()
     }
 }
+
+final class EncoderBehaviourTests: XCTestCase {
+    func testFrameRateAndBitrateChangesKeepTheEncoderRunning() throws {
+        let done = NSLock()
+        var outputs = 0
+        var nils = 0
+        let enc: VideoEncoder
+        do {
+            enc = try VideoEncoder(width: 1280, height: 720, codec: .hevc, fps: 60, bitrateKbps: 8000) { f in
+                done.lock(); if f == nil { nils += 1 } else { outputs += 1 }; done.unlock()
+            }
+        } catch {
+            throw XCTSkip("kein Hardware-Encoder verfuegbar: \(error)")
+        }
+        let src = SynthSource(width: 1280, height: 720, fps: 60)
+        var sent = 0
+        let sentLock = NSLock()
+        try src.start(onFrame: { pb, t in
+            sentLock.lock(); sent += 1; sentLock.unlock()
+            enc.encode(pb, hostTime: t, forceKeyframe: false)
+        }, onStop: { _ in })
+        func counts() -> (Int, Int) { done.lock(); defer { done.unlock() }; return (outputs, nils) }
+        /// Wartet, bis seit `base` mindestens `n` Frames dazugekommen sind (Polling, die CI-Maschinen sind langsam).
+        func waitForMore(_ n: Int, since base: Int) -> Bool {
+            let end = Date().addingTimeInterval(8)
+            while Date() < end { if counts().0 - base >= n { return true }; Thread.sleep(forTimeInterval: 0.02) }
+            return counts().0 - base >= n
+        }
+        XCTAssertTrue(waitForMore(10, since: 0), "Encoder liefert Frames")
+        let a = counts().0
+        enc.setFrameRate(51)
+        XCTAssertTrue(waitForMore(10, since: a), "nach setFrameRate laeuft der Encoder weiter")
+        let b = counts().0
+        enc.setBitrate(kbps: 3000)
+        enc.setFrameRate(24)
+        XCTAssertTrue(waitForMore(10, since: b), "nach setBitrate/setFrameRate laeuft der Encoder weiter")
+        src.stop()
+        enc.flush()
+        enc.invalidate()
+    }
+}

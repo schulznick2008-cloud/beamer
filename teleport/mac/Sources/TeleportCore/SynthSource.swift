@@ -7,7 +7,7 @@ import Foundation
 public final class SynthSource: FrameSource {
     private let width: Int
     private let height: Int
-    private let fps: Int
+    private var fps: Int
     private var timer: DispatchSourceTimer?
     private var pool: CVPixelBufferPool?
     private let queue = DispatchQueue(label: "teleport.synth", qos: .userInteractive)
@@ -44,6 +44,12 @@ public final class SynthSource: FrameSource {
         }
         timer = t
         t.resume()
+    }
+
+    public func setMaxFps(_ fps: Int) {
+        guard fps > 0, fps != self.fps else { return }
+        self.fps = fps
+        timer?.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / fps), leeway: .microseconds(200))
     }
 
     public func stop() {

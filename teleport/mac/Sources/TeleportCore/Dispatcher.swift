@@ -26,9 +26,12 @@ public final class Dispatcher {
     }
 
     private let backend: TeleportBackend
+    private let lowPower: () -> Bool
 
-    public init(backend: TeleportBackend) {
+    public init(backend: TeleportBackend,
+                lowPower: @escaping () -> Bool = { ProcessInfo.processInfo.isLowPowerModeEnabled }) {
         self.backend = backend
+        self.lowPower = lowPower
     }
 
     /// Fehlerereignis fuer Zeilen, die sich keiner Anfrage zuordnen lassen.
@@ -70,7 +73,8 @@ public final class Dispatcher {
     private func run(cmd: String, msg: JSON, quit: inout Bool) throws -> JSON {
         switch cmd {
         case "hello":
-            return ["helper_version": Self.helperVersion, "platform": "mac", "caps": Self.caps]
+            // low_power (Zusatzfeld): Energiesparmodus an. Die Codec-Wahl trifft Python, der Helfer meldet nur.
+            return ["helper_version": Self.helperVersion, "platform": "mac", "caps": Self.caps, "low_power": lowPower()]
 
         case "transport.open":
             guard let lp = msg.int("local_port"), (0...65535).contains(lp) else {
