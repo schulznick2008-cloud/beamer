@@ -1,0 +1,7 @@
+# FFmpeg (LGPL-shared, 8.1) liegt nach scripts/fetch-ffmpeg.ps1 unter third_party/ffmpeg (nicht im Repo).
+# rusty_ffmpeg erzeugt die Bindings mit bindgen (braucht libclang, z. B. LLVM unter C:\Program Files\LLVM).
+[env]
+FFMPEG_INCLUDE_DIR = { value = "third_party/ffmpeg/include", relative = true }
+FFMPEG_DLL_PATH = { value = "third_party/ffmpeg/lib", relative = true }
+# Die Transport-Tests und die Selbsttests messen Zeitverhalten, deshalb nacheinander (wie in transport/).
+RUST_TEST_THREADS = "1"

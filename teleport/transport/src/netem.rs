@@ -20,6 +20,10 @@ pub struct NetemConfig {
     /// Verwirft die erste Uebertragung jedes n-ten Video-Pakets (0 = aus). Deterministisch, unabhaengig
     /// von zwischengeschobenen ping/pong-Paketen.
     pub drop_video_every: u64,
+    /// WLAN-artige Aussetzer: im Mittel alle `stall_every_ms` (zufaellig 0,5..1,5-fach) haelt die
+    /// Strecke `stall_ms` lang alle Pakete fest und gibt sie danach gesammelt frei (0 = aus).
+    pub stall_ms: f64,
+    pub stall_every_ms: f64,
 }
 
 impl NetemConfig {
@@ -30,6 +34,7 @@ impl NetemConfig {
             && self.reorder_pct <= 0.0
             && self.drop_once.is_empty()
             && self.drop_video_every == 0
+            && (self.stall_ms <= 0.0 || self.stall_every_ms <= 0.0)
     }
 }
 
@@ -87,6 +92,9 @@ pub struct Netem {
     counter: u64,
     video_seen: u64,
     video_top: u64,
+    /// Naechster Aussetzer (Beginn) bzw. Ende des laufenden.
+    next_stall: Option<Instant>,
+    stall_until: Option<Instant>,
 }
 
 pub enum Verdict {
@@ -137,6 +145,21 @@ impl Netem {
             return Verdict::Held;
         }
         let mut ms = self.cfg.delay_ms.max(0.0);
+        if self.cfg.stall_ms > 0.0 && self.cfg.stall_every_ms > 0.0 {
+            let gap = |r: &mut Rng, every: f64| {
+                Duration::from_secs_f64(every * (0.5 + r.next_f64()) / 1000.0)
+            };
+            let next = *self
+                .next_stall
+                .get_or_insert_with(|| now + gap(rng, self.cfg.stall_every_ms));
+            if now >= next {
+                self.stall_until = Some(now + Duration::from_secs_f64(self.cfg.stall_ms / 1000.0));
+                self.next_stall = Some(now + gap(rng, self.cfg.stall_every_ms));
+            }
+            if let Some(u) = self.stall_until.filter(|u| *u > now) {
+                ms += u.saturating_duration_since(now).as_secs_f64() * 1000.0;
+            }
+        }
         if self.cfg.jitter_ms > 0.0 {
             ms += rng.next_f64() * self.cfg.jitter_ms;
         }
@@ -162,5 +185,45 @@ impl Netem {
             return Some((d.data, d.src));
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stalls_hold_packets_and_release_them_together() {
+        let mut n = Netem::default();
+        n.set(NetemConfig {
+            stall_ms: 50.0,
+            stall_every_ms: 1000.0,
+            seed: 3,
+            ..Default::default()
+        });
+        let src: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let t0 = Instant::now();
+        let mut delays = Vec::new();
+        // 10 s lang jede Millisekunde ein Paket; Ausgabe sofort abholen.
+        for i in 0..10_000u64 {
+            let now = t0 + Duration::from_millis(i);
+            let _ = n.ingest(now, &[1, 1], src, i);
+            while n.pop_due(now).is_some() {}
+            delays.push(
+                n.heap
+                    .iter()
+                    .map(|d| d.due.saturating_duration_since(now))
+                    .max(),
+            );
+        }
+        let stalls = delays
+            .windows(2)
+            .filter(|w| {
+                w[0].is_none_or(|d| d.is_zero())
+                    && w[1].is_some_and(|d| d >= Duration::from_millis(40))
+            })
+            .count();
+        // Im Mittel alle 1000 ms (0,5..1,5-fach): in 10 s etwa 10 Aussetzer.
+        assert!((6..=16).contains(&stalls), "{stalls} Aussetzer");
     }
 }
