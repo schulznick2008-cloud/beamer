@@ -163,3 +163,30 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(backend.calls, ["shutdown"])
     }
 }
+
+final class HelloAndFilterTests: XCTestCase {
+    func testHelloReportsLowPower() throws {
+        for lp in [true, false] {
+            let d = Dispatcher(backend: FakeBackend(), lowPower: { lp })
+            let r = try JSONLine.parse(d.handle(line: JSONLine.encode(["v": 1, "id": 1, "cmd": "hello"])).line)
+            XCTAssertEqual(r.bool("low_power"), lp)
+            XCTAssertEqual(r.bool("ok"), true)
+        }
+    }
+
+    func testWindowFilter() {
+        func keep(layer: Int = 0, w: Double = 800, h: Double = 600, on: Bool = true, title: String = "Fenster",
+                  regular: Bool = true) -> Bool {
+            WindowFilter.keep(layer: layer, width: w, height: h, isOnScreen: on, title: title, regularApp: regular)
+        }
+        XCTAssertTrue(keep())
+        XCTAssertTrue(keep(on: false, title: "Minimiert"), "minimiertes Fenster mit Titel bleibt")
+        XCTAssertTrue(keep(title: ""), "sichtbares Fenster einer normalen App ohne Titel bleibt")
+        XCTAssertFalse(keep(w: 500, h: 500, on: false, title: ""), "unsichtbares Fenster ohne Titel (Claude 500x500)")
+        XCTAssertFalse(keep(w: 500, h: 500, on: false, title: "", regular: false), "Open and Save Panel Service")
+        XCTAssertFalse(keep(on: true, title: "Gesture Blocking Overlay", regular: false), "WindowManager")
+        XCTAssertFalse(keep(layer: 25), "Menueleiste / Overlays")
+        XCTAssertFalse(keep(w: 1800, h: 39), "Menueleisten-Streifen")
+        XCTAssertFalse(keep(w: 64, h: 64), "winziges Hilfsfenster")
+    }
+}

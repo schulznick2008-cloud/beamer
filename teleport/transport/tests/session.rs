@@ -502,13 +502,17 @@ fn bitrate_recovers_without_loss() {
             std::thread::sleep(Duration::from_millis(16));
         }
     };
-    pump(2500);
-    let low = l.tx.target_kbps(SID);
-    assert!(low < 7000, "Absenkung erwartet, ist {low}");
-    l.rx.set_netem(NetemConfig::default());
-    // Erholung: die Messung gleitet ueber 1 s und es geht mit +5 %/s hoch; bis 12 s warten, statt fester Zeit.
+    // Erst Verlust aufbauen, bis die Zielbitrate sichtbar gesunken ist (Polling statt fester Zeit).
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(12) && l.tx.target_kbps(SID) <= low + low / 20 {
+    while start.elapsed() < Duration::from_secs(10) && l.tx.target_kbps(SID) >= 6500 {
+        pump(200);
+    }
+    let low = l.tx.target_kbps(SID);
+    assert!(low < 6500, "Absenkung erwartet, ist {low}");
+    l.rx.set_netem(NetemConfig::default());
+    // Erholung: die Messung gleitet ueber 1 s und es geht mit +5 %/s hoch; bis 20 s warten.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(20) && l.tx.target_kbps(SID) <= low + low / 20 {
         pump(200);
     }
     assert!(
@@ -722,7 +726,10 @@ fn set_peer_while_streaming_moves_the_stream() {
         std::thread::sleep(Duration::from_millis(16));
     }
     assert!(wait_until(3.0, || s2.frames.lock().unwrap().len() == 5));
-    // Umstellen mitten im Strom: seq, Schluessel und Puffer laufen weiter.
+    // Umstellen mitten im Strom: seq, Schluessel und Puffer laufen weiter. Der alte Empfaenger ist danach
+    // tot (sonst folgt das Roaming des Transports seinen Rueckpaketen, je nach Timing schon waehrend der
+    // naechsten Frames, und das Ziel springt zurueck).
+    r1.close();
     tx.set_peer("127.0.0.1", r2.local_port()).unwrap();
     for i in 5..10 {
         tx.send_frame(SID, 1, &blob(3000, i), i as u64, (i == 5) as u8)

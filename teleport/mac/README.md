@@ -23,7 +23,7 @@ Helfer startet (Systemeinstellungen > Datenschutz & Sicherheit). Ohne Freigabe a
 | `Sources/CBeamerTransport` | C-Target; `include/beamer_transport.h` ist ein Symlink auf `../transport/include` |
 | `Sources/TeleportCore` | `IPC` (JSON, Zeilen), `Dispatcher` (Befehle), `SenderEngine`/`SenderPipeline` (Strom), `Capture` (ScreenCaptureKit), `VideoEncoder` (VideoToolbox), `AnnexB`, `Transport` (Swift-Hülle der C-ABI), Selbsttests |
 | `Sources/BeamerTeleport` | `main.swift`: Argumente, IPC-Schleife |
-| `Tests/TeleportCoreTests` | 37 Tests (Hardware-Encoder-Tests werden ohne Hardware übersprungen) |
+| `Tests/TeleportCoreTests` | 46 Tests (Hardware-Encoder-Tests werden ohne Hardware übersprungen; die Pipeline-Tests laufen mit einer Attrappe als langsamem Encoder und brauchen keine) |
 
 ## IPC (Helfer-Seite)
 
@@ -37,16 +37,20 @@ Ereignisse: `send.gone` (`reason`: `window_closed` oder `capture_error: …`), `
 geändert; der Encoder startet mit einem Keyframe neu), `stats` jede Sekunde, `error` (nur für Zeilen, die sich
 keiner Anfrage zuordnen lassen). Nach `send.gone` ist ein `send.stop` zu derselben `tid` kein Fehler.
 
+`hello` meldet zusätzlich `low_power` (Energiesparmodus an). Die Codec-Wahl (HEVC → H.264) trifft Python; der Helfer meldet nur.
+
 `stats` enthält die Felder aus §1.2 (`fps`, `kbps`, `rtt_ms`, `loss_pct`, `latency_ms`) und zusätzlich `state`
 (`ok`, `minimized_or_other_space`), `target_kbps`, `capture_fps`, `encode_fps`, `encode_ms`, `refused`, `cpu_pct`
-(Prozent eines Kerns), `pace_queue_ms`. `latency_ms` ist beim Sender 0.
+(Prozent eines Kerns), `pace_queue_ms`, `backlog_drops` (wegen Encoder-Rückstau verworfene Capture-Frames), `encoder_slow`, `effective_fps`, `low_power`, `encoder_resets`. `latency_ms` ist beim Sender 0.
 
 Pipeline: Capture (Retina-Pixel, 420v, kein Cursor, `max_fps`) → VideoToolbox (Low-Latency-Ratenregelung, keine
 B-Frames, Keyframe alle 2 s und auf `keyframe_req`/`send.keyframe`) → Annex-B mit Parametersätzen vor jedem
 Keyframe → `bt_send_frame`. Jede Sekunde wird die Encoder-Bitrate auf `min(bt_target_kbps, Obergrenze)` gesetzt. Lehnt der
 Transport ein Frame ab („Sendewarteschlange voll“), werden die Folgebilder bis zum nächsten Keyframe nicht gesendet
 und sofort ein Keyframe angefordert. Ändert sich nichts im Bild, geht spätestens alle 2 s trotzdem ein Keyframe mit dem
-letzten Bild raus. Ist das Fenster minimiert oder auf einem anderen Space, bleibt das letzte Bild stehen und `state`
+letzten Bild raus. Ein Keyframe-Wunsch (`keyframe_req`, `send.keyframe`, abgelehntes Frame) kodiert das letzte Bild sofort, auch bei stehender Quelle.
+
+**Encoder-Rückstau (C02a):** Höchstens 2 Frames stecken gleichzeitig im Encoder; weitere Capture-Frames ersetzen das eine wartende (das neueste zählt). Liegt die Encode-Zeit 2 s lang über einer Bildzeit (`1000/max_fps`), meldet `stats` `encoder_slow:true`; gab es dabei Rückstau, sinkt die effektive Bildrate auf den Durchsatz (nicht unter 20) und geht nach 3 s ohne Engpass schrittweise zurück. Verschluckt VideoToolbox Frames (0,6 s lang kein Fortschritt), legt ein Wachhund den Encoder neu an. `send.stop` und das Beenden bei EOF warten höchstens 0,5 s auf den Encoder. Ist das Fenster minimiert oder auf einem anderen Space, bleibt das letzte Bild stehen und `state`
 zeigt es an.
 
 ## Selbsttests und Messung
@@ -66,3 +70,5 @@ diese Selbsttests; echte Teleports bekommen ihre Schlüssel von Python (§4.2).
 
 `BEAMER_TELEPORT_FAKE_NO_PERMISSION=1` lässt den Helfer so tun, als fehle die Freigabe (Test der Fehlerpfade),
 `BEAMER_TELEPORT_DEBUG=1` loggt Capture-Statuswechsel nach stderr.
+
+`windows.list` liefert nur sichtbare oder minimierte Fenster (Layer 0, mindestens 100×50 pt, mit Titel) normaler Apps; Hilfsprozesse (z. B. WindowManager, „Open and Save Panel Service“) und unsichtbare Fenster ohne Titel fallen heraus (`WindowFilter`).

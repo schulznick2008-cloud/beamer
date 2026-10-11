@@ -15,10 +15,13 @@ public protocol FrameSource: AnyObject {
     /// Einmal pro Sekunde: Zustand neu lesen ("ok", "minimized_or_other_space", "gone") und die Capture-Groesse
     /// an eine geaenderte Fenstergroesse anpassen. `sizeChanged`, wenn sich die Pixelgroesse geaendert hat.
     func refresh() -> (state: String, sizeChanged: Bool)
+    /// Effektive Bildrate senken oder wieder anheben (langsamer Encoder, Energiesparmodus).
+    func setMaxFps(_ fps: Int)
 }
 
 extension FrameSource {
     public func refresh() -> (state: String, sizeChanged: Bool) { (state, false) }
+    public func setMaxFps(_ fps: Int) {}
 }
 
 enum CapturePermission {
@@ -53,6 +56,21 @@ func runBlocking<T>(_ work: @escaping () async throws -> T) throws -> T {
     return try result!.get()
 }
 
+/// Welche Fenster Teleport-Kandidaten sind. Unsichtbare System-Hilfsfenster (Service-Prozesse, leere
+/// Fenster ohne Titel, die nicht auf dem Bildschirm liegen, Fenster von Hilfsprozessen) fallen heraus.
+public enum WindowFilter {
+    public static func keep(layer: Int, width: Double, height: Double, isOnScreen: Bool, title: String,
+                            regularApp: Bool) -> Bool {
+        // Menueleisten-/Overlay-Fenster und winzige Hilfsfenster sind keine Kandidaten.
+        guard layer == 0, width >= 100, height >= 50 else { return false }
+        let hasTitle = !title.trimmingCharacters(in: .whitespaces).isEmpty
+        // Sichtbar oder (mit Titel) minimiert: unsichtbar und ohne Titel ist ein Hilfsfenster.
+        guard isOnScreen || hasTitle else { return false }
+        // Nur Fenster normaler Apps (Hilfsprozesse wie WindowManager oder "Open and Save Panel Service" nicht).
+        return regularApp
+    }
+}
+
 public enum WindowCatalog {
     public static func list() throws -> [WindowInfo] {
         try CapturePermission.check()
@@ -66,8 +84,12 @@ public enum WindowCatalog {
         }
         let displays = content.displays
         return content.windows.compactMap { w -> WindowInfo? in
-            // Menueleisten-/Overlay-Fenster und winzige Hilfsfenster sind keine Teleport-Kandidaten.
-            guard w.windowLayer == 0, w.frame.width >= 100, w.frame.height >= 50 else { return nil }
+            let policyRegular = w.owningApplication.flatMap {
+                NSRunningApplication(processIdentifier: $0.processID)?.activationPolicy == .regular
+            } ?? false
+            guard WindowFilter.keep(layer: Int(w.windowLayer), width: Double(w.frame.width),
+                                    height: Double(w.frame.height), isOnScreen: w.isOnScreen,
+                                    title: w.title ?? "", regularApp: policyRegular) else { return nil }
             let disp = displays.max(by: { a, b in
                 a.frame.intersection(w.frame).area < b.frame.intersection(w.frame).area
             })
@@ -187,6 +209,12 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         } catch {
             throw CapturePermission.mapped(error)
         }
+    }
+
+    public func setMaxFps(_ fps: Int) {
+        guard let cfg = config, let s = stream, fps > 0 else { return }
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        _ = try? runBlocking { try await s.updateConfiguration(cfg) }
     }
 
     public func refresh() -> (state: String, sizeChanged: Bool) {
