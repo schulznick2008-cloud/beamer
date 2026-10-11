@@ -1,0 +1,4 @@
+# Die Session-Tests messen Zeitverhalten (Fristen, Bitratenregelung). Nebeneinander laufende Tests
+# verfaelschen das auf kleinen Runnern, deshalb nacheinander.
+[env]
+RUST_TEST_THREADS = "1"

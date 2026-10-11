@@ -39,7 +39,7 @@ Die Zusatzlatenz ist der Median gegen einen verlustfreien Basislauf mit demselbe
 - Der `BtFrame`-Zeiger und `data` sind nur während des Callbacks gültig. Daten kopieren und zurückkehren.
 - Der Stats-JSON enthält die Felder aus §1.2 (`fps`, `kbps`, `rtt_ms`, `loss_pct`, `latency_ms`) und zusätzlich
   `role`, `target_kbps`, `jitter_ms`, `frames_*`, `retransmits`, `nacks`, `fec_recovered`, `auth_fail`, `peer_recv_kbps`.
-  `peer` ist die aktuelle Gegenstelle (`ip:port`), `sock_rcvbuf`/`sock_sndbuf` die vom Betriebssystem bestätigten Socket-Puffer, `resid_loss_pct` der Restverlust nach FEC/NACK (Grundlage der Bitratenregelung). `loss_pct` ist der Rohverlust. Beim Sender ist `latency_ms` 0, `rtt_ms` kommt aus eigenen ping/pong.
+  `peer` ist die aktuelle Gegenstelle (`ip:port`), `sock_rcvbuf`/`sock_sndbuf` die vom Betriebssystem bestätigten Socket-Puffer, `pace_queue_ms` die Wartezeit der Sendewarteschlange, `resid_loss_pct` der Restverlust nach FEC/NACK (Grundlage der Bitratenregelung). `loss_pct` ist der Rohverlust (eine seq zählt nur als verloren, wenn das Original nicht mehr kommt; reine Umordnung nicht). Beim Sender ist `latency_ms` 0, `rtt_ms` kommt aus eigenen ping/pong.
 - `role` ist `uint32_t` (1 = Sender, 2 = Receiver); ungültige Werte liefern -1 und `bt_last_error`.
 - Header neu erzeugen: `BEAMER_UPDATE_HEADER=1 cargo build`. `tests/header.rs` (und damit die CI) schlägt an, wenn `include/beamer_transport.h` veraltet ist.
 - Nur im Rust-API, nicht in der C-ABI: `Session::set_fec_enabled`, `Session::set_netem`, `Session::counters`.
@@ -51,3 +51,5 @@ Die Zusatzlatenz ist der Median gegen einen verlustfreien Basislauf mit demselbe
   und spart 2 Byte je Quelle.
 - `frame_id` zählt je Stream und Art (Video/Audio) getrennt ab 1. FEC gibt es nur für Video.
 - Fragment-Nutzlast höchstens 1141 Byte, damit das zugehörige FEC-Paket noch in 1200 Byte passt.
+
+- Die Sperre gegen Schlüssel-Wiederverwendung (`bt_add_stream`) gilt nur innerhalb einer Session. Frische Schlüssel pro Teleport sind Pflicht der Python-Seite (§4.2).
