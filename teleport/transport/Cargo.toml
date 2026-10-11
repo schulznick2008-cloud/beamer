@@ -1,0 +1,23 @@
+[package]
+name = "beamer-transport"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Verschluesselter UDP-Medienstrom fuer Beamer-Teleport (SCHNITTSTELLEN.md 4 und 5)"
+build = "build.rs"
+
+[lib]
+name = "beamer_transport"
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+chacha20poly1305 = "0.10"
+socket2 = "0.5"
+
+[build-dependencies]
+cbindgen = { version = "0.27", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "unwind"
