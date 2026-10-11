@@ -3,9 +3,16 @@
 //! Alle Fenster gehoeren dem Hauptthread (Nachrichtenschleife). Gerendert wird im Empfaenger-Thread;
 //! die Fensterprozedur meldet ihm Groessenaenderungen nur ueber atomare Werte. Schliessen schickt
 //! eine Thread-Nachricht an den Hauptthread, der dann `proxy.closed` meldet und aufraeumt.
+//!
+//! C05: Eingabe (Maus, Rad, Tasten, Text/IME) geht als `proxy.input` raus, Aktivierung als `proxy.focus`,
+//! Groessenaenderungen durch den Nutzer als `proxy.resize` (entprellt). Dazu Taskleisten-Identitaet
+//! (AppUserModelID je App, Icon) und randloses Vollbild (Strg+Alt+Shift+F schaltet um).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
 
 use windows::core::BOOL;
 use windows::core::{w, Result, HSTRING, PCWSTR};
@@ -20,7 +27,14 @@ use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetKeyState, GetKeyboardLayout, ReleaseCapture, SetCapture, ToUnicodeEx,
+    VK_CAPITAL,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+use crate::input::{self, Button, Debounce, DebounceOut, InputState};
+use crate::ipc::{self, Out};
 
 /// Hauptthread-Nachrichten (PostThreadMessage, hwnd = 0).
 pub const WM_APP_CMD: u32 = WM_APP + 1;
@@ -34,15 +48,43 @@ const CLASS: PCWSTR = w!("BeamerTeleportProxy");
 const STYLE: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
 
+/// Gemeldete Groesse fuer `proxy.resize`: Client-Pixel und DPI (Punkte = Pixel * 96 / DPI).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResizeVal {
+    pub px: (u32, u32),
+    pub dpi: u32,
+}
+
+/// Fensterlage vor dem Vollbild (zum Zuruecksetzen).
+struct Windowed {
+    style: WINDOW_STYLE,
+    rect: RECT,
+}
+
+const RESIZE_TIMER: usize = 1;
+/// `proxy.resize` hoechstens 10/s.
+const RESIZE_EVERY: Duration = Duration::from_millis(100);
+const VK_F: u32 = 0x46;
+
 /// Zustand, den Fensterprozedur (Hauptthread) und Empfaenger-Thread teilen.
 pub struct Shared {
     pub tid: u32,
     main_thread: u32,
     /// Client-Groesse in physischen Pixeln, (w << 32) | h.
     size: AtomicU64,
+    /// Groesse des dekodierten Bildes (Stream-Pixel), (w << 32) | h; 0 = noch kein Bild.
+    stream: AtomicU64,
     /// Groesse geaendert oder Neuzeichnen noetig.
     pub dirty: AtomicBool,
     pub dpi: AtomicU32,
+    out: Out,
+    input: Mutex<InputState>,
+    resize: Mutex<Debounce<ResizeVal>>,
+    /// Groessenaenderung kommt von uns (recv.update): kein `proxy.resize` zurueck.
+    programmatic: AtomicBool,
+    windowed: Mutex<Option<Windowed>>,
+    /// Zuletzt gemeldeter Fokus (WM_ACTIVATE kommt auch ohne Wechsel, gemeldet wird nur der Wechsel).
+    focused: AtomicBool,
 }
 
 impl Shared {
@@ -55,6 +97,32 @@ impl Shared {
         self.size
             .store(((w as u64) << 32) | h as u64, Ordering::Release);
         self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Vom Empfaenger-Thread: Groesse des zuletzt dekodierten Bildes (fuer die Eingabe-Umrechnung).
+    pub fn set_stream(&self, w: u32, h: u32) {
+        self.stream
+            .store(((w as u64) << 32) | h as u64, Ordering::Release);
+    }
+
+    pub fn stream(&self) -> Option<(u32, u32)> {
+        let v = self.stream.load(Ordering::Acquire);
+        (v != 0).then_some(((v >> 32) as u32, v as u32))
+    }
+
+    fn send_input(&self, v: Value) {
+        self.out.send(&ipc::event(
+            "proxy.input",
+            json!({"tid": self.tid, "input": v}),
+        ));
+    }
+
+    /// Client-Pixel -> Stream-Pixel; vor dem ersten Bild 1:1.
+    fn to_stream(&self, x: i32, y: i32) -> (f64, f64) {
+        match self.stream() {
+            Some(st) => input::to_stream(x as f64, y as f64, self.size(), st),
+            None => (x as f64, y as f64),
+        }
     }
 }
 
@@ -216,6 +284,7 @@ pub struct ProxyWindow {
 }
 
 /// Fenster auf dem Monitor unter dem Mauszeiger erzeugen, `index` versetzt mehrere Fenster.
+#[allow(clippy::too_many_arguments)]
 pub fn create(
     tid: u32,
     title: &str,
@@ -223,6 +292,8 @@ pub fn create(
     h_pt: f64,
     main_thread: u32,
     index: usize,
+    out: Out,
+    fullscreen: bool,
 ) -> Result<ProxyWindow> {
     register_class();
     unsafe {
@@ -240,8 +311,16 @@ pub fn create(
             tid,
             main_thread,
             size: AtomicU64::new(((c.0 as u64) << 32) | c.1 as u64),
+            stream: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             dpi: AtomicU32::new(dpi),
+            out,
+            input: Mutex::new(InputState::default()),
+            resize: Mutex::new(Debounce::default()),
+            // Erzeugen und erstes Anzeigen melden nichts (Python kennt die Groesse aus recv.open).
+            programmatic: AtomicBool::new(true),
+            windowed: Mutex::new(None),
+            focused: AtomicBool::new(false),
         });
         let raw = Arc::into_raw(shared.clone());
         let hinst = GetModuleHandleW(None)?;
@@ -266,6 +345,19 @@ pub fn create(
                 return Err(e);
             }
         };
+        // Doppelklick-Zeit und -Rechteck des Systems fuer den Klickzaehler (`n`).
+        if let Some(s) = shared_of(hwnd) {
+            let mut st = s.input.lock().unwrap();
+            st.dbl_time = Duration::from_millis(GetDoubleClickTime() as u64);
+            st.dbl_slop = (
+                GetSystemMetrics(SM_CXDOUBLECLK) as f64 / 2.0,
+                GetSystemMetrics(SM_CYDOUBLECLK) as f64 / 2.0,
+            );
+        }
+        if fullscreen {
+            // Fuer den Vollbild-Stream (mode "display"): randlos auf dem gewaehlten Monitor.
+            set_fullscreen(hwnd, true, Some(mon));
+        }
         // Sichtbar und oben, aber ohne Aktivierung: kein Fokusklau (Tastatur bleibt beim Nutzer).
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(
@@ -289,6 +381,7 @@ pub fn create(
             };
             let _ = FlashWindowEx(&fi);
         }
+        shared.programmatic.store(false, Ordering::Release);
         Ok(ProxyWindow { hwnd, shared })
     }
 }
@@ -300,8 +393,13 @@ impl ProxyWindow {
         }
     }
 
-    /// Neue Groesse in Punkten (recv.update). Der Inhalt wird nur skaliert (Rueckkanal: C05).
+    /// Neue Groesse in Punkten (recv.update, also die Antwort auf ein `proxy.resize`). Meldet selbst kein
+    /// `proxy.resize`. Im Vollbild bleibt das Fenster, wie es ist (das Bild wird skaliert).
     pub fn resize_points(&self, w_pt: f64, h_pt: f64) {
+        if self.shared.windowed.lock().unwrap().is_some() {
+            return;
+        }
+        self.shared.programmatic.store(true, Ordering::Release);
         unsafe {
             let dpi = GetDpiForWindow(self.hwnd).max(96);
             let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
@@ -316,6 +414,15 @@ impl ProxyWindow {
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+        self.shared.programmatic.store(false, Ordering::Release);
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        self.shared.windowed.lock().unwrap().is_some()
+    }
+
+    pub fn set_fullscreen(&self, on: bool) {
+        set_fullscreen(self.hwnd, on, None);
     }
 
     pub fn destroy(&self) {
@@ -323,6 +430,238 @@ impl ProxyWindow {
             let _ = DestroyWindow(self.hwnd);
         }
     }
+}
+
+/// Randloses Vollbild an/aus. `mon`: Zielmonitor (sonst der des Fensters).
+fn set_fullscreen(hwnd: HWND, on: bool, mon: Option<HMONITOR>) {
+    unsafe {
+        let Some(s) = shared_of(hwnd) else { return };
+        let mut saved = s.windowed.lock().unwrap();
+        if on == saved.is_some() {
+            return;
+        }
+        if on {
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rect);
+            let style = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
+            *saved = Some(Windowed { style, rect });
+            drop(saved);
+            let m = mon.unwrap_or_else(|| MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let _ = GetMonitorInfoW(m, &mut mi);
+            let r = mi.rcMonitor;
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_STYLE,
+                ((style.0 & !WS_OVERLAPPEDWINDOW.0) | WS_POPUP.0) as isize,
+            );
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        } else {
+            let w = saved.take().unwrap();
+            drop(saved);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, w.style.0 as isize);
+            let r = w.rect;
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        eprintln!(
+            "beamer-teleport: tid {} Vollbild {}",
+            s.tid,
+            if on { "an" } else { "aus" }
+        );
+    }
+}
+
+/// `proxy.resize` anbieten (entprellt); `final_` = Ziehen beendet, wartenden Wert sofort senden.
+fn offer_resize(hwnd: HWND, s: &Shared, final_: bool) {
+    let now = Instant::now();
+    let val = ResizeVal {
+        px: s.size(),
+        dpi: s.dpi.load(Ordering::Relaxed).max(1),
+    };
+    let mut d = s.resize.lock().unwrap();
+    let send = if final_ {
+        let r = match d.offer(val, now, Duration::ZERO) {
+            DebounceOut::Send(v) => Some(v),
+            _ => d.flush(now),
+        };
+        unsafe {
+            let _ = KillTimer(Some(hwnd), RESIZE_TIMER);
+        }
+        r
+    } else {
+        match d.offer(val, now, RESIZE_EVERY) {
+            DebounceOut::Send(v) => Some(v),
+            DebounceOut::Later(wait) => {
+                unsafe {
+                    SetTimer(
+                        Some(hwnd),
+                        RESIZE_TIMER,
+                        wait.as_millis().max(1) as u32,
+                        None,
+                    );
+                }
+                None
+            }
+            DebounceOut::Nothing => None,
+        }
+    };
+    drop(d);
+    if let Some(v) = send {
+        send_resize(s, v);
+    }
+}
+
+fn send_resize(s: &Shared, v: ResizeVal) {
+    let (w, h) = input::px_to_points(v.px, v.dpi);
+    // w/h in Punkten (Vertrag); px_w/px_h/dpi als Zusatzfelder (v1.3), damit der Sender so kodieren kann,
+    // dass ein Stream-Pixel ein Bildschirm-Pixel ist.
+    s.out.send(&ipc::event(
+        "proxy.resize",
+        json!({"tid": s.tid, "w": w, "h": h, "px_w": v.px.0, "px_h": v.px.1, "dpi": v.dpi}),
+    ));
+}
+
+fn lparam_xy(lp: LPARAM) -> (i32, i32) {
+    (
+        (lp.0 & 0xffff) as i16 as i32,
+        ((lp.0 >> 16) & 0xffff) as i16 as i32,
+    )
+}
+
+fn key_down(vk: u32) -> bool {
+    unsafe { GetKeyState(vk as i32) < 0 }
+}
+
+/// Zeichen einer Zeichentaste: nur Shift und Feststelltaste zaehlen (wie win_app/capture_win.py),
+/// Strg/Alt nicht. Tote Tasten (Akzente) liefern nichts; ihr Ergebnis kommt als WM_CHAR -> `text`.
+fn key_char(vk: u32, scan: u32) -> Option<String> {
+    unsafe {
+        let mut state = [0u8; 256];
+        if key_down(input::VK_SHIFT) {
+            state[input::VK_SHIFT as usize] = 0x80;
+        }
+        if GetKeyState(VK_CAPITAL.0 as i32) & 1 != 0 {
+            state[VK_CAPITAL.0 as usize] = 0x01;
+        }
+        let mut buf = [0u16; 8];
+        // Flag 4: Tastaturzustand (tote Tasten) nicht veraendern, sonst stoert es das echte WM_CHAR.
+        let n = ToUnicodeEx(vk, scan, &state, &mut buf, 4, Some(GetKeyboardLayout(0)));
+        if n <= 0 {
+            return None;
+        }
+        let s = String::from_utf16(&buf[..n as usize]).ok()?;
+        let mut cs = s.chars();
+        let c = cs.next()?;
+        (cs.next().is_none() && !c.is_control()).then(|| c.to_string())
+    }
+}
+
+fn on_key(hwnd: HWND, s: &Shared, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    let vk = wp.0 as u32;
+    let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    let scan = ((lp.0 >> 16) & 0xff) as u32;
+    let extended = (lp.0 >> 24) & 1 == 1;
+    if vk == input::VK_PROCESSKEY || input::is_system_key(vk) {
+        return None; // IME bzw. Windows-Taste: Windows ueberlassen
+    }
+    // Strg+Alt+Shift+F: Vollbild umschalten, nicht weitergeben.
+    if vk == VK_F
+        && key_down(input::VK_CONTROL)
+        && key_down(input::VK_MENU)
+        && key_down(input::VK_SHIFT)
+    {
+        if down && (lp.0 >> 30) & 1 == 0 {
+            let on = s.windowed.lock().unwrap().is_none();
+            set_fullscreen(hwnd, on, None);
+        }
+        s.input.lock().unwrap().swallow_char = true;
+        return Some(LRESULT(0));
+    }
+    // Alt+F4 schliesst den Proxy (proxy.closed), F4 geht nicht zum Sender.
+    if vk == input::VK_F4 && msg == WM_SYSKEYDOWN {
+        return None;
+    }
+    let svk = input::sided_vk(vk, scan, extended);
+    let name = match input::named_key(svk) {
+        Some(n) => Some(n.to_owned()),
+        None => key_char(vk, scan),
+    };
+    let mut st = s.input.lock().unwrap();
+    if let Some(name) = name {
+        if down && input::named_key(svk).is_none() {
+            st.swallow_char = true;
+        }
+        let ev = st.key(&name, down);
+        drop(st);
+        if let Some(v) = ev {
+            s.send_input(v);
+        }
+    }
+    if msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP {
+        // Alt+Leertaste (Systemmenue) bleibt bei Windows; den Rest nicht an DefWindowProc (kein Menue-Modus).
+        if vk == 0x20 {
+            return None;
+        }
+        return Some(LRESULT(0));
+    }
+    Some(LRESULT(0))
+}
+
+fn on_button(hwnd: HWND, s: &Shared, b: Button, down: bool, lp: LPARAM) {
+    let (x, y) = lparam_xy(lp);
+    let pos = s.to_stream(x, y);
+    let mut st = s.input.lock().unwrap();
+    let ev = st.button(b, down, pos, (x as f64, y as f64), Instant::now());
+    let any = st.any_button();
+    drop(st);
+    unsafe {
+        // Ziehen ueber den Fensterrand hinaus: Maus festhalten, bis alle Buttons oben sind.
+        if down {
+            SetCapture(hwnd);
+        } else if !any {
+            let _ = ReleaseCapture();
+        }
+    }
+    if let Some(v) = ev {
+        s.send_input(v);
+    }
+}
+
+fn on_wheel(hwnd: HWND, s: &Shared, wp: WPARAM, lp: LPARAM, horizontal: bool) {
+    let delta = ((wp.0 >> 16) & 0xffff) as i16 as f64 / WHEEL_DELTA as f64;
+    // Rad-Nachrichten tragen Bildschirmkoordinaten.
+    let (sx, sy) = lparam_xy(lp);
+    let mut pt = POINT { x: sx, y: sy };
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+    }
+    let pos = s.to_stream(pt.x, pt.y);
+    let (dy, dx) = if horizontal {
+        (0.0, delta)
+    } else {
+        (delta, 0.0)
+    };
+    let v = s.input.lock().unwrap().scroll(pos, dy, dx);
+    s.send_input(v);
 }
 
 unsafe fn shared_of(hwnd: HWND) -> Option<&'static Shared> {
@@ -344,6 +683,142 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     let h = ((lp.0 >> 16) & 0xffff) as u32;
                     if w > 0 && h > 0 {
                         s.set_size(w, h);
+                        if wp.0 as u32 != SIZE_MINIMIZED && !s.programmatic.load(Ordering::Acquire)
+                        {
+                            offer_resize(hwnd, s, false);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_EXITSIZEMOVE => {
+                if let Some(s) = shared_of(hwnd) {
+                    offer_resize(hwnd, s, true);
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == RESIZE_TIMER => {
+                let _ = KillTimer(Some(hwnd), RESIZE_TIMER);
+                if let Some(s) = shared_of(hwnd) {
+                    let v = s.resize.lock().unwrap().flush(Instant::now());
+                    if let Some(v) = v {
+                        send_resize(s, v);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                if let Some(s) = shared_of(hwnd) {
+                    let (x, y) = lparam_xy(lp);
+                    let pos = s.to_stream(x, y);
+                    let v = s.input.lock().unwrap().moved(pos);
+                    s.send_input(v);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+            | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                if let Some(s) = shared_of(hwnd) {
+                    let (b, down) = match msg {
+                        WM_LBUTTONDOWN => (Button::Left, true),
+                        WM_LBUTTONUP => (Button::Left, false),
+                        WM_RBUTTONDOWN => (Button::Right, true),
+                        WM_RBUTTONUP => (Button::Right, false),
+                        WM_MBUTTONDOWN => (Button::Middle, true),
+                        WM_MBUTTONUP => (Button::Middle, false),
+                        _ => {
+                            let b = if (wp.0 >> 16) & 0xffff == 1 {
+                                Button::Back
+                            } else {
+                                Button::Forward
+                            };
+                            (b, msg == WM_XBUTTONDOWN)
+                        }
+                    };
+                    on_button(hwnd, s, b, down, lp);
+                }
+                if msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP {
+                    LRESULT(1)
+                } else {
+                    LRESULT(0)
+                }
+            }
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                if let Some(s) = shared_of(hwnd) {
+                    on_wheel(hwnd, s, wp, lp, msg == WM_MOUSEHWHEEL);
+                }
+                LRESULT(0)
+            }
+            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
+                match shared_of(hwnd).and_then(|s| on_key(hwnd, s, msg, wp, lp)) {
+                    Some(r) => r,
+                    None => DefWindowProcW(hwnd, msg, wp, lp),
+                }
+            }
+            WM_CHAR => {
+                if let Some(s) = shared_of(hwnd) {
+                    let v = s.input.lock().unwrap().char_unit(wp.0 as u16);
+                    if let Some(v) = v {
+                        s.send_input(v);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_SYSCHAR => {
+                // Alt+Taste wurde schon als Taste gemeldet; kein Menue-Kuerzel (Piepton). Alt+Leertaste:
+                // Systemmenue bleibt bei Windows.
+                if let Some(s) = shared_of(hwnd) {
+                    s.input.lock().unwrap().swallow_char = false;
+                }
+                if wp.0 == 0x20 {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                } else {
+                    LRESULT(0)
+                }
+            }
+            WM_SYSCOMMAND if (wp.0 & 0xfff0) as u32 == SC_KEYMENU && lp.0 == 0 => {
+                // Alt allein loest sonst den Menue-Modus aus und schluckt die naechsten Tasten.
+                LRESULT(0)
+            }
+            WM_ACTIVATE => {
+                if let Some(s) = shared_of(hwnd) {
+                    let focused = (wp.0 & 0xffff) as u32 != WA_INACTIVE;
+                    if s.focused.swap(focused, Ordering::AcqRel) != focused {
+                        s.out.send(&ipc::event(
+                            "proxy.focus",
+                            json!({"tid": s.tid, "focused": focused}),
+                        ));
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_KILLFOCUS => {
+                // Fokus weg (Alt+Tab, Klick woanders): alles Gedrueckte loslassen, nichts darf haengen.
+                if let Some(s) = shared_of(hwnd) {
+                    let ups = s.input.lock().unwrap().release_all();
+                    for v in ups {
+                        s.send_input(v);
+                    }
+                }
+                let _ = ReleaseCapture();
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_CAPTURECHANGED => {
+                // Maus-Capture verloren (z. B. Fokuswechsel waehrend des Ziehens): Buttons loslassen.
+                if let Some(s) = shared_of(hwnd) {
+                    if HWND(lp.0 as *mut _) != hwnd {
+                        let mut st = s.input.lock().unwrap();
+                        if st.any_button() {
+                            let ups: Vec<Value> = st
+                                .release_all()
+                                .into_iter()
+                                .filter(|v| v["k"] == "up")
+                                .collect();
+                            drop(st);
+                            for v in ups {
+                                s.send_input(v);
+                            }
+                        }
                     }
                 }
                 LRESULT(0)
@@ -362,6 +837,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     r.bottom - r.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
+                // Monitor mit anderer DPI: Python erfaehrt die neue Pixelgroesse (Punkte bleiben gleich).
+                if let Some(s) = shared_of(hwnd) {
+                    offer_resize(hwnd, s, true);
+                }
                 LRESULT(0)
             }
             WM_PAINT => {

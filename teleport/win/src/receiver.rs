@@ -392,6 +392,8 @@ fn handle_frame(f: FrameIn, st: &mut State, cfg: &Config, shared: &Shared) {
         }
     };
     st.waiting_key = false;
+    // Fuer die Umrechnung der Eingabe (Client- -> Stream-Pixel) im Fenster.
+    cfg.win.set_stream(d.size().0, d.size().1);
     let mut w = shared.stats.lock().unwrap();
     w.decode_ms.push((t1 - t0).as_secs_f64() * 1000.0);
     // Ein noch nicht gezeigtes aelteres Bild wird ersetzt: nach einem Schwung (WLAN-Aussetzer)
