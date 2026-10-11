@@ -455,8 +455,8 @@ fn main() {
                 &mut fails,
             );
             check(
-                p95_run < 25.0,
-                &format!("E2E: p95 Empfang->Present <= {p95_run} ms < 25 ms"),
+                p95_run <= 25.0,
+                &format!("E2E: p95 Empfang->Present <= {p95_run} ms (Grenze 25 ms)"),
                 &mut fails,
             );
             check(

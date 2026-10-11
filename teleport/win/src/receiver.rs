@@ -18,9 +18,11 @@ use crate::ipc::Codec;
 use crate::stats;
 use crate::window::Shared as WinShared;
 
-/// Ab so vielen wartenden Frames holt der Empfaenger auf: er springt zum neuesten Keyframe in der
-/// Warteschlange bzw. verwirft alles und fordert einen an (Latenz vor Vollstaendigkeit).
-pub const MAX_BACKLOG: usize = 6;
+/// Ab so vielen wartenden Frames (1 s bei 60 fps) holt der Empfaenger auf: er springt zum neuesten
+/// Keyframe in der Warteschlange bzw. verwirft alles und fordert einen an. Kleinere Schwuenge nach
+/// WLAN-Aussetzern (gemessen 7-10 Frames) werden vollstaendig dekodiert (~0,6 ms je Frame); gezeigt wird
+/// dank Jitter-Puffer nur das neueste. Frueher 6: das verwarf solche Schwuenge und kostete je einen Keyframe.
+pub const MAX_BACKLOG: usize = 60;
 
 pub struct FrameIn {
     pub data: Vec<u8>,
