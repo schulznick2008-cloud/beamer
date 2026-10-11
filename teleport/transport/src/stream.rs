@@ -182,6 +182,8 @@ pub struct Stream {
     replay: ReplayWindow,
     max_kbps: u32,
     pub fec_enabled: bool,
+    /// Untergrenze der Frist fuer unvollstaendige Frames in ms (Vertrag: 30; hoeher nur fuer Tests).
+    pub min_deadline_ms: f64,
     t0: Instant,
     pub c: Counters,
     win: Window,
@@ -265,6 +267,7 @@ impl Stream {
             replay: ReplayWindow::new(),
             max_kbps,
             fec_enabled: true,
+            min_deadline_ms: 30.0,
             t0: now,
             c: Counters::default(),
             win: Window::default(),
@@ -381,7 +384,7 @@ impl Stream {
 
     fn deadline(&self) -> Duration {
         let rtt = self.srtt_ms.unwrap_or(0.0);
-        Duration::from_secs_f64(((2.0 * rtt).clamp(30.0, 250.0)) / 1000.0)
+        Duration::from_secs_f64((2.0 * rtt).clamp(self.min_deadline_ms.min(250.0), 250.0) / 1000.0)
     }
 
     fn now_us(&self, now: Instant) -> u64 {

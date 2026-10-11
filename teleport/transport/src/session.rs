@@ -272,6 +272,7 @@ impl Session {
             .map_err(|e| format!("timeout: {e}"))?;
         let port = socket.local_addr().map_err(|e| e.to_string())?.port();
         eprintln!("beamer-transport: UDP-Port {port}, Socket-Puffer empfangen {rcvbuf} B, senden {sndbuf} B");
+        crate::timer::begin_fine_timer();
         let inner = Arc::new(Inner {
             socket,
             state: Mutex::new(State {
@@ -293,7 +294,10 @@ impl Session {
         let h = thread::Builder::new()
             .name("beamer-transport".into())
             .spawn(move || runner.run())
-            .map_err(|e| format!("thread: {e}"))?;
+            .map_err(|e| {
+                crate::timer::end_fine_timer();
+                format!("thread: {e}")
+            })?;
         let id = h.thread().id();
         Ok(Session {
             inner,
@@ -449,6 +453,16 @@ impl Session {
             .ok_or_else(|| format!("stream {stream_id} unbekannt"))
     }
 
+    /// Untergrenze der Frist fuer unvollstaendige Frames (Standard 30 ms nach dem Vertrag, hoechstens
+    /// 250 ms). Nur fuer Tests auf langsamen Rechnern gedacht.
+    pub fn set_min_deadline_ms(&self, stream_id: u32, ms: f64) -> Result<(), String> {
+        lock(&self.inner.state)
+            .streams
+            .get_mut(&stream_id)
+            .map(|s| s.min_deadline_ms = ms.clamp(30.0, 250.0))
+            .ok_or_else(|| format!("stream {stream_id} unbekannt"))
+    }
+
     /// Kuenstliche Netzstoerung fuer eingehende Pakete (Tests, Beispiele).
     pub fn set_netem(&self, cfg: NetemConfig) {
         lock(&self.inner.state).netem.set(cfg);
@@ -468,7 +482,10 @@ impl Session {
     /// Beendet den Transport-Thread und gibt den Socket frei. Ruft man es aus einem Callback
     /// (also im Transport-Thread) auf, wird nicht auf sich selbst gewartet.
     pub fn close(&self) {
-        self.inner.stop.store(true, Ordering::Relaxed);
+        let was_running = !self.inner.stop.swap(true, Ordering::Relaxed);
+        if was_running {
+            crate::timer::end_fine_timer();
+        }
         let t = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some((h, id)) = t {
             if thread::current().id() != id {

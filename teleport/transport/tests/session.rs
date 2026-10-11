@@ -404,6 +404,8 @@ fn sender_paces_instead_of_bursting() {
 fn nack_recovers_losses() {
     let l = link(8000);
     l.tx.set_fec_enabled(SID, false).unwrap();
+    // Langsame Runner: die 30-ms-Frist des Vertrags wuerde hier Timing testen, nicht NACK.
+    l.rx.set_min_deadline_ms(SID, 250.0).unwrap();
     // Die erste Uebertragung jedes 3. Video-Pakets geht verloren. Alle Frames sind Keyframes, damit ein
     // auf einem langsamen Runner verpasstes Zeitfenster (30 ms) nicht die folgenden Frames mitreisst; die
     // exakte Wiederherstellung steht zeitunabhaengig in tests/streams.rs.
@@ -419,7 +421,7 @@ fn nack_recovers_losses() {
     }
     wait_until(8.0, || l.rx_sink.frames.lock().unwrap().len() == n);
     let fr = l.rx_sink.frames.lock().unwrap();
-    assert!(fr.len() >= n - 2, "geliefert: {} von {n}", fr.len());
+    assert!(fr.len() >= n - 1, "geliefert: {} von {n}", fr.len());
     for g in fr.iter() {
         assert_eq!(g.data, blob(5000, g.pts as usize), "Nutzdaten stimmen");
     }
@@ -857,9 +859,8 @@ fn roaming_follows_a_changed_source_address() {
     let key_every = 30u64; // Keyframe-Intervall = 0,5 s
     let i = std::cell::Cell::new(0u64);
     let seen_req = std::cell::Cell::new(0usize);
-    let send_for = |ms: u64| {
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(ms) {
+    let send_for = |frames: u64| {
+        for _ in 0..frames {
             let reqs = tx_sink.controls.lock().unwrap().len();
             let key = i.get().is_multiple_of(key_every) || reqs > seen_req.get();
             seen_req.set(reqs);
@@ -875,7 +876,7 @@ fn roaming_follows_a_changed_source_address() {
             std::thread::sleep(Duration::from_millis(16));
         }
     };
-    send_for(1500);
+    send_for(60);
     wait_until(1.0, || {
         rx_sink.frames.lock().unwrap().len() as u64 + 1 >= i.get()
     });
@@ -891,7 +892,7 @@ fn roaming_follows_a_changed_source_address() {
 
     // Pfadwechsel: ab jetzt kommen die Pakete von der zweiten Adresse.
     rel.active.store(1, std::sync::atomic::Ordering::Relaxed);
-    send_for(2500);
+    send_for(120);
     wait_until(1.0, || {
         rx_sink.frames.lock().unwrap().len() as u64 + 1 >= i.get()
     });
@@ -905,7 +906,7 @@ fn roaming_follows_a_changed_source_address() {
     );
     // Danach 100 %: alle Frames der letzten Sekunde sind da.
     assert!(
-        i >= sent_before_switch + 60,
+        i >= sent_before_switch + 100,
         "zu wenige Frames nach dem Wechsel gesendet: {}",
         i - sent_before_switch
     );

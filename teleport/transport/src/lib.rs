@@ -9,6 +9,7 @@ pub mod packet;
 pub mod replay;
 pub mod session;
 pub mod stream;
+mod timer;
 
 pub use netem::NetemConfig;
 pub use session::{Callbacks, FrameRef, Session, SessionCounters, StreamKeys};
