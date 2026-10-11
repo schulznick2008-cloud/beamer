@@ -1,4 +1,4 @@
-# Beamer-Teleport – Schnittstellen-Verträge (v1)
+# Beamer-Teleport – Schnittstellen-Verträge (v1.1)
 
 Verbindlich für alle Beteiligten (Claude Code und Cursor). Liegt im Fork unter
 `docs/teleport/SCHNITTSTELLEN.md`. Änderungen nur per PR mit dem Label `vertrag`, und beide Seiten
@@ -6,6 +6,8 @@ passen dann an. Unklarheiten nicht selbst auflösen, sondern im PR als Frage mel
 
 Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zeiten sind in µs
 (monotone Uhr des Senders).
+
+Änderungen: v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5.
 
 ## 0. Begriffe und Komponenten
 
@@ -37,7 +39,7 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 |---|---|---|---|
 | `hello` | `beamer_version` | `helper_version`, `platform` (`mac`/`win`), `caps` (Liste aus `send_window`,`send_display`,`recv`,`inject`,`audio`) | beide |
 | `transport.open` | `local_port` (0 = beliebig), `peer_host`, `peer_port` (0 = später) | `local_port` | beide |
-| `transport.peer` | `peer_host`, `peer_port` | – | beide |
+| `transport.peer` | `peer_host`, `peer_port` | – (darf bei laufenden Streams kommen, siehe §7) | beide |
 | `transport.close` | – | – | beide |
 | `windows.list` | – | `windows`: `[{wid,pid,app,title,x,y,w,h,display,scale}]` (x..h in Punkten bzw. logischen Pixeln) | Sender |
 | `send.start` | `tid`, `mode` (`window`/`display`), `wid` oder `display`, `codec` (`hevc`/`h264`), `max_fps`, `bitrate_kbps`, `keys` (siehe 4.2), `virtual_display` (bool) | `width`, `height` (Stream-Pixel), `scale` | Sender |
@@ -45,6 +47,7 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 | `send.resize` | `tid`, `w`, `h` (Punkte) | `width`, `height` | Sender |
 | `send.activate` | `tid` | – | Sender |
 | `send.keyframe` | `tid` | – | Sender |
+| `send.bitrate` | `tid`, `bitrate_kbps` | – (neue Obergrenze, siehe §7) | Sender |
 | `inject` | `tid`, `input` (siehe 3) | – | Sender |
 | `recv.open` | `tid`, `title`, `app`, `icon_png` (b64, optional), `w`, `h` (Punkte), `scale`, `codec`, `fullscreen` (bool), `keys` | – | Empfänger |
 | `recv.update` | `tid`, optional `title`, `w`, `h` | – | Empfänger |
@@ -113,6 +116,7 @@ Offset Größe Feld (Header = AAD, unverschlüsselt)
 - Nonce (12 B) = `prefix_dir` (4 B) ‖ `seq` (8 B, Big-Endian). AAD = die 16 Header-Bytes.
 - Ein Paket ist höchstens **1200 Byte** groß, inklusive Header und Tag.
 - Replay-Schutz: Fenster von 4096 seq-Werten, Duplikate und zu alte Pakete werden verworfen. Pakete, die die Authentifizierung nicht bestehen, werden still verworfen und gezählt.
+- Roaming: Die Gegenstelle ist an `stream_id` und Schlüssel gebunden, nicht an die IP. Kommt ein Paket von einer neuen Quelladresse, das die Authentifizierung besteht, kein Replay ist und dessen `seq` größer ist als jede bisher gesehene dieses Streams, übernimmt der Transport diese Adresse als Ziel für alle Streams der Session.
 - Medien laufen vom Sender zum Empfänger (Richtung `s2r`). `nack`, `keyframe_req`, `feedback`, `ping` und `pong` laufen in Gegenrichtung (`r2s`), `pong` als Antwort auch `s2r`.
 
 Klartext je Typ:
@@ -138,7 +142,7 @@ Python leitet die Schlüssel ab. Die Helfer bekommen nur fertige Schlüssel, im 
 
 Ableitung (Python, `core/teleport_keys.py`, HKDF-SHA256 wie `protocol.hkdf_sha256`):
 - `T` = `link_info(key_id, prefix_i, prefix_r, share_i, share_r, 1)` ohne das führende `b"beamer-frames"` und ohne das letzte Richtungs-Byte. Das ist das Handshake-Transkript des aktuellen Links.
-- `master = HKDF(ikm = link_ikm(token, shared), salt = b"beamer-teleport-v1", info = b"tp-master" + T)`. Wird beim Link-Aufbau einmal berechnet und gehalten. `shared` wird danach verworfen. Daraus folgt: Fällt der Link weg, enden alle Teleports.
+- `master = HKDF(ikm = link_ikm(token, shared), salt = b"beamer-teleport-v1", info = b"tp-master" + T)`. Wird beim Link-Aufbau einmal berechnet und gehalten. `shared` wird danach verworfen. Daraus folgt: Fällt der Link weg, enden alle Teleports. Ausnahme: ein Pfadwechsel nach §7 (neuer Link steht innerhalb von 5 s). Laufende Teleports behalten dann ihre Schlüssel. Neue Teleports nutzen den Master des neuen Links.
 - Pro Teleport, mit `salt16` aus `tp_offer` und `sid = tid` als u32 BE:
   - `s2r_key = HKDF(master, salt16 + sid, b"tp-key-s2r")`
   - `r2s_key = HKDF(master, salt16 + sid, b"tp-key-r2s")`
@@ -168,13 +172,16 @@ int        bt_send_frame(BtSession *, uint32_t stream_id, uint8_t kind, const ui
                          uint64_t pts_us, uint8_t fflags);               // fragmentiert, FEC, Puffer
 int        bt_request_keyframe(BtSession *, uint32_t stream_id);
 uint32_t   bt_target_kbps(const BtSession *, uint32_t stream_id);       // für den Encoder
+int        bt_set_max_kbps(BtSession *, uint32_t stream_id, uint32_t max_kbps); // v1.1, §7
 void       bt_close(BtSession *);
 const char*bt_last_error(void);                                         // thread-lokal
 ```
 
 - Rückgabe 0 bedeutet OK, <0 einen Fehler.
 - Die Callbacks kommen aus einem Transport-Thread. Der Aufrufer muss sie schnell verarbeiten (in eine Queue legen).
-- Ein Socket pro Session, beliebig viele Streams.
+- Ein Socket pro Session, beliebig viele Streams. Der Socket ist an `0.0.0.0` gebunden (alle Interfaces), damit derselbe Port über Kabel und WLAN erreichbar ist.
+- `bt_set_peer` darf jederzeit kommen, auch bei laufenden Streams. Es wirkt sofort, `seq`, Schlüssel und Puffer laufen weiter. Danach schickt der Transport sofort ein `ping` (Empfänger) bzw. das nächste Paket (Sender) an die neue Adresse.
+- Die Stats-JSON enthält zusätzlich `peer` (`"ip:port"`).
 
 ## 6. Repo-Struktur und Branches
 
@@ -190,3 +197,52 @@ tools/teleport/       Test-/Demo-Skripte
 - Integrations-Branch: `teleport`. Upstream-`main` bleibt unverändert, damit Upstream-Releases sauber gemergt werden können.
 - Arbeits-Branches: `claude/NN-kurzname` bzw. `cursor/kurzname`. PR immer nach `teleport`. **Kein Force-Push, kein Rebase von gepushten Commits, kein Push auf `main` oder `teleport` direkt.**
 - Lizenz: Der Fork bleibt GPL-3.0. Erlaubt sind nur GPL-3-kompatible Abhängigkeiten (MIT, BSD, Apache-2.0, MPL-2.0, ISC, Zlib, LGPL, GPL-2.0-or-later, GPL-3.0). **Verboten** sind AGPL, proprietäre Teile, SSPL und „source-available“. Neue Abhängigkeiten kommen mit Lizenz in `docs/teleport/DEPENDENCIES.md`.
+
+## 7. Pfadwahl / Kabel (v1.1)
+
+Ziel: Steckt ein direktes LAN-Kabel zwischen Mac (USB-C-LAN-Adapter) und PC, laufen Beamer-Link und Medienstrom darüber. Ohne Kabel läuft alles über WLAN. Der Wechsel geschieht im laufenden Stream, ohne dass ein Teleport endet.
+
+**Pfade**
+- `cable`: Ethernet direkt Mac↔PC. Adressen entweder Link-Local `169.254.0.0/16` (ohne Konfiguration) oder feste IPs im Netz `teleport.cable_subnet` (Einstellung, Standard `192.168.77.0/24`, Mac `.1`, PC `.2`, ohne Gateway).
+- `wlan`: Heimnetz über die Fritzbox (auch wenn der PC per Kabel an der Fritzbox hängt).
+- VPN, Tunnel, `/31` und `/32` werden ignoriert, wie in `core/pairing.py` (`_interfaces()`).
+
+**Erkennung (Python, `core/teleport_path.py`)**
+- Ein Interface ist Kabel-Kandidat, wenn es up ist, eine Broadcast-Adresse hat und seine IPv4-Adresse in `169.254/16` oder in `cable_subnet` liegt.
+- Als Kabel gilt es erst, wenn die Gegenstelle darüber antwortet (Probe, siehe unten). Grund: Windows vergibt `169.254` auch an ein WLAN ohne DHCP.
+- Interfaces werden alle 2 s neu gelesen und zusätzlich bei Netzwechsel-Ereignissen des Systems, falls vorhanden.
+
+**Discovery**
+- Das Beacon des PCs geht schon heute an jedes Interface, auch an `169.254/16` (`broadcast_targets`). Der Mac sammelt pro Peer-ID alle Absenderadressen als Kandidaten: `{addr, path, last_seen, rtt_ms}`.
+- Probe: TCP-Connect auf 24820 an jeden Kandidaten, alle 2 s, ohne Handshake. RTT ist die Zeit bis zum Connect.
+- Kandidaten mit `cable` werden mit fester IP auch ohne Beacon direkt geprüft (Gegenstelle `.1`↔`.2`).
+
+**Wahl und Hysterese**
+- Bester Pfad: `cable`, wenn die letzten 2 Proben erfolgreich waren. Sonst `wlan`.
+- Wechsel auf `cable` nach 2 erfolgreichen Proben in Folge. Wechsel weg von `cable` sofort bei Link-down des Interfaces, bei 2 verlorenen Proben oder wenn 1 s lang kein Medienpaket über Kabel kam (Stats).
+- Die Einstellung `teleport.path` kann `auto` (Standard), `cable` oder `wlan` sein. Bei `cable` gibt es keinen Rückfall, nur eine Warnung.
+
+**Steuerkanal (Beamer-Link, TCP 24820)**
+- Der Link läuft über den besten Pfad. Beim Wechsel: neuen Link zur neuen Adresse aufbauen (normales `hello`/`welcome`, gleiche Kopplung), erst danach auf ihn umschalten und den alten schließen (make-before-break).
+- Laufende Teleports bleiben bestehen (§4.2, Ausnahme). Ihr `tid` gilt weiter. `tp_*`-Nachrichten gehen ab dem Umschalten über den neuen Link.
+- Steht nach 5 s kein Link, enden alle Teleports mit `tp_close` `reason:"error"`.
+
+**Medienstrom (UDP)**
+- Bei jedem Pfadwechsel schickt Python beiden Helfern `transport.peer` mit der neuen Adresse. Der UDP-Port bleibt gleich (Socket an `0.0.0.0`).
+- Kommt `transport.peer` zu spät oder geht verloren, greift das Roaming (§4.1): Das erste gültige, authentifizierte Paket von der neuen Adresse stellt das Ziel um.
+- Ziel: Einstecken des Kabels ohne sichtbare Unterbrechung. Ziehen des Kabels höchstens 1 s Aussetzer, danach ein Keyframe.
+
+**Bitrate**
+- Obergrenze `bitrate_kbps` je Pfad: `wlan` 40 000, `cable` 150 000 (Einstellungen `teleport.max_kbps_wlan` / `teleport.max_kbps_cable`).
+- Beim Wechsel schickt Python dem Sender `send.bitrate`. Der Helfer ruft `bt_set_max_kbps` und stellt den Encoder um.
+- Wechsel auf `cable`: Zielbitrate springt sofort auf 50 % der neuen Obergrenze, danach normal +5 %/s. Wechsel auf `wlan`: Zielbitrate sofort auf höchstens die WLAN-Obergrenze.
+- Paketgröße bleibt bei 1200 Byte (keine Jumbo-Frames), FEC und NACK bleiben an.
+
+**Sicherheit und Windows**
+- Der Kabelpfad bringt kein neues Vertrauen mit. Link und Medien sind genauso gekoppelt und verschlüsselt. Roaming folgt nur Paketen, die die Authentifizierung bestehen und kein Replay sind.
+- Windows stuft das Kabelnetz als „Nicht identifiziertes Netzwerk“ (Öffentlich) ein. Entweder das Netzwerkprofil auf „Privat“ stellen oder die Beamer-Firewallregel auch für „Öffentlich“, beschränkt auf die Remote-Adressen `169.254.0.0/16` und `cable_subnet`, zulassen.
+
+**Tests (Abnahme)**
+- Transport: Loopback mit zwei lokalen Adressen (z. B. `127.0.0.1` und `127.0.0.2`). Während eines Streams wechselt die Quelladresse, es geht kein Frame über einen Keyframe hinaus verloren. Ein manipuliertes oder wiederholtes Paket von einer fremden Adresse ändert das Ziel nicht.
+- Python: Pfadwahl mit gefälschten Interfaces und Proben (Einstecken, Ziehen, Flattern), Make-before-break des Links mit einem Fake-Peer.
+- Gerät: B8 aus `M0-TEST.md` plus Kabel ziehen und stecken während eines Teleports.
