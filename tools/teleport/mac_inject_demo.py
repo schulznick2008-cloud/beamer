@@ -76,6 +76,13 @@ class Helper:
         r["_ms"] = (time.time() - t0) * 1000
         return r
 
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=3)
+        except Exception:
+            self.p.kill()
+
     def events_named(self, name, since=0.0):
         with self.cv:
             return [e for e in self.events if e.get("ev") == name and e["_at"] >= since]

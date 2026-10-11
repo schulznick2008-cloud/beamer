@@ -383,13 +383,20 @@ public final class SenderEngine: TeleportBackend {
         guard let c = c else { return }
         if let vd = c.virtual {
             if let wid = c.windowID { CrashRestore.unregister(windowID: wid) }
+            ScreenCaptureSource.clearScaleHint(forDisplay: vd.displayID)
+            // Erst den Monitor entfernen, dann das Fenster zurueckstellen: Solange der kleine virtuelle Monitor noch
+            // existiert, kappt macOS die Fenstergroesse an seinem Rand.
+            vd.destroy()
             if let wid = c.windowID, let pid = c.pid, let f = c.restoreFrame, windowFrameProvider(wid) != nil {
-                _ = try? runBounded(timeout: 1.0, "Fenster zurueckschieben") {
-                    try self.windowController.setFrame(windowID: wid, pid: pid, origin: f.origin, size: f.size)
+                for attempt in 0..<2 {
+                    Thread.sleep(forTimeInterval: attempt == 0 ? 0.2 : 0.1)
+                    _ = try? runBounded(timeout: 1.0, "Fenster zurueckschieben") {
+                        try self.windowController.setFrame(windowID: wid, pid: pid, origin: f.origin, size: f.size)
+                    }
+                    if let now = windowFrameProvider(wid), abs(now.width - f.width) <= 2, abs(now.height - f.height) <= 2,
+                       abs(now.minX - f.minX) <= 2, abs(now.minY - f.minY) <= 2 { break }
                 }
             }
-            ScreenCaptureSource.clearScaleHint(forDisplay: vd.displayID)
-            vd.destroy()
         }
         injector.releaseAll(at: nil)
         sleepGuard.release()
