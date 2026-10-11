@@ -1,4 +1,4 @@
-# Beamer-Teleport – Schnittstellen-Verträge (v1.1)
+# Beamer-Teleport – Schnittstellen-Verträge (v1.4)
 
 Verbindlich für alle Beteiligten (Claude Code und Cursor). Liegt im Fork unter
 `docs/teleport/SCHNITTSTELLEN.md`. Änderungen nur per PR mit dem Label `vertrag`, und beide Seiten
@@ -7,7 +7,7 @@ passen dann an. Unklarheiten nicht selbst auflösen, sondern im PR als Frage mel
 Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zeiten sind in µs
 (monotone Uhr des Senders).
 
-Änderungen: v1.3 – §1: optionale Zusatzfelder in `hello` und `stats` zugelassen (z. B. `low_power`, `encoder_slow`), Python-seitige Ereignisse wie `helper_restarted` abgegrenzt; §4.2: Einmal-Regel für `salt16`/`tid` und Testvektoren nur für Python. v1.2 – §4.1 Frame-Frist bei unvollständigen Frames: `2×RTT + 4×Jitter`, mindestens 60 ms (statt 30 ms), Maximum 250 ms unverändert. v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
+Änderungen: v1.4 – §3: Vorzeichen und Einheit von `scroll` wie Beamer, gehaltene Tasten nur ein `down` (Wiederholung macht der Sender), AltGr-Zeichen als `text`, System-Kürzel (Windows-Taste, Alt+Tab, Strg+Alt+Entf) werden nicht weitergeleitet; §1.2: `proxy.resize` mit optionalen `px_w`/`px_h`/`dpi` und Pixel-Regel (1 Stream-Pixel = 1 Bildschirm-Pixel). v1.3 – §1: optionale Zusatzfelder in `hello` und `stats` zugelassen (z. B. `low_power`, `encoder_slow`), Python-seitige Ereignisse wie `helper_restarted` abgegrenzt; §4.2: Einmal-Regel für `salt16`/`tid` und Testvektoren nur für Python. v1.2 – §4.1 Frame-Frist bei unvollständigen Frames: `2×RTT + 4×Jitter`, mindestens 60 ms (statt 30 ms), Maximum 250 ms unverändert. v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
 
 ## 0. Begriffe und Komponenten
 
@@ -60,7 +60,7 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 |---|---|---|
 | `proxy.input` | `tid`, `input` (siehe 3) | Eingabe im Proxy-Fenster, die Python an den Sender weiterleitet |
 | `proxy.focus` | `tid`, `focused` | Proxy hat den Fokus bekommen oder verloren |
-| `proxy.resize` | `tid`, `w`, `h` | Nutzer hat die Proxy-Größe geändert (Punkte) |
+| `proxy.resize` | `tid`, `w`, `h`, optional `px_w`, `px_h`, `dpi` | Nutzer hat die Proxy-Größe geändert (`w`/`h` in Punkten, `px_w`/`px_h` in Bildschirm-Pixeln der Client-Fläche, `dpi` des Monitors; Pixel-Regel siehe unten) |
 | `proxy.closed` | `tid` | Nutzer hat den Proxy geschlossen (bedeutet: zurückholen) |
 | `send.gone` | `tid`, `reason` | Fenster geschlossen bzw. Capture beendet |
 | `send.size` | `tid`, `width`, `height`, `scale` | Stream-Größe hat sich geändert |
@@ -68,6 +68,7 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 | `error` | `code`, `msg`, optional `tid` | asynchroner Fehler |
 
 - Zusatzfelder (v1.3): Helfer dürfen in Antworten und Ereignissen weitere Felder melden; Python ignoriert unbekannte Felder und verlässt sich nur auf die Felder dieser Tabelle. Dokumentiert werden Zusatzfelder in der README des Helfers (`teleport/mac/README.md`: u. a. `encoder_slow`, `effective_fps`, `low_power`, `backlog_drops`; `teleport/win/README.md`: u. a. `recv_to_present_ms`, `frames_presented`, `dropped_*`). Wird Python von einem Zusatzfeld abhängig (z. B. Codec-Wahl nach `low_power`/`encoder_slow`), wandert es zuerst per Vertrags-PR in diese Tabelle.
+- Pixel-Regel für `proxy.resize` (v1.4): Ziel ist **1 Stream-Pixel = 1 Bildschirm-Pixel** auf dem Empfänger. Meldet der Proxy `px_w`/`px_h`, rechnet Python daraus die Sendegröße: `send.resize` mit `w = round(px_w / s)`, `h = round(px_h / s)`, wobei `s` der `scale` des Senders aus der letzten `send.start`-Antwort bzw. `send.size` ist. Fehlen `px_w`/`px_h`, gilt `px = w × dpi / 96` (Windows) bzw. `px = w × scale` des Empfängers. Der Windows-Proxy meldet `w`/`h` = Client-Pixel × 96 / `dpi`. Weicht die Streamgröße danach leicht ab (Encoder-Ausrichtung, Mindest- oder Höchstgröße), skaliert der Proxy ohne Verzerrung (Letterbox). Ein Monitorwechsel mit anderer DPI löst ein `proxy.resize` aus; die Antwort `recv.update` löst keines aus.
 - Python-seitige Ereignisse: `core/teleport_ipc.py` erzeugt selbst `helper_restarted` (`code` = Exit-Code; Helfer nach Absturz neu gestartet, alle Transporte und Streams sind weg und müssen mit **neuen** Schlüsseln neu geöffnet werden) und `error`/`bad_request` bei unlesbaren Zeilen. Sie kommen nie vom Helfer und gehören nicht zum IPC-Draht.
 
 ## 2. Beamer-Link: neue Nachrichten (Python ↔ Python, über den bestehenden verschlüsselten TCP-Link)
@@ -98,9 +99,13 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 ```
 
 - `b`: `left`/`right`/`middle`/`back`/`forward`. `n`: Klickzahl (1/2/3). `unit`: `line` oder `px`.
+- `scroll` (v1.4) wie Beamer (`core/protocol.py` `scroll_msg`, `win_app/capture_win.py` `wheel_notches`, `win_app/input_injector.py`): `dy` positiv = vom Nutzer weg (Rad nach vorn, Inhalt nach oben), `dx` positiv = nach rechts. `unit:"line"`: Rastungen, 1.0 = eine Rastung (`WHEEL_DELTA` 120 unter Windows), Bruchteile erlaubt. `unit:"px"`: Pixel (Trackpad). Die Seite, die erfasst, meldet das Rad roh; Bildlaufrichtung und -tempo stellt nur Python nach Beamers Einstellungen um, kein Helfer.
 - `key`: **Beamer-Tastennamen**, also dieselben Namen wie bei `keydown`/`keyup` in `core/protocol.py` und `core/keytable.py`. Die Modifier-Umsetzung Cmd↔Strg macht **Python** nach Beamers Tastatur-Einstellung, bevor `inject` an den Helfer geht. Der Helfer spielt die Namen 1:1 ein.
 - Der Sender rechnet Stream-Pixel in Bildschirmkoordinaten des echten bzw. virtuellen Monitors um. Liegt eine Eingabe außerhalb des Bildes, wird sie verworfen.
 - Vor `down`, `key` und `text` aktiviert der Sender das Fenster, falls es nicht vorne ist.
+- Gehaltene Tasten (v1.4): Der Proxy meldet **ein** `down` und beim Loslassen ein `up`, keine Auto-Repeat-`down`s. Die Wiederholung erzeugt der Sender selbst nach der Wiederholverzögerung und -rate seines Systems, solange kein `up` kam. Bei Fokusverlust des Proxys, `send.stop` oder Ende des Teleports endet jede Wiederholung (der Proxy schickt zuvor die `up`s).
+- AltGr (v1.4): Zeichen, die über AltGr entstehen (z. B. AltGr+Q auf deutschem Layout), gehen als `text` („@“). Das AltGr-Paar selbst (unter Windows rechtes Alt mit dem künstlichen linken Strg) wird nicht als `key` gemeldet. Auf Layouts ohne AltGr bleibt rechtes Alt `alt_r`.
+- Nicht weitergeleitet (v1.4): System-Kürzel bleiben beim Empfänger-System und erzeugen kein `proxy.input`. Unter Windows: Windows-Taste (allein und mit anderen Tasten), Alt+Tab, Strg+Alt+Entf, Alt+Leertaste; Alt+F4 schließt den Proxy (`proxy.closed`). Strg+Alt+Shift+F schaltet im Proxy das Vollbild um und geht ebenfalls nicht zum Sender.
 
 ## 4. UDP-Medienstrom
 
