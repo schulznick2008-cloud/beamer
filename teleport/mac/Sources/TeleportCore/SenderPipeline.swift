@@ -21,6 +21,11 @@ public final class SenderPipeline {
     private let makeEncoder: EncoderFactory
     private let lowPower: () -> Bool
     private let queue = DispatchQueue(label: "teleport.pipeline")
+    /// Alle ScreenCaptureKit-Abfragen (Zustand, Groesse, Bildrate) laufen hier, nie auf der Pipeline-Queue:
+    /// Kehrt ein Aufruf nicht zurueck, steht nur diese Queue, der Strom und `stop` laufen weiter.
+    private let sckQueue = DispatchQueue(label: "teleport.pipeline.sck")
+    private var refreshRunning = false
+    private var lastRefresh: (state: String, resized: Bool) = ("ok", false)
     private var timer: DispatchSourceTimer?
 
     private let lock = NSLock()
@@ -90,7 +95,13 @@ public final class SenderPipeline {
         if was { return }
         timer?.cancel()
         timer = nil
-        source.stop()
+        // Hoechstens ~1,2 s auf die Quelle warten; kehrt `stop` nicht zurueck, laeuft es im Hintergrund weiter.
+        let src = source
+        do {
+            try runBounded(timeout: 1.2, "Capture stop") { src.stop() }
+        } catch {
+            logErr("teleport: \(error); Quelle wird im Hintergrund weiter angehalten")
+        }
         enc?.retire()
     }
 
@@ -243,7 +254,12 @@ public final class SenderPipeline {
 
         // Zustand (geschlossen / minimiert) und Fenstergroesse einmal pro Sekunde neu lesen. Aendert sich die
         // Groesse, wird der Encoder mit dem ersten Bild neuer Groesse neu angelegt und `send.size` gemeldet.
-        let (state, resized) = source.refresh()
+        // Die Abfrage selbst laeuft asynchron auf `sckQueue`; hier gilt das Ergebnis der vorigen Runde.
+        scheduleRefresh()
+        lock.lock()
+        let (state, resized) = lastRefresh
+        lastRefresh.resized = false
+        lock.unlock()
         if state == "gone" {
             lock.lock()
             let sent = goneSent
@@ -266,6 +282,21 @@ public final class SenderPipeline {
 
         adaptFrameRate()
         emitStats(state: state, effectiveKbps: eff)
+    }
+
+    private func scheduleRefresh() {
+        lock.lock()
+        if refreshRunning || stopped { lock.unlock(); return }
+        refreshRunning = true
+        lock.unlock()
+        sckQueue.async { [weak self] in
+            guard let self = self else { return }
+            let r = self.source.refresh()
+            self.lock.lock()
+            self.lastRefresh = (r.state, self.lastRefresh.resized || r.sizeChanged)
+            self.refreshRunning = false
+            self.lock.unlock()
+        }
     }
 
     /// Steckt ein Frame laenger als 0,6 s im Encoder, ohne dass irgendein Frame fertig wird, hat VideoToolbox
@@ -317,7 +348,8 @@ public final class SenderPipeline {
         let enc = encoder
         lock.unlock()
         if changed {
-            source.setMaxFps(newFps)
+            let src = source
+            sckQueue.async { src.setMaxFps(newFps) }
             enc?.setFrameRate(newFps)
         }
     }

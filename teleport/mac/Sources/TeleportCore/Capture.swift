@@ -4,6 +4,31 @@ import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
+/// Zeitlimits fuer ScreenCaptureKit-Aufrufe (Sekunden). Unter Last kehren sie manchmal nie zurueck.
+enum SCKTimeouts {
+    static let query = 2.5     // SCShareableContent (je Versuch, zwei Versuche)
+    static let start = 3.5     // startCapture (je Versuch, zwei Versuche)
+    static let stop = 1.0      // stopCapture
+    static let update = 1.0    // updateConfiguration
+}
+
+/// `SCShareableContent` mit einem zweiten Versuch: Die Abfrage dauert normal ~60 ms; kehrt sie nicht zurueck (unter
+/// Last, mit mehreren Helfern), hilft meist ein neuer Aufruf.
+func queryContent() throws -> SCShareableContent {
+    var last: Error?
+    for attempt in 1...2 {
+        do {
+            return try runBlockingLocked(timeout: SCKTimeouts.query, "SCShareableContent") {
+                try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+            }
+        } catch let t as BlockingTimeout {
+            last = t
+            logErr("teleport: \(t) (Versuch \(attempt) von 2)")
+        }
+    }
+    throw last!
+}
+
 /// Quelle der Pixelbilder (ScreenCaptureKit oder, fuer Selbsttests, ein Muster-Erzeuger).
 public protocol FrameSource: AnyObject {
     func start(onFrame: @escaping (CVPixelBuffer, CMTime) -> Void, onStop: @escaping (String) -> Void) throws
@@ -36,24 +61,20 @@ enum CapturePermission {
 
     /// Ein Fehler aus ScreenCaptureKit, der "nicht freigegeben" bedeutet?
     static func mapped(_ error: Error) -> IPCError {
+        if let t = error as? BlockingTimeout {
+            return IPCError(.busy, "ScreenCaptureKit antwortet nicht (\(t.label), \(Int(t.seconds)) s). Der Mac ist wohl ueberlastet; spaeter erneut versuchen.")
+        }
         let ns = error as NSError
+        if ns.domain == SCStreamErrorDomain, ns.code == SCStreamError.userDeclined.rawValue,
+           CGPreflightScreenCaptureAccess() {
+            // Die Freigabe ist da, ScreenCaptureKit meldet sie unter Last trotzdem manchmal als verweigert.
+            return IPCError(.busy, "ScreenCaptureKit meldet kurzzeitig \"nicht freigegeben\", obwohl die Freigabe vorhanden ist (Mac ueberlastet?). Spaeter erneut versuchen.")
+        }
         if ns.domain == SCStreamErrorDomain, ns.code == SCStreamError.userDeclined.rawValue {
             return IPCError(.permission, "Bildschirmaufnahme nicht freigegeben (SCStreamError.userDeclined). In den Systemeinstellungen unter Datenschutz & Sicherheit freigeben.")
         }
         return IPCError(.internalError, "ScreenCaptureKit: \(error.localizedDescription)")
     }
-}
-
-/// Blockiert einen Hintergrund-Thread, bis die async-Aufgabe fertig ist (nie auf dem Hauptthread aufrufen).
-func runBlocking<T>(_ work: @escaping () async throws -> T) throws -> T {
-    let sem = DispatchSemaphore(value: 0)
-    var result: Result<T, Error>?
-    Task.detached {
-        do { result = .success(try await work()) } catch { result = .failure(error) }
-        sem.signal()
-    }
-    sem.wait()
-    return try result!.get()
 }
 
 /// Welche Fenster Teleport-Kandidaten sind. Unsichtbare System-Hilfsfenster (Service-Prozesse, leere
@@ -76,9 +97,7 @@ public enum WindowCatalog {
         try CapturePermission.check()
         let content: SCShareableContent
         do {
-            content = try runBlocking {
-                try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
-            }
+            content = try queryContent()
         } catch {
             throw CapturePermission.mapped(error)
         }
@@ -157,9 +176,7 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         try CapturePermission.check()
         let content: SCShareableContent
         do {
-            content = try runBlocking {
-                try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
-            }
+            content = try queryContent()
         } catch {
             throw CapturePermission.mapped(error)
         }
@@ -171,6 +188,10 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
             }
             filter = SCContentFilter(desktopIndependentWindow: w)
         case .display(let id):
+            if content.displays.isEmpty {
+                // Unter Last liefert ScreenCaptureKit manchmal eine leere Liste: kein Fehler des Aufrufers.
+                throw IPCError(.busy, "ScreenCaptureKit liefert keine Bildschirme (Mac ueberlastet?). Spaeter erneut versuchen.")
+            }
             guard let d = content.displays.first(where: { $0.displayID == id }) ?? (id == 0 ? content.displays.first : nil) else {
                 throw IPCError(.notFound, "Bildschirm \(id) nicht gefunden")
             }
@@ -201,25 +222,42 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
     }
 
     public func start(onFrame: @escaping (CVPixelBuffer, CMTime) -> Void, onStop: @escaping (String) -> Void) throws {
-        guard let s = stream else { throw IPCError(.internalError, "Capture nicht vorbereitet") }
+        guard stream != nil else { throw IPCError(.internalError, "Capture nicht vorbereitet") }
         self.onFrame = onFrame
         self.onStop = onStop
-        do {
-            try runBlocking { try await s.startCapture() }
-        } catch {
-            throw CapturePermission.mapped(error)
+        // Zwei Versuche: Starten mehrere Helfer gleichzeitig, bleibt oft ein startCapture haengen, waehrend ein
+        // frischer Stream kurz danach klappt (nacheinander gestartet geht es immer).
+        for attempt in 1...2 {
+            guard let s = stream else { throw IPCError(.internalError, "Capture nicht vorbereitet") }
+            do {
+                try runBlockingLocked(timeout: SCKTimeouts.start, "startCapture") { try await s.startCapture() }
+                return
+            } catch let t as BlockingTimeout {
+                logErr("teleport: \(t) (Versuch \(attempt) von 2)")
+                // Der Stream ist in unbekanntem Zustand: verwerfen und im Hintergrund anhalten.
+                stream = nil
+                Task.detached { try? await s.stopCapture() }
+                if attempt == 2 {
+                    self.onFrame = nil
+                    throw CapturePermission.mapped(t)
+                }
+                try prepare() // frischer Filter und Stream
+                self.onFrame = onFrame
+            } catch {
+                throw CapturePermission.mapped(error)
+            }
         }
     }
 
     public func setMaxFps(_ fps: Int) {
         guard let cfg = config, let s = stream, fps > 0 else { return }
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        _ = try? runBlocking { try await s.updateConfiguration(cfg) }
+        _ = try? runBlocking(timeout: SCKTimeouts.update, "updateConfiguration") { try await s.updateConfiguration(cfg) }
     }
 
     public func refresh() -> (state: String, sizeChanged: Bool) {
         guard case .window(let id) = mode, let cfg = config, let s = stream else { return (state, false) }
-        guard let content = try? runBlocking({
+        guard let content = try? runBlockingLocked(timeout: SCKTimeouts.query, "SCShareableContent (refresh)", {
             try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         }) else { return (state, false) }
         guard let win = content.windows.first(where: { $0.windowID == id }) else {
@@ -237,7 +275,7 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         cfg.width = w
         cfg.height = h
         do {
-            try runBlocking { try await s.updateConfiguration(cfg) }
+            try runBlocking(timeout: SCKTimeouts.update, "updateConfiguration") { try await s.updateConfiguration(cfg) }
         } catch {
             return (state, false)
         }
@@ -255,7 +293,14 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         let s = stream
         stream = nil
         onFrame = nil
-        if let s = s { _ = try? runBlocking { try await s.stopCapture() } }
+        // Kehrt stopCapture nicht zurueck (Last), wird der Stream trotzdem verworfen: nach 1 s ist aufgeraeumt.
+        if let s = s {
+            do {
+                try runBlocking(timeout: SCKTimeouts.stop, "stopCapture") { try await s.stopCapture() }
+            } catch let t as BlockingTimeout {
+                logErr("teleport: \(t); Stream wird verworfen")
+            } catch {}
+        }
     }
 
     // MARK: SCStreamOutput / SCStreamDelegate
