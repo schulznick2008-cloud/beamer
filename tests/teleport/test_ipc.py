@@ -50,7 +50,13 @@ def test_events_stats_and_send_gone():
     h.start()
     hello(h, "test")
     h.request("send.start", tid=7, mode="window", wid=1, codec="hevc", max_fps=30, bitrate_kbps=8000)
-    evs = h.pop_events()
+    evs: list = []
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        evs.extend(h.pop_events())
+        if any(e.get("ev") == "stats" and e.get("tid") == 7 for e in evs):
+            break
+        time.sleep(0.02)
     assert any(e.get("ev") == "stats" and e.get("tid") == 7 for e in evs)
 
     h.request("emit.gone", tid=7)
@@ -144,6 +150,29 @@ def test_unicode_window_title_roundtrip():
     hello(h, "test")
     wl = h.request("windows.list")
     assert wl["windows"][0]["title"] == "Fenster – Übersicht"
+    h.stop()
+
+
+def test_race_reply_at_timeout_does_not_leave_orphan_in_replies():
+    h = TeleportHelper(
+        TeleportHelperConfig(
+            executable=[sys.executable, FAKE],
+            extra_args=[],
+            env={
+                "BEAMER_FAKE_HELPER_MODE": "race",
+                "BEAMER_FAKE_HELPER_RACE_CMD": "transport.open",
+                "BEAMER_FAKE_HELPER_RACE_DELAY": "0.3",
+            },
+            restart_on_crash=False,
+        )
+    )
+    h.start()
+    hello(h, "test")
+    with pytest.raises(TeleportIPCTimeout):
+        h.request("transport.open", timeout=0.05)
+    time.sleep(0.4)
+    r = h.request("hello", beamer_version="nach-race", timeout=2.0)
+    assert r["ok"] is True
     h.stop()
 
 
