@@ -38,12 +38,17 @@ fn copy_dlls(from: &Path, to: &Path) {
         let p = e.path();
         if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll")) {
             let dst = to.join(p.file_name().unwrap());
-            let fresh = std::fs::metadata(&dst)
-                .and_then(|m| m.modified())
-                .ok()
-                .zip(e.metadata().and_then(|m| m.modified()).ok())
-                .is_some_and(|(d, s)| d >= s);
-            if !fresh {
+            // Gleich, wenn Groesse und Zeitstempel uebereinstimmen (fs::copy uebernimmt den
+            // Zeitstempel). Ein anderer FFmpeg-Build darf aelter sein als die alte Kopie.
+            let same = match (std::fs::metadata(&dst), e.metadata()) {
+                (Ok(d), Ok(s)) => {
+                    d.len() == s.len()
+                        && d.modified().ok().is_some()
+                        && d.modified().ok() == s.modified().ok()
+                }
+                _ => false,
+            };
+            if !same {
                 let _ = std::fs::copy(&p, &dst);
             }
         }
