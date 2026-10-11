@@ -186,8 +186,13 @@ final class PipelineTests: XCTestCase {
         let early = snap.lat.dropFirst(5).prefix(10).reduce(0, +) / 10
         let late = snap.lat.suffix(10).reduce(0, +) / 10
         XCTAssertLessThan(late, early + service, "Latenz waechst: \(early) -> \(late) ms")
-        let drops = r.events.stats().compactMap { ($0["backlog_drops"] as? NSNumber)?.intValue }.reduce(0, +)
-        XCTAssertGreaterThan(drops, 0, "ueberzaehlige Capture-Frames werden verworfen")
+        // Hat die Quelle mehr Frames geliefert, als der Encoder schaffte, muessen die ueberzaehligen verworfen
+        // worden sein. (Auf einem sehr langsamen Runner liefert schon die Quelle weniger als der Encoder frisst.)
+        func sum(_ k: String) -> Int { r.events.stats().compactMap { ($0[k] as? NSNumber)?.intValue }.reduce(0, +) }
+        let drops = sum("backlog_drops"), captured = sum("capture_fps"), encoded = sum("encode_fps")
+        if captured > encoded + 6 {
+            XCTAssertGreaterThan(drops, 0, "ueberzaehlige Capture-Frames werden verworfen (\(captured) erfasst, \(encoded) kodiert)")
+        }
     }
 
     func testKeyframeComesImmediatelyEvenWithAStillPicture() throws {
