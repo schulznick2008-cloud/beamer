@@ -7,7 +7,7 @@ passen dann an. Unklarheiten nicht selbst auflösen, sondern im PR als Frage mel
 Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zeiten sind in µs
 (monotone Uhr des Senders).
 
-Änderungen: v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
+Änderungen: v1.2 – §4.1 Frame-Frist bei unvollständigen Frames: `2×RTT + 4×Jitter`, mindestens 60 ms (statt 30 ms), Maximum 250 ms unverändert. v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
 
 ## 0. Begriffe und Komponenten
 
@@ -128,7 +128,7 @@ Klartext je Typ:
 - **ping/pong**: `t_us` u64 (pong spiegelt das t_us des pings).
 
 Verhalten:
-- Der Empfänger schickt bei Lücken einen NACK. Ist ein Frame nach 2 × RTT (mindestens 30 ms, höchstens 250 ms, gerechnet ab dem letzten Paket des Frames) noch unvollständig, wird er verworfen und ein `keyframe_req` geschickt (höchstens alle 300 ms).
+- Der Empfänger schickt bei Lücken einen NACK. Ist ein Frame nach 2 × RTT + 4 × Jitter (mindestens 60 ms, höchstens 250 ms, gerechnet ab dem letzten Paket des Frames) noch unvollständig, wird er verworfen und ein `keyframe_req` geschickt (höchstens alle 300 ms).
 - Der Sender hält einen Puffer zum erneuten Senden von 300 ms.
 - Bitratenregelung (Sender, v1.1/C01a): Zielbitrate um 15 % pro Sekunde senken bei **Restverlust** `loss_permille` > 10 (1 %), bei **Rohverlust** `raw_loss_permille` > 80 (8 %, Notbremse) oder bei steigendem Jitter (zwei Anstiege in Folge um je ≥ 15 % und ≥ 2 ms). Sonst um 5 % pro Sekunde anheben, bis zur Obergrenze (`bitrate_kbps`, `bt_set_max_kbps`). Untergrenze: Obergrenze/20, mindestens 200 kbit/s. Grund: FEC und NACK heilen Verluste unterhalb dieser Schwellen, eine Drosselung nach Rohverlust würde nur Qualität kosten.
 - Pacing (Sender): Token-Bucket mit 1,5 × Zielbitrate, Burst höchstens 64 KB; Wiederholungen und Steuerpakete laufen durch denselben Bucket. Die Sendewarteschlange ist zeitlich begrenzt: Liegt die Wartezeit der bereits wartenden Pakete bei aktueller Bucket-Rate über 150 ms, lehnt `bt_send_frame` mit einem Fehler ab (der Encoder soll das Frame auslassen); darunter wird auch ein einzelnes großes Keyframe angenommen.
