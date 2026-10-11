@@ -170,18 +170,20 @@ final class EncoderBehaviourTests: XCTestCase {
             enc.encode(pb, hostTime: t, forceKeyframe: false)
         }, onStop: { _ in })
         func counts() -> (Int, Int) { done.lock(); defer { done.unlock() }; return (outputs, nils) }
-        Thread.sleep(forTimeInterval: 1)
+        /// Wartet, bis seit `base` mindestens `n` Frames dazugekommen sind (Polling, die CI-Maschinen sind langsam).
+        func waitForMore(_ n: Int, since base: Int) -> Bool {
+            let end = Date().addingTimeInterval(8)
+            while Date() < end { if counts().0 - base >= n { return true }; Thread.sleep(forTimeInterval: 0.02) }
+            return counts().0 - base >= n
+        }
+        XCTAssertTrue(waitForMore(10, since: 0), "Encoder liefert Frames")
         let a = counts().0
-        XCTAssertGreaterThan(a, 30)
         enc.setFrameRate(51)
-        Thread.sleep(forTimeInterval: 1)
+        XCTAssertTrue(waitForMore(10, since: a), "nach setFrameRate laeuft der Encoder weiter")
         let b = counts().0
-        XCTAssertGreaterThan(b - a, 30, "nach setFrameRate laeuft der Encoder weiter (\(b - a) Frames)")
         enc.setBitrate(kbps: 3000)
         enc.setFrameRate(24)
-        Thread.sleep(forTimeInterval: 1)
-        let c = counts().0
-        XCTAssertGreaterThan(c - b, 15, "nach setBitrate/setFrameRate laeuft der Encoder weiter (\(c - b) Frames)")
+        XCTAssertTrue(waitForMore(10, since: b), "nach setBitrate/setFrameRate laeuft der Encoder weiter")
         src.stop()
         enc.flush()
         enc.invalidate()

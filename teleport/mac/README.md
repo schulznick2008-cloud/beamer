@@ -23,7 +23,7 @@ Helfer startet (Systemeinstellungen > Datenschutz & Sicherheit). Ohne Freigabe a
 | `Sources/CBeamerTransport` | C-Target; `include/beamer_transport.h` ist ein Symlink auf `../transport/include` |
 | `Sources/TeleportCore` | `IPC` (JSON, Zeilen), `Dispatcher` (Befehle), `SenderEngine`/`SenderPipeline` (Strom), `Capture` (ScreenCaptureKit), `VideoEncoder` (VideoToolbox), `AnnexB`, `Transport` (Swift-Hülle der C-ABI), Selbsttests |
 | `Sources/BeamerTeleport` | `main.swift`: Argumente, IPC-Schleife |
-| `Tests/TeleportCoreTests` | 46 Tests (Hardware-Encoder-Tests werden ohne Hardware übersprungen; die Pipeline-Tests laufen mit einer Attrappe als langsamem Encoder und brauchen keine) |
+| `Tests/TeleportCoreTests` | 45 Tests (Hardware-Encoder-Tests werden ohne Hardware übersprungen; die Pipeline-Tests laufen mit einer Attrappe als langsamem Encoder und brauchen keine) |
 
 ## IPC (Helfer-Seite)
 

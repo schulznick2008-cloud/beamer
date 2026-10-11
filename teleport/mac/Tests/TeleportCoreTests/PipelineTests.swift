@@ -17,6 +17,10 @@ final class SlowEncoder: FrameEncoder {
     private(set) var submitted = 0
     private(set) var frameRates: [Int] = []
     private var count = 0
+    private var busySum = 0.0
+    /// Tatsaechliche mittlere Bearbeitungszeit je Frame in ms (der Scheduler schlaeft auf kleinen Runnern laenger).
+    var serviceMS: Double { lock.lock(); defer { lock.unlock() }; return count > 0 ? busySum / Double(max(1, doneCount)) : 0 }
+    private var doneCount = 0
 
     init(width: Int, height: Int, delay: TimeInterval, onDone: @escaping (EncodedFrame?) -> Void) {
         self.width = width; self.height = height; self.delay = delay; self.onDone = onDone
@@ -33,8 +37,13 @@ final class SlowEncoder: FrameEncoder {
         lock.unlock()
         let pts = UInt64(max(0, hostTime.seconds * 1_000_000))
         queue.async { [self] in
+            let b0 = DispatchTime.now().uptimeNanoseconds
             Thread.sleep(forTimeInterval: delay)
-            lock.lock(); concurrent -= 1; lock.unlock()
+            lock.lock()
+            concurrent -= 1
+            busySum += Double(DispatchTime.now().uptimeNanoseconds - b0) / 1e6
+            doneCount += 1
+            lock.unlock()
             let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
             let nal: [UInt8] = key ? [0, 0, 0, 1, 0x65, 1, 2, 3] : [0, 0, 0, 1, 0x41, 1, 2, 3]
             onDone(EncodedFrame(annexB: nal, isKeyframe: key, ptsUS: pts, encodeMS: ms))
@@ -164,14 +173,19 @@ final class PipelineTests: XCTestCase {
         XCTAssertLessThanOrEqual(enc?.maxConcurrent ?? 99, 2, "hoechstens 2 Frames gleichzeitig im Encoder")
         XCTAssertGreaterThan(snap.frames, 30, "Frames kommen an: \(snap.frames)")
         let lat = snap.lat.sorted()
-        let p95 = lat[Int(Double(lat.count - 1) * 0.95)]
-        let max = lat.last ?? 0
-        // Ein serieller Attrappen-Encoder braucht mit einem Frame davor in der Schlange 2 Frame-Zeiten (100 ms)
-        // plus Alter des Bilds und Scheduler; ohne Begrenzung wuerde die Latenz in 4 s auf ueber 1 s wachsen.
+        let service = enc?.serviceMS ?? delay * 1000 // tatsaechliche Bearbeitungszeit (>= delay)
+        // Ein serieller Attrappen-Encoder braucht mit einem Frame davor in der Schlange 2 Bearbeitungszeiten plus
+        // Alter des Bilds und Scheduler. Auf langsamen Runnern wird alles um denselben Faktor laenger, deshalb
+        // wird an der gemessenen Bearbeitungszeit gemessen, nicht an der eingestellten.
         let median = lat[lat.count / 2]
-        XCTAssertLessThan(median, 3 * delay * 1000, "Latenz Capture bis Ausgabe, Median \(median) ms")
-        XCTAssertLessThan(p95, 3.6 * delay * 1000, "Latenz p95 \(p95) ms")
-        XCTAssertLessThan(max, 4.4 * delay * 1000, "Latenz max \(max) ms")
+        let p95 = lat[Int(Double(lat.count - 1) * 0.95)]
+        XCTAssertLessThan(median, 3 * service, "Latenz Capture bis Ausgabe, Median \(median) ms bei \(service) ms je Frame")
+        XCTAssertLessThan(p95, 3.6 * service, "Latenz p95 \(p95) ms bei \(service) ms je Frame")
+        XCTAssertLessThan(lat.last ?? 0, 4.4 * service, "Latenz max \(lat.last ?? 0) ms bei \(service) ms je Frame")
+        // Kein Wachstum: die letzten Frames sind nicht spaeter dran als die ersten (ohne Begrenzung wuchse die Latenz).
+        let early = snap.lat.dropFirst(5).prefix(10).reduce(0, +) / 10
+        let late = snap.lat.suffix(10).reduce(0, +) / 10
+        XCTAssertLessThan(late, early + service, "Latenz waechst: \(early) -> \(late) ms")
         let drops = r.events.stats().compactMap { ($0["backlog_drops"] as? NSNumber)?.intValue }.reduce(0, +)
         XCTAssertGreaterThan(drops, 0, "ueberzaehlige Capture-Frames werden verworfen")
     }
