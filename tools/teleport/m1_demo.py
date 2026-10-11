@@ -148,23 +148,33 @@ def run_pc(
     key_session: TeleportKeySession,
     stats: StatsSnapshot,
     on_restart: Optional[Any] = None,
+    local_port: int = 0,
+    salt_override: Optional[str] = None,
 ) -> None:
-    salt_hex = session.get("salt16_hex")
-    if not salt_hex:
-        salt_hex = _fresh_salt16().hex()
-        session["salt16_hex"] = salt_hex
+    # Pro Lauf immer ein frisches salt16 (nie aus einer alten Session-Datei uebernehmen: gleiche
+    # Schluessel mit neu beginnendem seq waeren Nonce-Wiederverwendung, SCHNITTSTELLEN.md 4.2).
+    salt_hex = salt_override or _fresh_salt16().hex()
+    session["salt16_hex"] = salt_hex
     salt16 = bytes.fromhex(salt_hex)
     keys = _keys_for_run(key_session, salt16, tid)
 
     hello(helper, "m1-demo")
+    # Peer-Port 0: der Empfaenger lernt die Gegenstelle aus dem ersten authentifizierten Paket
+    # (Roaming, 4.1/7); NACK/Feedback (r2s) gehen danach an diese Adresse.
     peer_port = int(session.get("peer_udp_port") or 0)
-    tr = helper.request("transport.open", local_port=0, peer_host=peer_host, peer_port=peer_port)
+    tr = helper.request("transport.open", local_port=local_port, peer_host=peer_host, peer_port=peer_port)
     if not tr.get("ok"):
         raise TeleportIPCError(f"transport.open: {tr}")
     local_port = int(tr["local_port"])
     session["pc_udp_port"] = local_port
     session["tid"] = tid
     _save_session(session_path, session)
+    print(
+        "PC bereit. Auf dem Mac jetzt starten:\n"
+        f"  python3 tools/teleport/m1_demo.py --role mac --peer <PC-IP>:{local_port} "
+        f"--salt-hex {salt_hex} --tid {tid} --codec {codec} --seconds <s> --app <App>",
+        flush=True,
+    )
 
     recv = helper.request(
         "recv.open",
@@ -236,7 +246,10 @@ def run_mac(
     stats: StatsSnapshot,
     app_hint: Optional[str],
     on_restart: Optional[Any] = None,
+    salt_override: Optional[str] = None,
 ) -> None:
+    if salt_override:
+        session["salt16_hex"] = salt_override
     hello(helper, "m1-demo")
     tr = helper.request_retry_busy(
         "transport.open", tries=5, delay=0.4, local_port=0, peer_host=peer_host, peer_port=peer_port
@@ -458,7 +471,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--session", type=Path, default=Path("m1_demo_session.json"))
     ap.add_argument("--helper", help="Pfad zum lokalen Helfer-Binary")
     ap.add_argument("--app", help="Teilstring App-Name (nur mac)")
-    ap.add_argument("--master-hex", help="32-Byte-Master hex (Default: vectors.json)")
+    ap.add_argument("--master-hex", help="32-Byte-Master hex (Default: vectors.json, NUR LABOR)")
+    ap.add_argument("--salt-hex", help="salt16 (32 Hex-Zeichen) vom PC-Lauf; der PC gibt die fertige Mac-Zeile aus")
+    ap.add_argument("--local-port", type=int, default=None, help="UDP-Port des lokalen Helfers (PC-Default 47001, Mac 0)")
     ap.add_argument("--selftest-fake", action="store_true", help="Zwei Fake-Helfer lokal (CI)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
@@ -482,6 +497,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         master_hex = _load_vectors_master().hex()
         session["master_hex"] = master_hex
         _save_session(args.session, session)
+    if master_hex == _load_vectors_master().hex():
+        print(
+            "WARNUNG: Master aus docs/teleport/vectors.json (oeffentliche Testvektoren). "
+            "Nur fuer M1 im Labor, NIE in Produktion; ab E5 kommt der Master aus dem Beamer-Link.",
+            file=sys.stderr,
+            flush=True,
+        )
+    if args.salt_hex and len(bytes.fromhex(args.salt_hex)) != 16:
+        ap.error("--salt-hex braucht 32 Hex-Zeichen (16 Byte)")
     key_session = TeleportKeySession(bytes.fromhex(master_hex))
     session["tid"] = args.tid
 
@@ -510,9 +534,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 key_session,
                 stats,
                 on_restart=pc_restart,
+                local_port=47001 if args.local_port is None else args.local_port,
+                salt_override=args.salt_hex,
             )
             print_summary(stats, None, {"role": "pc", "session": str(args.session)})
         else:
+            if not args.salt_hex and not session.get("salt16_hex"):
+                ap.error("--salt-hex fehlt (steht in der Ausgabe des PC-Laufs)")
             if peer_port == 0:
                 peer_port = int(_wait_session_key(args.session, "pc_udp_port"))
 
@@ -544,6 +572,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 stats,
                 args.app,
                 on_restart=mac_restart,
+                salt_override=args.salt_hex,
             )
             print_summary(None, stats, {"role": "mac", "session": str(args.session)})
     finally:

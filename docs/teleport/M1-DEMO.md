@@ -4,52 +4,50 @@ Kurztest: ein Mac-Fenster per UDP an den Windows-Empfänger-Helfer streamen. Ste
 `tools/teleport/m1_demo.py` und die Helfer-IPC (§1). Schlüssel kommen aus `core/teleport_keys`
 (frisches `salt16` je Lauf, kein `StreamKeys.testOnly`).
 
-**Reihenfolge:** zuerst **PC (Empfänger)**, dann **Mac (Sender)**. Beide teilen sich eine
-Session-Datei (`m1_demo_session.json`).
+**Reihenfolge:** zuerst **PC (Empfänger)**, dann **Mac (Sender)**. Der PC öffnet UDP **47001**
+(feste Portnummer, passend zur Firewall-Regel) und erzeugt pro Lauf ein frisches `salt16`. Er gibt
+die fertige Mac-Befehlszeile mit `--salt-hex` aus; die Session-Datei muss **nicht** zwischen den Geräten
+geteilt werden.
+
+> **Achtung, nur Labor:** Ohne `--master-hex` nimmt das Skript den Master aus
+> `docs/teleport/vectors.json`. Diese Testvektoren sind öffentlich; das ist für M1 im eigenen Netz
+> in Ordnung, aber **nie in Produktion**. Ab E5 kommt der Master aus dem Beamer-Link (§4.2).
 
 ## Voraussetzungen
 
-- Mac: `teleport/mac` gebaut → `teleport/mac/.build/release/BeamerTeleport`
-- PC: `teleport/win` gebaut → `teleport/win/target/release/beamer-teleport.exe`
-- Python 3.12+, Repo-Root als Arbeitsverzeichnis
-- Bildschirmaufnahme auf dem Mac erlaubt
+- Mac: `teleport/mac/build.sh` → `teleport/mac/.build/release/BeamerTeleport`; Bildschirmaufnahme für
+  Terminal erlaubt.
+- PC: `teleport\win` gebaut (`scripts\fetch-ffmpeg.ps1`, `cargo build --release`) →
+  `teleport\win\target\release\beamer-teleport.exe`; Firewall lässt UDP 47001 bzw. das Programm durch.
+- Python 3.10+ auf beiden Seiten, Repo-Root als Arbeitsverzeichnis.
 
-## Session-Datei
+## Peer und Rückkanal
 
-Die Datei enthält u. a. `master_hex` (32 Byte, Default aus `docs/teleport/vectors.json` für
-Labore; in Produktion später aus dem Beamer-Link), `salt16_hex`, `pc_udp_port`, `mac_udp_port`,
-`tid`. Nach `helper_restarted` erzeugt das Skript ein neues `salt16` und öffnet Transport/Stream
-neu.
+Der PC öffnet den Transport mit Peer-Port 0. Der Empfänger lernt die Adresse des Macs aus dem ersten
+authentifizierten Paket (Roaming, §4.1/§7); NACK, Feedback und `keyframe_req` (r2s) gehen danach dorthin.
+Ein `transport.peer` nach `mac_udp_port` ist deshalb nicht nötig.
 
-## PC (PowerShell)
-
-Im Repo-Root, Session-Datei z. B. auf dem Desktop:
+## PC (PowerShell, im Repo-Root)
 
 ```powershell
-cd C:\Pfad\zum\beamer
-$session = "$env:USERPROFILE\Desktop\m1_demo_session.json"
-python tools/teleport/m1_demo.py --role pc --peer 192.168.1.50:0 --session $session --codec hevc --seconds 30
+python tools/teleport/m1_demo.py --role pc --peer <MAC-IP>:0 --codec h264 --seconds 120
 ```
 
-`192.168.1.50` = IP des **Macs** (Gegenstelle für `transport.peer`). Port `0` bis der Mac
-gestartet ist; danach nutzt der PC `mac_udp_port` aus der Session, sobald vorhanden.
+Die Ausgabe enthält eine Zeile `python3 tools/teleport/m1_demo.py --role mac --peer <PC-IP>:47001 --salt-hex …`.
 
-## Mac (Terminal)
+## Mac (Terminal, im Repo-Root)
 
-Gleiche Session-Datei (per SMB/USB kopieren oder gemeinsamer Pfad):
+Die Zeile vom PC übernehmen, `<PC-IP>`, `<s>` und `<App>` ersetzen, z. B.:
 
 ```bash
-cd /Pfad/zum/beamer
-python3 tools/teleport/m1_demo.py --role mac --peer 192.168.1.2:0 --session ~/Desktop/m1_demo_session.json --codec hevc --seconds 30 --app TextEdit
+python3 tools/teleport/m1_demo.py --role mac --peer 192.168.178.176:47001 --salt-hex <vom PC> --tid 1 --codec h264 --seconds 60 --app TextEdit
 ```
 
-`192.168.1.2` = IP des **PCs**. Port `0`: das Skript wartet auf `pc_udp_port` in der Session.
+Pro Lauf neu starten (neues `salt16`). Startet ein Helfer nach einem Absturz neu (`helper_restarted`),
+erzeugt diese Seite ein neues `salt16`; die Gegenseite kennt es nicht, der Stream bricht ab. Dann beide
+Seiten neu starten (in M1 so gewollt; ab E5 handeln die Seiten das über `tp_*` aus).
 
-Optional eigenes Master (hex, 64 Zeichen):
-
-```bash
-python3 tools/teleport/m1_demo.py --role mac --master-hex <64-hex-zeichen> ...
-```
+Die Zusammenfassung zeigt pro Lauf nur die lokale Rolle (PC: Empfangswerte, Mac: Senderwerte).
 
 ## Ausgabe
 
