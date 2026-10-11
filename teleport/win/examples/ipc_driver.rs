@@ -7,6 +7,16 @@
 //! Optionen: --streams 1|2  --secs <s>  --fps <n>  --size BxH  --codec h264|hevc  --port <udp>
 //!           --encoder <name>  --keep (Fenster am Ende offen lassen, bis Enter)
 //!           --loss <%> (kuenstlicher Paketverlust im Empfaenger: Erholung per Keyframe pruefen)
+//!           --netem "loss=1,delay=5,jitter=3,stall=40,stall_every=1500" (Stoerung im Empfaenger, WLAN-artig)
+//!           --present-all (Vergleich: Jitter-Puffer aus, jedes Bild blockierend zeigen)
+//!           --dump (stats je Sekunde ausgeben)
+//!
+//! E2E mit dem Mac-Sender (C02): `--external` startet keinen eigenen Sender, oeffnet tid 1 mit den
+//! Testschluesseln aus `tools/teleport/send_demo.py` und `transport.open` auf `--port` mit leerem Peer
+//! (Roaming lernt den Mac aus dem ersten authentifizierten Paket). Gemessen wird ab dem ersten Bild
+//! `--secs` Sekunden lang; danach Abnahmewerte 03a (fps >= 57, verworfen < 0,5 %, p95 < 25 ms).
+//!
+//!   ipc_driver.exe --external --codec hevc --secs 60 --port 47001
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -15,13 +25,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use beamer_teleport_win::selftest::test_keys;
+use beamer_teleport_win::selftest::{mac_test_keys, test_keys};
 use beamer_teleport_win::window::init_process_dpi;
 use serde_json::{json, Value};
 use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetClientRect, PostMessageW, WM_CLOSE};
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, GetClientRect, GetForegroundWindow, IsWindowVisible, PostMessageW, WM_CLOSE,
+};
 
 struct Opts {
     streams: u32,
@@ -33,6 +45,10 @@ struct Opts {
     encoder: Option<String>,
     keep: bool,
     loss: f64,
+    netem: Option<String>,
+    present_all: bool,
+    dump: bool,
+    external: bool,
 }
 
 fn parse() -> Opts {
@@ -46,6 +62,10 @@ fn parse() -> Opts {
         encoder: None,
         keep: false,
         loss: 0.0,
+        netem: None,
+        present_all: false,
+        dump: false,
+        external: false,
     };
     let a: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -60,6 +80,23 @@ fn parse() -> Opts {
             "--port" => o.port = v.parse().expect("port"),
             "--encoder" => o.encoder = Some(v),
             "--loss" => o.loss = v.parse().expect("loss"),
+            "--netem" => o.netem = Some(v),
+            "--external" => {
+                o.external = true;
+                o.streams = 1;
+                i += 1;
+                continue;
+            }
+            "--dump" => {
+                o.dump = true;
+                i += 1;
+                continue;
+            }
+            "--present-all" => {
+                o.present_all = true;
+                i += 1;
+                continue;
+            }
             "--keep" => {
                 o.keep = true;
                 i += 1;
@@ -95,15 +132,16 @@ struct Helper {
 }
 
 impl Helper {
-    fn start(loss: f64) -> Helper {
-        let mut child = Command::new(exe())
-            .args([
-                "--ipc",
-                "stdio",
-                "--same-clock",
-                "--test-loss",
-                &loss.to_string(),
-            ])
+    fn start(netem: Option<&str>, present_all: bool) -> Helper {
+        let mut cmd = Command::new(exe());
+        cmd.args(["--ipc", "stdio", "--same-clock"]);
+        if present_all {
+            cmd.arg("--test-present-all");
+        }
+        if let Some(n) = netem {
+            cmd.args(["--test-netem", n]);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -214,7 +252,12 @@ fn main() {
     // Sonst virtualisiert Windows die Fenstergroessen des Helfers fuer diesen Prozess.
     init_process_dpi();
     let mut fails = Vec::new();
-    let mut h = Helper::start(o.loss);
+    let netem = o
+        .netem
+        .clone()
+        .or((o.loss > 0.0).then(|| format!("loss={}", o.loss)));
+    let disturbed = netem.is_some();
+    let mut h = Helper::start(netem.as_deref(), o.present_all);
     let r = h.cmd(json!({"cmd":"hello","beamer_version":"driver"}));
     check(
         r["ok"] == true && r["platform"] == "win",
@@ -238,8 +281,13 @@ fn main() {
         let (a, b) = o.size.split_once('x').unwrap();
         (a.parse().unwrap(), b.parse().unwrap())
     };
+    let fg_before = unsafe { GetForegroundWindow() };
     for tid in 1..=o.streams {
-        let k = test_keys(tid);
+        let k = if o.external {
+            mac_test_keys()
+        } else {
+            test_keys(tid)
+        };
         let r = h.cmd(
             json!({"cmd":"recv.open","tid":tid,"title":format!("Selbsttest {tid}"),"app":"Teleport",
             // Fenster halb so gross wie der Stream (in Punkten), damit zwei nebeneinander passen.
@@ -253,6 +301,21 @@ fn main() {
             &mut fails,
         );
     }
+    // Proxy-Fenster sichtbar, aber ohne Fokusklau (03a Punkt 5).
+    let fg_after = unsafe { GetForegroundWindow() };
+    let title1 = HSTRING::from("Teleport \u{2013} Selbsttest 1");
+    let p1 = unsafe { FindWindowW(w!("BeamerTeleportProxy"), &title1) };
+    check(
+        p1.as_ref()
+            .is_ok_and(|hw| unsafe { IsWindowVisible(*hw) }.as_bool()),
+        "Proxy-Fenster sichtbar",
+        &mut fails,
+    );
+    check(
+        fg_after == fg_before && p1.as_ref().is_ok_and(|hw| *hw != fg_after),
+        "recv.open stiehlt den Fokus nicht",
+        &mut fails,
+    );
     let r = h.cmd(json!({"cmd":"transport.open","local_port":o.port,"peer_host":"","peer_port":0}));
     check(
         r["ok"] == true && r["local_port"] == o.port,
@@ -260,20 +323,50 @@ fn main() {
         &mut fails,
     );
 
-    let mut senders: Vec<Child> = (1..=o.streams).map(|t| sender(&o, t)).collect();
+    let mut senders: Vec<Child> = if o.external {
+        Vec::new()
+    } else {
+        (1..=o.streams).map(|t| sender(&o, t)).collect()
+    };
+    if o.external {
+        println!(
+            "Warte auf den Mac-Sender (UDP {}, Testschluessel aus send_demo.py, tid 1) ...",
+            o.port
+        );
+        let t = Instant::now();
+        loop {
+            match h.wait_event("stats", Duration::from_secs(1)) {
+                Some(e) if e["frames_presented"].as_u64().unwrap_or(0) > 0 => {
+                    println!(
+                        "  erstes Bild nach {:.1} s, Gegenstelle {}",
+                        t.elapsed().as_secs_f64(),
+                        e["peer"]
+                    );
+                    break;
+                }
+                _ if t.elapsed() > Duration::from_secs(300) => {
+                    println!("  nach 5 min kein Bild");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
     // Anlaufen lassen (Encoder-Init, erster Keyframe), Messwerte davor verwerfen.
     h.pump(Duration::from_secs(2));
     h.events.clear();
 
-    // transport.peer im laufenden Stream (§7): auf die Quelladresse des ersten Senders.
     let half = Duration::from_secs_f64(o.secs / 2.0);
     h.pump(half);
-    let r = h.cmd(json!({"cmd":"transport.peer","peer_host":"127.0.0.1","peer_port":47101}));
-    check(
-        r["ok"] == true,
-        "transport.peer bei laufendem Stream",
-        &mut fails,
-    );
+    if !o.external {
+        // transport.peer im laufenden Stream (§7): auf die Quelladresse des ersten Senders.
+        let r = h.cmd(json!({"cmd":"transport.peer","peer_host":"127.0.0.1","peer_port":47101}));
+        check(
+            r["ok"] == true,
+            "transport.peer bei laufendem Stream",
+            &mut fails,
+        );
+    }
     h.pump(half);
 
     let stats: Vec<Value> = h
@@ -285,6 +378,15 @@ fn main() {
     println!("\nstats ({} Ereignisse):", stats.len());
     for tid in 1..=o.streams {
         let s: Vec<&Value> = stats.iter().filter(|e| e["tid"] == tid).collect();
+        if o.dump {
+            for e in &s {
+                println!(
+                    "    fps {} p95 {} r2p {} queue {} jitter {} rtt {} dropped {} superseded {} late {}",
+                    e["fps"], e["recv_to_present_p95_ms"], e["recv_to_present_ms"], e["queue_ms"],
+                    e["jitter_ms"], e["rtt_ms"], e["frames_dropped"], e["frames_superseded"], e["late_packets"]
+                );
+            }
+        }
         let col = |k: &str| s.iter().filter_map(|e| e[k].as_f64()).collect::<Vec<f64>>();
         let fps = median(col("fps"));
         let r2p = median(col("recv_to_present_ms"));
@@ -306,22 +408,89 @@ fn main() {
             &format!("tid {tid}: stats jede Sekunde"),
             &mut fails,
         );
-        if o.loss > 0.0 {
-            let presented: f64 = col("frames_presented").iter().sum();
-            println!(
-                "        Verlust {} %: angezeigt {presented:.0}, uebersprungen {:.0}, verworfen (Transport) {:.0}, FEC repariert {:.0}, NACKs {:.0}",
-                o.loss,
-                col("frames_skipped").iter().sum::<f64>(),
-                s.last().and_then(|e| e["frames_dropped"].as_f64()).unwrap_or(0.0),
-                s.last().and_then(|e| e["fec_recovered"].as_f64()).unwrap_or(0.0),
-                s.last().and_then(|e| e["nacks"].as_f64()).unwrap_or(0.0),
+        // Zaehler im Messfenster (Differenz erste/letzte stats-Zeile, der Anlauf zaehlt nicht).
+        let delta = |k: &str| {
+            let v = col(k);
+            match (v.first(), v.last()) {
+                (Some(a), Some(b)) => b - a,
+                _ => 0.0,
+            }
+        };
+        let dropped = delta("frames_dropped");
+        let delivered = delta("frames_delivered");
+        let drop_pct = 100.0 * dropped / (dropped + delivered).max(1.0);
+        let p95s = col("recv_to_present_p95_ms");
+        let p95_max = p95s.iter().cloned().fold(0.0, f64::max);
+        // p95 ueber den ganzen Lauf aus dem Histogramm (obere Klassengrenze, also eher zu hoch).
+        let mut hist = [0u64; 10];
+        for e in &s {
+            if let Some(a) = e["recv_to_present_hist"].as_array() {
+                for (i, v) in a.iter().enumerate().take(10) {
+                    hist[i] += v.as_u64().unwrap_or(0);
+                }
+            }
+        }
+        let total: u64 = hist.iter().sum();
+        let mut acc = 0u64;
+        let edges = beamer_teleport_win::stats::HIST_EDGES_MS;
+        let p95_run = hist
+            .iter()
+            .enumerate()
+            .find_map(|(i, n)| {
+                acc += n;
+                (acc as f64 >= 0.95 * total as f64)
+                    .then(|| edges.get(i).copied().unwrap_or(f64::INFINITY))
+            })
+            .unwrap_or(0.0);
+        let max_run = col("recv_to_present_max_ms")
+            .iter()
+            .cloned()
+            .fold(0.0, f64::max);
+        if o.external {
+            // Abnahme 03a (E2E WLAN).
+            check(fps >= 57.0, &format!("E2E: fps {fps:.1} >= 57"), &mut fails);
+            check(
+                drop_pct < 0.5,
+                &format!("E2E: verworfen {drop_pct:.2} % < 0,5 %"),
+                &mut fails,
             );
+            check(
+                p95_run < 25.0,
+                &format!("E2E: p95 Empfang->Present <= {p95_run} ms < 25 ms"),
+                &mut fails,
+            );
+            check(
+                col("decode_errors").iter().sum::<f64>() == 0.0,
+                "E2E: keine decode_errors",
+                &mut fails,
+            );
+        }
+        println!(
+            "        Empfang->Present ueber den Lauf: p95 <= {p95_run} ms, Max {max_run:.1} ms, Histogramm {hist:?} (Grenzen {edges:?})"
+        );
+        println!(
+            "        verworfen {dropped:.0} von {:.0} ({drop_pct:.2} %): unvollstaendig {:.0}, Ueberlauf {:.0}, nach Luecke {:.0}; Luecken unvollstaendig {:.0} / blockiert {:.0}; spaete Pakete {:.0}; uebersprungen (Empfaenger) {:.0}; FEC {:.0}, NACKs {:.0}; p95 je Sekunde Median {:.2} / Max {:.2} ms; Rueckstau-Spruenge {:.0}",
+            dropped + delivered,
+            delta("dropped_incomplete"),
+            delta("dropped_overflow"),
+            delta("dropped_gap"),
+            delta("gaps_incomplete"),
+            delta("gaps_blocked"),
+            delta("late_packets"),
+            col("frames_skipped").iter().sum::<f64>(),
+            delta("fec_recovered"),
+            delta("nacks"),
+            median(p95s.clone()),
+            p95_max,
+            col("catchups").iter().sum::<f64>(),
+        );
+        if disturbed {
             check(
                 fps > o.fps as f64 * 0.5,
                 &format!("tid {tid}: Bild laeuft trotz Verlust"),
                 &mut fails,
             );
-        } else {
+        } else if !o.external {
             check(
                 fps > o.fps as f64 * 0.9,
                 &format!("tid {tid}: fps >= 90 % von {}", o.fps),
