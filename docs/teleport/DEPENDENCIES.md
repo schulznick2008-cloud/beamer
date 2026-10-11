@@ -10,6 +10,8 @@ Verboten: AGPL, SSPL, proprietär, „source-available“, Code ohne klare Lizen
 | chacha20poly1305 | 0.10 | Apache-2.0 OR MIT | transport | AEAD ChaCha20-Poly1305 (IETF) für den UDP-Strom | crate (RustCrypto) |
 | socket2 | 0.5 | MIT OR Apache-2.0 | transport | UDP-Socket mit großen Puffern binden | crate |
 | cbindgen | 0.27 | MPL-2.0 | transport (nur Build) | erzeugt `include/beamer_transport.h` aus `src/ffi.rs`, landet nicht im Binary | crate (build-dependency) |
+| ScreenCaptureKit, VideoToolbox, CoreMedia, CoreVideo, CoreGraphics, AppKit, Foundation | macOS 14+ SDK | Systemframeworks (Systembibliotheks-Ausnahme der GPL) | mac | Capture, Hardware-Encoder und -Decoder, Zeit/Puffer | `.linkedFramework` in `teleport/mac/Package.swift` |
+| beamer-transport | 0.1 | GPL-3.0 (eigener Code, `teleport/transport`) | mac | UDP-Strom | `libbeamer_transport.a` per `teleport/mac/build.sh`, Header per Symlink |
 
 Systemframeworks (ScreenCaptureKit, VideoToolbox, Windows Graphics Capture, D3D11, Media Foundation) fallen unter die Systembibliotheks-Ausnahme der GPL und werden nur der Vollständigkeit halber genannt.
 
