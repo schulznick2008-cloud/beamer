@@ -45,10 +45,14 @@ public protocol FrameSource: AnyObject {
     /// Aktuelle Groesse der Quelle in Punkten, billig (ohne ScreenCaptureKit), um Groessenaenderungen schnell zu
     /// bemerken. `nil`, wenn unbekannt.
     func currentPointSize() -> CGSize?
+    /// Capture auf eine bekannte neue Groesse in Punkten umstellen, ohne ScreenCaptureKit erst abzufragen (schnell:
+    /// ein Aufruf). `true`, wenn sich die Pixelgroesse geaendert hat. Standard: `refresh()`.
+    func applySize(points: CGSize) -> Bool
 }
 
 extension FrameSource {
     public func currentPointSize() -> CGSize? { nil }
+    public func applySize(points: CGSize) -> Bool { refresh().sizeChanged }
     public func refresh() -> (state: String, sizeChanged: Bool) { (state, false) }
     public func setMaxFps(_ fps: Int) {}
 }
@@ -151,10 +155,28 @@ private extension CGRect {
 
 /// ScreenCaptureKit-Strom fuer ein Fenster oder einen Bildschirm.
 public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, SCStreamDelegate {
+    private static let hintLock = NSLock()
+    nonisolated(unsafe) private static var scaleHints: [UInt32: Double] = [:]
+
+    /// Fuer einen frisch angelegten virtuellen HiDPI-Monitor meldet ScreenCaptureKit/CoreGraphics zunaechst Skalierung 1.
+    public static func setScaleHint(_ s: Double, forDisplay id: UInt32) {
+        hintLock.lock(); scaleHints[id] = s; hintLock.unlock()
+    }
+
+    public static func clearScaleHint(forDisplay id: UInt32) {
+        hintLock.lock(); scaleHints.removeValue(forKey: id); hintLock.unlock()
+    }
+
+    static func scaleHint(forDisplay id: UInt32) -> Double? {
+        hintLock.lock(); defer { hintLock.unlock() }
+        return scaleHints[id]
+    }
+
     private let mode: CaptureMode
     private let maxFps: Int
     private var stream: SCStream?
     private var filter: SCContentFilter?
+    private var resolvedDisplay: CGDirectDisplayID?
     private var config: SCStreamConfiguration?
     private var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
     private var onStop: ((String) -> Void)?
@@ -200,9 +222,15 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
                 throw IPCError(.notFound, "Bildschirm \(id) nicht gefunden")
             }
             filter = SCContentFilter(display: d, excludingWindows: [])
+            resolvedDisplay = d.displayID
         }
         let info = SCShareableContent.info(for: filter)
-        let pxScale = Double(info.pointPixelScale)
+        var pxScale = Double(info.pointPixelScale)
+        // Ein virtueller HiDPI-Monitor meldet hier manchmal 1; die echte Pixelzahl steht im Anzeigemodus.
+        if let did = resolvedDisplay, let dm = CGDisplayCopyDisplayMode(did), dm.width > 0 {
+            pxScale = max(pxScale, Double(dm.pixelWidth) / Double(dm.width))
+        }
+        if let did = resolvedDisplay, let hint = Self.scaleHint(forDisplay: did) { pxScale = max(pxScale, hint) }
         scale = pxScale
         // Gerade Pixelzahlen, sonst verweigert mancher Encoder die Arbeit.
         width = max(2, Int((Double(info.contentRect.width) * pxScale).rounded()) & ~1)
@@ -257,6 +285,23 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         guard let cfg = config, let s = stream, fps > 0 else { return }
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         _ = try? runBlocking(timeout: SCKTimeouts.update, "updateConfiguration") { try await s.updateConfiguration(cfg) }
+    }
+
+    public func applySize(points: CGSize) -> Bool {
+        guard let cfg = config, let s = stream, points.width > 0, points.height > 0 else { return false }
+        let w = max(2, Int((Double(points.width) * scale).rounded()) & ~1)
+        let h = max(2, Int((Double(points.height) * scale).rounded()) & ~1)
+        guard w != width || h != height else { return false }
+        cfg.width = w
+        cfg.height = h
+        do {
+            try runBlocking(timeout: SCKTimeouts.update, "updateConfiguration") { try await s.updateConfiguration(cfg) }
+        } catch {
+            return false
+        }
+        width = w
+        height = h
+        return true
     }
 
     public func currentPointSize() -> CGSize? {

@@ -144,7 +144,7 @@ def main():
     if not a.no_launch and not probe.wait_for(lambda e: e.get("ev") == "ready", 8):
         print("Pruef-Fenster startet nicht")
         return 1
-    time.sleep(0.5)
+    time.sleep(2.0)  # das Fenster setzt sich beim Start erst noch zurecht
 
     recv_args = [a.helper, "--selftest-recv", str(a.port), "--seconds", "120"]
     if a.dump_dir:
@@ -169,6 +169,7 @@ def main():
             print("Zielfenster nicht gefunden")
             return 1
         win = max(cands, key=lambda w: w["w"] * w["h"])
+        orig_frame = (win["x"], win["y"])
         start = h.call("send.start", tid=1, mode="window", wid=win["wid"], codec=a.codec, max_fps=30,
                        bitrate_kbps=20000, keys=TEST_KEYS, virtual_display=a.virtual)
         if not start.get("ok"):
@@ -206,6 +207,7 @@ def main():
         def near(a_, b_, tol=0.75):
             return abs(a_[0] - b_[0]) <= tol and abs(a_[1] - b_[1]) <= tol
 
+        title_bar_est = rel(last)[1] - last["view"][1]
         print("1. Maus")
         t_mark = time.time()
         n0 = len(probe.events())
@@ -240,8 +242,29 @@ def main():
             h.call("send.keyframe", tid=1)
             print(f"   (Kontextmenue offen: Stream-Bild in {a.dump_dir} ansehen)")
             time.sleep(2.5)
-        inject(k="key", key="esc", down=True)
-        inject(k="key", key="esc", down=False)
+        # Kontextmenue bedienen: Pfeil runter + Return waehlt einen Eintrag
+        for key in ("down", "down", "enter"):
+            inject(k="key", key=key, down=True)
+            inject(k="key", key=key, down=False)
+        menu_hit = probe.wait_for(lambda e: e.get("ev") == "menu", 2)
+        rep.check("Kontextmenue ist bedienbar (Eintrag gewaehlt)", bool(menu_hit), menu_hit[-1]["title"] if menu_hit else "kein Menueeintrag")
+        time.sleep(0.3)
+
+        print("1b. Dropdown")
+        # Popup bei View (20..260, 70..98): Klick in die Mitte oeffnet das Menue
+        popup_px = 140.0 * scale, (84.0 + title_bar_est + off_y) * scale
+        inject(k="down", x=popup_px[0], y=popup_px[1], b="left", n=1)
+        inject(k="up", x=popup_px[0], y=popup_px[1], b="left")
+        time.sleep(0.6)
+        if a.dump_dir:
+            h.call("send.keyframe", tid=1)
+            print(f"   (Dropdown offen: Stream-Bild in {a.dump_dir} ansehen)")
+            time.sleep(2.5)
+        for key in ("down", "enter"):
+            inject(k="key", key=key, down=True)
+            inject(k="key", key=key, down=False)
+        dd_hit = probe.wait_for(lambda e: e.get("ev") == "dropdown", 2)
+        rep.check("Dropdown ist bedienbar (Eintrag gewaehlt)", bool(dd_hit), dd_hit[-1]["title"] if dd_hit else "keine Auswahl")
         time.sleep(0.3)
 
         print("2. Scrollen")
@@ -294,21 +317,26 @@ def main():
             rep.check("send.size gemeldet", bool(size_ev), f"nach {t_ev:.0f} ms" if t_ev else "kein Ereignis")
             if size_ev:
                 rep.check("send.size unter 300 ms", t_ev < 300, f"{t_ev:.0f} ms")
-            time.sleep(0.5)
-            wnow = [e for e in probe.events() if "win" in e][-1]["win"]
-            probe.wait_for(lambda e: abs(e["win"][2] - 1200) < 2, 2)
-            wnow = [e for e in probe.events() if "win" in e][-1]["win"]
-            rep.check("Fenster hat die neue Groesse (1200x800 pt)", abs(wnow[2] - 1200) < 2 and abs(wnow[3] - 800) < 2, str(wnow))
+            print(f"   Antwort: {r['width']}x{r['height']} px")
+            ok_size = probe.wait_for(lambda e: e.get("ev") == "resized" and abs(e["win"][2] - 1200) < 2, 3)
+            wnow = ([e for e in probe.events() if "win" in e][-1]["win"])
+            rep.check("Fenster hat die neue Groesse (1200x800 pt)", bool(ok_size) and abs(wnow[3] - 800) < 2, str(wnow))
+            exp_w = int(round(1200 * scale))
+            rep.check("Antwort nennt die neue Stream-Groesse", r["width"] == exp_w or a.virtual, f"{r['width']} (erwartet ~{exp_w})")
 
         print("5. Beenden")
         t0 = time.time()
         r = h.call("send.stop", tid=1, restore=True)
         rep.check("send.stop", r.get("ok") and (time.time() - t0) < 2, f"{(time.time() - t0) * 1000:.0f} ms")
         time.sleep(0.8)
-        after = [e for e in probe.events() if "win" in e][-1]["win"]
+        # Die endgueltige Position nicht aus dem Protokoll (das nur bei Eingaben schreibt), sondern frisch lesen.
+        now = [w for w in h.call("windows.list")["windows"] if w["wid"] == win["wid"]]
         if a.virtual:
-            rep.check("Fenster ist zurueck auf dem echten Monitor (Position)", abs(after[0] - probe_before[0]) < 4 and abs(after[1] - probe_before[1]) < 4,
-                      f"vorher {probe_before[:2]}, nachher {after[:2]}")
+            ok = bool(now) and abs(now[0]["x"] - orig_frame[0]) < 4 and abs(now[0]["y"] - orig_frame[1]) < 4
+            rep.check("Fenster ist zurueck auf dem echten Monitor (alte Position)", ok,
+                      f"vorher {list(orig_frame)}, nachher {[now[0]['x'], now[0]['y']] if now else '-'}")
+            rep.check("Fenster hat die alte Groesse zurueck", bool(now) and abs(now[0]["w"] - win["w"]) < 3 and abs(now[0]["h"] - win["h"]) < 3,
+                      f"vorher {win['w']}x{win['h']}, nachher {now[0]['w']}x{now[0]['h']}" if now else "-")
         code = 0 if not rep.failed else 1
     except RuntimeError as e:
         text = str(e)

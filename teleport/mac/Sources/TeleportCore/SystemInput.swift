@@ -211,8 +211,13 @@ public final class AXWindowController: WindowController {
             if e != .success { throw IPCError(.internalError, "AX-Position setzen fehlgeschlagen (\(e.rawValue))") }
         }
         if let s = size { try setSize(s) }
-        if let o = origin { try setPos(o) }
-        if let s = size, origin != nil { try setSize(s) }
+        if let o = origin {
+            try setPos(o)
+            // Nur wenn das Verschieben die Groesse veraendert hat (Kappen am Rand des alten Bildschirms), noch einmal setzen.
+            if let s = size, let now = try? axFrame(w), abs(now.width - s.width) > 1 || abs(now.height - s.height) > 1 {
+                try setSize(s)
+            }
+        }
     }
 
     public func isFrontmost(windowID: UInt32, pid: pid_t) -> Bool {

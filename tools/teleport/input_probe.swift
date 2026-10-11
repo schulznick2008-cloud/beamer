@@ -44,7 +44,10 @@ final class ProbeView: NSView {
     }
     override func mouseDown(with e: NSEvent) { mouse("down", e) }
     override func mouseUp(with e: NSEvent) { mouse("up", e) }
-    override func rightMouseDown(with e: NSEvent) { mouse("down", e) }
+    override func rightMouseDown(with e: NSEvent) {
+        mouse("down", e)
+        super.rightMouseDown(with: e) // zeigt das Kontextmenue (menu(for:))
+    }
     override func rightMouseUp(with e: NSEvent) { mouse("up", e) }
     override func otherMouseDown(with e: NSEvent) { mouse("down", e) }
     override func otherMouseUp(with e: NSEvent) { mouse("up", e) }
@@ -103,6 +106,20 @@ let popupTarget = Popup()
 popup.target = popupTarget
 popup.action = #selector(Popup.changed(_:))
 view.addSubview(popup)
+// Hauptmenue mit Bearbeiten-Menue, damit Cmd+A, Cmd+C, Cmd+V wie in jeder App funktionieren.
+let mainMenu = NSMenu()
+let appItem = NSMenuItem(); mainMenu.addItem(appItem)
+let appMenu = NSMenu(); appItem.submenu = appMenu
+appMenu.addItem(NSMenuItem(title: "Beenden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+let editItem = NSMenuItem(); mainMenu.addItem(editItem)
+let editMenu = NSMenu(title: "Bearbeiten"); editItem.submenu = editMenu
+editMenu.addItem(NSMenuItem(title: "Alles auswählen", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+editMenu.addItem(NSMenuItem(title: "Kopieren", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+editMenu.addItem(NSMenuItem(title: "Einsetzen", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+app.mainMenu = mainMenu
+NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: win, queue: .main) { _ in
+    log(["ev": "resized"])
+}
 win.makeKeyAndOrderFront(nil)
 win.makeFirstResponder(field)
 app.activate(ignoringOtherApps: true)

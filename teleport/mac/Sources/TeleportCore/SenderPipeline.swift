@@ -243,11 +243,30 @@ public final class SenderPipeline {
     /// Keyframe anfordern. Wartet hoechstens `timeout` Sekunden (ScreenCaptureKit kann haengen) und liefert die
     /// aktuelle Stream-Groesse in Pixeln.
     @discardableResult
-    public func syncSize(timeout: TimeInterval = 1.5) -> (width: Int, height: Int) {
+    public func syncSize(expecting target: CGSize? = nil, timeout: TimeInterval = 1.5) -> (width: Int, height: Int) {
         let src = source
-        let r = try? runBounded(timeout: timeout, "Groesse neu lesen") { src.refresh() }
+        let t0 = Date()
+        var changed = false
+        // Das Fenster uebernimmt eine per AX gesetzte Groesse erst nach einigen Millisekunden: erst billig auf die
+        // neue Groesse warten (CoreGraphics-Rahmen), dann ScreenCaptureKit neu lesen lassen.
+        if let t = target {
+            while Date().timeIntervalSince(t0) < 0.25 {
+                if let pt = src.currentPointSize(), abs(pt.width - t.width) <= 1, abs(pt.height - t.height) <= 1 { break }
+                if src.currentPointSize() == nil { break }
+                Thread.sleep(forTimeInterval: 0.008)
+            }
+        }
+        // Die neue Groesse steht fest (CoreGraphics-Rahmen): direkt umstellen, ohne ScreenCaptureKit zu befragen.
+        let known = src.currentPointSize() ?? target
+        if let pt = known {
+            changed = (try? runBounded(timeout: max(0.2, timeout - Date().timeIntervalSince(t0)), "Groesse umstellen") {
+                src.applySize(points: pt)
+            }) ?? false
+        } else {
+            changed = (try? runBounded(timeout: timeout, "Groesse neu lesen") { src.refresh().sizeChanged }) ?? false
+        }
         let size = src.pixelSize
-        if r?.sizeChanged == true {
+        if changed {
             reportSize(size.width, size.height)
             requestKeyframe()
         }

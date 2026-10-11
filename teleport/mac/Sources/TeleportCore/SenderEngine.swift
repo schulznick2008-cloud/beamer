@@ -161,6 +161,7 @@ public final class SenderEngine: TeleportBackend {
                 restoreFrame = frame
                 captureMode = .display(vd.displayID)
                 displayID = vd.displayID
+                ScreenCaptureSource.setScaleHint(2, forDisplay: vd.displayID) // der virtuelle Monitor ist HiDPI
             }
         case .display(let id):
             displayID = id
@@ -304,18 +305,61 @@ public final class SenderEngine: TeleportBackend {
             throw IPCError(.unsupported, "send.resize gilt nur fuer Fenster")
         }
         let size = CGSize(width: width.rounded(), height: height.rounded())
+        let debug = ProcessInfo.processInfo.environment["BEAMER_TELEPORT_DEBUG"] == "1"
+        var mark = Date()
+        func lap(_ what: String) {
+            if debug { logErr("resize: \(what) \(Int(Date().timeIntervalSince(mark) * 1000)) ms") }
+            mark = Date()
+        }
         if let vd = c.virtual {
-            // Erst der Monitor, dann das Fenster darauf, dann die Capture-Konfiguration.
-            guard vd.resize(widthPoints: Int(size.width), heightPoints: Int(size.height) + Self.menuBarAllowance) else {
-                throw IPCError(.internalError, "Der virtuelle Monitor liess sich nicht auf \(Int(size.width))x\(Int(size.height)) bringen")
+            let newMonitorH = Int(size.height) + Self.menuBarAllowance
+            let shrinking = Int(size.width) <= vd.widthPoints && newMonitorH <= vd.heightPoints
+            func moveWindow() throws {
+                // Der Monitor sitzt nach der Groessenaenderung an einer neuen Stelle (macOS legt ihn buendig links vom
+                // Hauptbildschirm ab): Fenster samt Position neu setzen.
+                try windowController.setFrame(
+                    windowID: wid, pid: pid,
+                    origin: CGPoint(x: vd.bounds.minX, y: vd.bounds.minY + CGFloat(Self.menuBarAllowance)), size: size)
             }
-            try windowController.setFrame(
-                windowID: wid, pid: pid,
-                origin: CGPoint(x: vd.bounds.minX, y: vd.bounds.minY + CGFloat(Self.menuBarAllowance)), size: size)
+            if shrinking {
+                // Verkleinern: Fenster und Monitor gleichzeitig (das Fenster passt auf beide Groessen). macOS legt den
+                // Monitor buendig an derselben rechten Kante ab; mit dieser vorhergesagten Position setzt der AX-Aufruf
+                // Groesse und Position in einem Rutsch. Stimmt die Vorhersage nicht, kommt eine Korrektur.
+                let old = vd.bounds
+                let predicted = CGPoint(x: old.maxX - size.width, y: old.minY + CGFloat(Self.menuBarAllowance))
+                var winError: Error?
+                let g = DispatchGroup()
+                g.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do { try self.windowController.setFrame(windowID: wid, pid: pid, origin: predicted, size: size) } catch { winError = error }
+                    g.leave()
+                }
+                let ok = vd.resize(widthPoints: Int(size.width), heightPoints: newMonitorH)
+                g.wait()
+                guard ok else { throw IPCError(.internalError, "Der virtuelle Monitor liess sich nicht auf \(Int(size.width))x\(Int(size.height)) bringen") }
+                if let e = winError { throw e }
+                lap("Monitor+Fenster")
+                let want = CGPoint(x: vd.bounds.minX, y: vd.bounds.minY + CGFloat(Self.menuBarAllowance))
+                if abs(want.x - predicted.x) > 1 || abs(want.y - predicted.y) > 1 {
+                    try moveWindow()
+                    lap("Korrektur")
+                }
+            } else {
+                // Vergroessern: erst der Monitor, sonst kappt macOS das Fenster am alten Rand.
+                guard vd.resize(widthPoints: Int(size.width), heightPoints: newMonitorH) else {
+                    throw IPCError(.internalError, "Der virtuelle Monitor liess sich nicht auf \(Int(size.width))x\(Int(size.height)) bringen")
+                }
+                lap("Monitor")
+                try moveWindow()
+                lap("Fenster")
+            }
         } else {
             try windowController.setFrame(windowID: wid, pid: pid, origin: nil, size: size)
+            lap("Fenster")
         }
-        let px = pipe.syncSize()
+        let expected = c.virtual != nil ? CGSize(width: size.width, height: size.height + CGFloat(Self.menuBarAllowance)) : size
+        let px = pipe.syncSize(expecting: expected)
+        lap("Capture")
         return (px.width, px.height)
     }
 
@@ -333,6 +377,7 @@ public final class SenderEngine: TeleportBackend {
                     try self.windowController.setFrame(windowID: wid, pid: pid, origin: f.origin, size: f.size)
                 }
             }
+            ScreenCaptureSource.clearScaleHint(forDisplay: vd.displayID)
             vd.destroy()
         }
         injector.releaseAll(at: nil)
