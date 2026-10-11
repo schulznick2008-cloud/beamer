@@ -15,8 +15,14 @@ public final class SenderEngine: TeleportBackend {
         return s
     }
 
+    /// Wie lange `send.start` auf die Quelle wartet, bevor es mit `busy` scheitert (Sekunden).
+    public var startTimeout: TimeInterval = 12
+    /// Wie lange `send.stop` hoechstens auf das Aufraeumen wartet (die Antwort kommt immer rechtzeitig).
+    public var stopTimeout: TimeInterval = 1.5
+
     public init(emit: @escaping (JSON) -> Void) {
         self.emit = emit
+        if let test = TestSources.fromEnvironment() { makeSource = test }
     }
 
     // MARK: Transport
@@ -57,7 +63,14 @@ public final class SenderEngine: TeleportBackend {
         let t = transport
         transport = nil
         lock.unlock()
-        ps.forEach { $0.stop() }
+        // Alle Strome gleichzeitig anhalten, damit ein haengender nicht die anderen aufhaelt; hoechstens
+        // `stopTimeout` warten, danach wird der Transport geschlossen und der Rest laeuft im Hintergrund aus.
+        let group = DispatchGroup()
+        for p in ps {
+            group.enter()
+            DispatchQueue.global().async { p.stop(); group.leave() }
+        }
+        _ = group.wait(timeout: .now() + stopTimeout)
         t?.close()
     }
 
@@ -90,7 +103,8 @@ public final class SenderEngine: TeleportBackend {
         do {
             try t.addStream(id: p.tid, role: .sender, keys: p.keys, maxKbps: p.bitrateKbps)
         } catch {
-            source.stop()
+            // Auch hier nicht unbegrenzt auf die Quelle warten.
+            _ = try? runBounded(timeout: 1.2, "Capture stop") { source.stop() }
             throw IPCError(.badRequest, "\(error)")
         }
         let tid = p.tid
@@ -103,25 +117,40 @@ public final class SenderEngine: TeleportBackend {
         pipelines[tid] = pipe
         lock.unlock()
         do {
-            try pipe.start()
+            try runBounded(timeout: startTimeout, "send.start (Quelle)") { try pipe.start() }
         } catch let e as IPCError {
-            dropPipeline(tid)
+            dropPipelineAsync(tid)
             throw e
+        } catch let t as BlockingTimeout {
+            dropPipelineAsync(tid)
+            throw IPCError(.busy, "Die Bildquelle startet nicht (\(t)). Mac ueberlastet? Spaeter erneut versuchen.")
         } catch {
-            dropPipeline(tid)
+            dropPipelineAsync(tid)
             throw IPCError(.internalError, "\(error)")
         }
         return SendStarted(width: size.width, height: size.height, scale: source.scale)
     }
 
+    /// Nimmt den Strom aus der Verwaltung und raeumt auf. Wartet hoechstens `stopTimeout` darauf; haengt die Quelle,
+    /// laeuft das Aufraeumen im Hintergrund weiter, der Aufrufer (IPC-Thread) kommt trotzdem rechtzeitig zurueck.
     private func dropPipeline(_ tid: UInt32, ended wasEnded: Bool = false) {
         lock.lock()
         if wasEnded { ended.insert(tid) }
         let pipe = pipelines.removeValue(forKey: tid)
         let t = transport
         lock.unlock()
-        pipe?.stop()
         t?.removeStream(id: tid)
+        guard let p = pipe else { return }
+        _ = try? runBounded(timeout: stopTimeout, "Strom beenden") { p.stop() }
+    }
+
+    private func dropPipelineAsync(_ tid: UInt32) {
+        lock.lock()
+        let pipe = pipelines.removeValue(forKey: tid)
+        let t = transport
+        lock.unlock()
+        t?.removeStream(id: tid)
+        if let p = pipe { DispatchQueue.global().async { p.stop() } }
     }
 
     public func sendStop(tid: UInt32, restore: Bool) throws {

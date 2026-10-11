@@ -23,7 +23,7 @@ Helfer startet (Systemeinstellungen > Datenschutz & Sicherheit). Ohne Freigabe a
 | `Sources/CBeamerTransport` | C-Target; `include/beamer_transport.h` ist ein Symlink auf `../transport/include` |
 | `Sources/TeleportCore` | `IPC` (JSON, Zeilen), `Dispatcher` (Befehle), `SenderEngine`/`SenderPipeline` (Strom), `Capture` (ScreenCaptureKit), `VideoEncoder` (VideoToolbox), `AnnexB`, `Transport` (Swift-Hülle der C-ABI), Selbsttests |
 | `Sources/BeamerTeleport` | `main.swift`: Argumente, IPC-Schleife |
-| `Tests/TeleportCoreTests` | 45 Tests (Hardware-Encoder-Tests werden ohne Hardware übersprungen; die Pipeline-Tests laufen mit einer Attrappe als langsamem Encoder und brauchen keine) |
+| `Tests/TeleportCoreTests` | 59 Tests (Hardware-Encoder-Tests werden ohne Hardware übersprungen; die Pipeline-Tests laufen mit einer Attrappe als langsamem Encoder und brauchen keine) |
 
 ## IPC (Helfer-Seite)
 
@@ -72,3 +72,23 @@ diese Selbsttests; echte Teleports bekommen ihre Schlüssel von Python (§4.2).
 `BEAMER_TELEPORT_DEBUG=1` loggt Capture-Statuswechsel nach stderr.
 
 `windows.list` liefert nur sichtbare oder minimierte Fenster (Layer 0, mindestens 100×50 pt, mit Titel) normaler Apps; Hilfsprozesse (z. B. WindowManager, „Open and Save Panel Service“) und unsichtbare Fenster ohne Titel fallen heraus (`WindowFilter`).
+
+## Haengende ScreenCaptureKit-Aufrufe (C02b)
+
+ScreenCaptureKit-Aufrufe kehren unter Last manchmal nie zurueck (besonders, wenn mehrere Helfer gleichzeitig starten).
+Der Helfer haelt dafuer folgende Regeln ein:
+
+- **Jeder blockierende SCK-Aufruf hat ein Zeitlimit** (`runBlocking(timeout:)`, kein Datenwettlauf auf dem Ergebnis):
+  `SCShareableContent` 2,5 s (zwei Versuche), `startCapture` 3,5 s (zwei Versuche mit frischem Stream), `stopCapture` und
+  `updateConfiguration` 1 s. Bei einem Timeout antwortet der Befehl mit `busy` (klare Meldung); `stop` raeumt trotzdem
+  auf und verwirft den Stream. Meldet SCK kurz `userDeclined`, obwohl `CGPreflightScreenCaptureAccess()` die Freigabe
+  bestaetigt, gilt das als `busy`, nicht als `permission`.
+- **Prozessuebergreifende Sperre** (`flock` auf `$TMPDIR/beamer-teleport-sck.lock`) nur um die kurzen Aufrufe, nie um
+  einen Strom: gleichzeitig gestartete Helfer fragen SCK nacheinander. Wer die Sperre nicht in 4 s bekommt, laeuft ohne.
+- **Der IPC-Thread blockiert nie:** Befehle laufen auf einer Queue, gelesen wird auf eigenem Thread. `send.stop` antwortet
+  nach hoechstens 1,5 s, auch wenn die Quelle haengt; `shutdown`/EOF raeumt alle Strome gleichzeitig auf, und ein Wachhund
+  beendet den Prozess nach 1,8 s mit `exit(0)`, falls das Aufraeumen nicht fertig wird. `send.start` wartet hoechstens 12 s.
+- **Kein SCK-Aufruf auf der Pipeline-Queue:** Zustand, Fenstergroesse und Bildrate werden auf einer eigenen Queue
+  abgefragt; die Pipeline nutzt beim naechsten Takt das letzte Ergebnis.
+- Test-Haken: `BEAMER_TELEPORT_TEST_SOURCE=hang-start|hang-stop|hang-refresh` ersetzt die Quelle durch eine haengende.
+- Lasttest: `tools/teleport/measure_c02_load.sh hevc 30 3` (Messung plus zwei Helfer mit `--display 0`).

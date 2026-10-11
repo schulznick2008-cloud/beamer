@@ -29,16 +29,29 @@ fn callbacks(sink: &Arc<Sink>) -> Callbacks {
     let (a, b, c) = (sink.clone(), sink.clone(), sink.clone());
     Callbacks {
         on_frame: Box::new(move |_sid, kind, f| {
-            a.frames.lock().unwrap().push(Got {
-                kind,
-                data: f.data.to_vec(),
-                pts: f.pts_us,
-                fflags: f.fflags,
-                frame_id: f.frame_id,
-            });
+            a.frames
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Got {
+                    kind,
+                    data: f.data.to_vec(),
+                    pts: f.pts_us,
+                    fflags: f.fflags,
+                    frame_id: f.frame_id,
+                });
         }),
-        on_control: Box::new(move |sid, t| b.controls.lock().unwrap().push((sid, t))),
-        on_stats: Box::new(move |_sid, j| c.stats.lock().unwrap().push(j.to_string())),
+        on_control: Box::new(move |sid, t| {
+            b.controls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((sid, t))
+        }),
+        on_stats: Box::new(move |_sid, j| {
+            c.stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(j.to_string())
+        }),
     }
 }
 
@@ -600,7 +613,27 @@ fn stats_and_rtt_are_reported() {
         i += 1;
         std::thread::sleep(Duration::from_millis(16));
     }
-    let st = l.rx_sink.stats.lock().unwrap();
+    // Mindestanzahl abwarten und eine Kopie ziehen (keine Panik unter Lock, das wuerde den Mutex vergiften).
+    wait_until(6.0, || {
+        l.rx_sink
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            >= 2
+            && l.tx_sink
+                .stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+                >= 2
+    });
+    let st = l
+        .rx_sink
+        .stats
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     assert!(st.len() >= 2, "Statistik jede Sekunde");
     let last = st.last().unwrap();
     for k in [
@@ -613,7 +646,12 @@ fn stats_and_rtt_are_reported() {
         assert!(last.contains(k), "{k} fehlt in {last}");
     }
     assert!(last.contains("\"peer\":\"127.0.0.1:"), "peer fehlt: {last}");
-    let tx_st = l.tx_sink.stats.lock().unwrap();
+    let tx_st = l
+        .tx_sink
+        .stats
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     assert!(tx_st.len() >= 2);
     let tl = tx_st.last().unwrap();
     let rtt: f64 = tl
@@ -994,9 +1032,47 @@ fn reordering_without_loss_is_not_raw_loss() {
             i += 1;
             std::thread::sleep(Duration::from_millis(16));
         }
-        let rx_stats = l.rx_sink.stats.lock().unwrap();
-        let tx_stats = l.tx_sink.stats.lock().unwrap();
-        assert!(rx_stats.len() >= 3 && tx_stats.len() >= 3);
+        // Stats kommen einmal je Sekunde aus dem Transport-Thread: Mindestanzahl abwarten (Polling), danach
+        // Kopien ziehen und die Locks freigeben, bevor asserted wird (eine Panik unter Lock vergiftet den Mutex).
+        assert!(
+            wait_until(8.0, || {
+                l.rx_sink
+                    .stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len()
+                    >= 3
+                    && l.tx_sink
+                        .stats
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len()
+                        >= 3
+            }),
+            "zu wenige Stats-Eintraege: rx {} tx {}",
+            l.rx_sink
+                .stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            l.tx_sink
+                .stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        );
+        let rx_stats = l
+            .rx_sink
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let tx_stats = l
+            .tx_sink
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let raw_rx = max_field(&rx_stats, "loss_pct");
         let raw_tx = max_field(&tx_stats, "loss_pct");
         eprintln!(
