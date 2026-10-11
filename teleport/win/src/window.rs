@@ -7,11 +7,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 
+use windows::core::BOOL;
 use windows::core::{w, Result, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, GetStockObject, MonitorFromPoint, MonitorFromWindow, ValidateRect,
-    BLACK_BRUSH, HBRUSH, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, GetStockObject, MonitorFromPoint, MonitorFromWindow,
+    ValidateRect, BLACK_BRUSH, HBRUSH, HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -155,6 +157,59 @@ fn outer_size(w_pt: f64, h_pt: f64, dpi: u32, work: &RECT) -> (i32, i32, (u32, u
     (r.right - r.left, r.bottom - r.top, c)
 }
 
+/// Monitor fuer ein neues Fenster: der unter dem Mauszeiger, ausser dort liegt ein Vollbild-Programm im
+/// Vordergrund (Spiel, Video); dann ein anderer Monitor. Gibt es keinen anderen, bleibt es beim Monitor
+/// unter dem Mauszeiger (`true` = das Fenster liegt dort wahrscheinlich verdeckt).
+pub fn choose_monitor<M: Copy + PartialEq>(
+    cursor: M,
+    all: &[M],
+    fullscreen: Option<M>,
+) -> (M, bool) {
+    if fullscreen != Some(cursor) {
+        return (cursor, false);
+    }
+    match all.iter().copied().find(|m| Some(*m) != fullscreen) {
+        Some(m) => (m, false),
+        None => (cursor, true),
+    }
+}
+
+/// Monitor, den das Vordergrundfenster ganz bedeckt (Vollbild), falls es eins ist.
+fn fullscreen_monitor() -> Option<HMONITOR> {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() || fg == GetDesktopWindow() || fg == GetShellWindow() {
+            return None;
+        }
+        let mut r = RECT::default();
+        GetWindowRect(fg, &mut r).ok()?;
+        let m = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+        if m.is_invalid() {
+            return None;
+        }
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let _ = GetMonitorInfoW(m, &mut mi);
+        let mr = mi.rcMonitor;
+        (r.left <= mr.left && r.top <= mr.top && r.right >= mr.right && r.bottom >= mr.bottom)
+            .then_some(m)
+    }
+}
+
+fn all_monitors() -> Vec<HMONITOR> {
+    unsafe extern "system" fn cb(m: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
+        (*(lp.0 as *mut Vec<HMONITOR>)).push(m);
+        true.into()
+    }
+    let mut v: Vec<HMONITOR> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut v as *mut _ as isize));
+    }
+    v
+}
+
 pub struct ProxyWindow {
     pub hwnd: HWND,
     pub shared: Arc<Shared>,
@@ -173,7 +228,8 @@ pub fn create(
     unsafe {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
-        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let cursor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let (mon, covered) = choose_monitor(cursor, &all_monitors(), fullscreen_monitor());
         let dpi = monitor_dpi(mon);
         let work = work_area(mon);
         let (ow, oh, c) = outer_size(w_pt, h_pt, dpi, &work);
@@ -210,7 +266,29 @@ pub fn create(
                 return Err(e);
             }
         };
-        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        // Sichtbar und oben, aber ohne Aktivierung: kein Fokusklau (Tastatur bleibt beim Nutzer).
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        if covered {
+            // Nur ein Monitor und dort laeuft ein Vollbild-Programm: in der Taskleiste blinken.
+            eprintln!("beamer-teleport: tid {tid} Fenster liegt unter einem Vollbild-Programm, Taskleiste blinkt");
+            let fi = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd,
+                dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            let _ = FlashWindowEx(&fi);
+        }
         Ok(ProxyWindow { hwnd, shared })
     }
 }
@@ -331,6 +409,18 @@ mod tests {
         assert_eq!(client_px(800.0, 600.0, 144), (1200, 900));
         assert_eq!(client_px(1000.0, 500.0, 120), (1250, 625));
         assert_eq!(client_px(0.1, 0.1, 96), (1, 1));
+    }
+
+    #[test]
+    fn monitor_choice_avoids_fullscreen() {
+        // kein Vollbild: Monitor unter dem Mauszeiger
+        assert_eq!(choose_monitor(1, &[1, 2], None), (1, false));
+        // Vollbild auf einem anderen Monitor: egal
+        assert_eq!(choose_monitor(1, &[1, 2], Some(2)), (1, false));
+        // Vollbild unter dem Mauszeiger: anderer Monitor
+        assert_eq!(choose_monitor(1, &[1, 2], Some(1)), (2, false));
+        // nur ein Monitor mit Vollbild: bleibt, aber verdeckt
+        assert_eq!(choose_monitor(1, &[1], Some(1)), (1, true));
     }
 
     #[test]
