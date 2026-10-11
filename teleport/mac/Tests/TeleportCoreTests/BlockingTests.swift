@@ -90,3 +90,21 @@ final class SCKLockTests: XCTestCase {
         release.signal()
     }
 }
+
+final class CoreGraphicsInitTests: XCTestCase {
+    func testEnsureInitializesOnTheMainThreadAndIsIdempotent() {
+        XCTAssertTrue(Thread.isMainThread)
+        CoreGraphicsInit.ensure()
+        CoreGraphicsInit.ensure()
+        XCTAssertTrue(CoreGraphicsInit.isInitialized)
+        // Danach duerfen SkyLight-nahe Aufrufe auch von Hintergrund-Threads kommen (CGS_REQUIRE_INIT bleibt still).
+        let exp = expectation(description: "bg")
+        DispatchQueue.global().async {
+            _ = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+            var n: UInt32 = 0
+            CGGetActiveDisplayList(0, nil, &n)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 5)
+    }
+}

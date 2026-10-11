@@ -4,6 +4,8 @@ import TeleportCore
 
 setvbuf(stdout, nil, _IOLBF, 0)
 signal(SIGPIPE, SIG_IGN)
+// CGS einmal auf dem Hauptthread initialisieren, bevor irgendein Befehl auf einem Hintergrund-Thread SCK/CG nutzt (C02d).
+CoreGraphicsInit.ensure()
 
 func usage() -> Never {
     let text = """
