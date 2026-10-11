@@ -23,6 +23,7 @@ DEFAULT_SHUTDOWN_CMD_TIMEOUT = 5.0
 DEFAULT_EOF_EXIT_TIMEOUT = 5.0
 MAX_LINE_BYTES = 1 << 20
 DEFAULT_RESTART_BACKOFF = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+STDERR_RING_LINES = 200
 
 
 class TeleportIPCError(Exception):
@@ -73,6 +74,8 @@ class TeleportHelper:
         self._proc: Optional[subprocess.Popen[str]] = None
         self._reader: Optional[threading.Thread] = None
         self._monitor: Optional[threading.Thread] = None
+        self._stderr_reader: Optional[threading.Thread] = None
+        self._stderr_lines: Deque[str] = deque(maxlen=STDERR_RING_LINES)
         self._next_id = 1
         self._pending: Dict[int, threading.Event] = {}
         self._replies: Dict[int, Mapping[str, Any]] = {}
@@ -117,6 +120,8 @@ class TeleportHelper:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             cwd=self._config.cwd,
             env=env,
@@ -129,6 +134,13 @@ class TeleportHelper:
             daemon=True,
         )
         self._reader.start()
+        self._stderr_reader = threading.Thread(
+            target=self._stderr_loop,
+            name="teleport-ipc-stderr",
+            args=(gen,),
+            daemon=True,
+        )
+        self._stderr_reader.start()
         if self._config.restart_on_crash and self._monitor is None:
             self._monitor = threading.Thread(
                 target=self._monitor_loop,
@@ -217,6 +229,30 @@ class TeleportHelper:
         """Alias für ältere Skripte."""
         return self.pop_events()
 
+    def stderr_tail(self) -> List[str]:
+        """Letzte stderr-Zeilen des Helfers (Ringpuffer)."""
+        with self._lock:
+            return list(self._stderr_lines)
+
+    def request_retry_busy(
+        self,
+        cmd: str,
+        tries: int = 3,
+        delay: float = 0.5,
+        timeout: Optional[float] = None,
+        **fields: Any,
+    ) -> Mapping[str, Any]:
+        """Wiederholt bei `error.code == busy` bis zu `tries` Mal."""
+        last: Mapping[str, Any] = {}
+        for attempt in range(tries):
+            last = self.request(cmd, timeout=timeout, **fields)
+            err = last.get("error") if isinstance(last.get("error"), Mapping) else None
+            if last.get("ok") or not err or err.get("code") != "busy":
+                return last
+            if attempt + 1 < tries:
+                time.sleep(delay)
+        return last
+
     def _allocate_id(self) -> int:
         with self._lock:
             i = self._next_id
@@ -237,22 +273,18 @@ class TeleportHelper:
         re = msg.get("re")
         if re is not None and isinstance(re, int):
             with self._lock:
-                self._replies[re] = msg
                 ev = self._pending.pop(re, None)
-            if ev:
-                ev.set()
+            if ev is None:
+                log.warning("verspätete oder unbekannte IPC-Antwort re=%s verworfen", re)
+                return
+            with self._lock:
+                self._replies[re] = msg
+            ev.set()
             return
         if msg.get("ev") is not None or msg.get("cmd") is not None:
-            with self._lock:
-                self._events.append(msg)
-            if self._on_event:
-                try:
-                    self._on_event(msg)
-                except Exception:
-                    log.exception("on_event handler failed")
+            self._emit_event(msg)
             return
-        with self._lock:
-            self._events.append(msg)
+        self._emit_event(msg)
 
     def _fail_pending(self, exc: BaseException) -> None:
         with self._lock:
@@ -260,6 +292,29 @@ class TeleportHelper:
             self._pending.clear()
         for ev in pending:
             ev.set()
+
+    def _emit_event(self, msg: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._events.append(msg)
+        if self._on_event:
+            try:
+                self._on_event(msg)
+            except Exception:
+                log.exception("on_event handler failed")
+
+    def _stderr_loop(self, generation: int) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for raw_line in proc.stderr:
+                line = raw_line.rstrip("\n\r")
+                log.info("helper stderr: %s", line)
+                with self._lock:
+                    if generation == self._crash_generation:
+                        self._stderr_lines.append(line)
+        except (OSError, ValueError):
+            pass
 
     def _read_loop(self, generation: int) -> None:
         proc = self._proc
@@ -337,7 +392,9 @@ class TeleportHelper:
                     return
                 self._restart_index += 1
                 self._crash_generation += 1
+                exit_code = code
                 self._spawn_process()
+            self._emit_event({"v": PROTOCOL_VERSION, "ev": "helper_restarted", "code": exit_code})
 
     def mark_healthy(self) -> None:
         """Setzt Backoff nach erfolgreichem hello zurück."""

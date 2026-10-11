@@ -1,4 +1,5 @@
 """Tests für core.teleport_ipc gegen tools/teleport/fake_helper.py."""
+import logging
 import os
 import sys
 import threading
@@ -124,6 +125,68 @@ def test_eof_shutdown_within_five_seconds():
     assert time.time() - t0 < 5.0
 
 
+def test_stderr_flood_does_not_block_requests():
+    h = TeleportHelper(
+        _fake_config(BEAMER_FAKE_HELPER_STDERR_FLOOD="1", BEAMER_FAKE_HELPER_STDERR_MB="1")
+    )
+    h.start()
+    hello(h, "test")
+    for _ in range(100):
+        r = h.request("hello", beamer_version="loop", timeout=2.0)
+        assert r["ok"] is True
+    assert len(h.stderr_tail()) <= 200
+    h.stop()
+
+
+def test_unicode_window_title_roundtrip():
+    h = TeleportHelper(_fake_config())
+    h.start()
+    hello(h, "test")
+    wl = h.request("windows.list")
+    assert wl["windows"][0]["title"] == "Fenster – Übersicht"
+    h.stop()
+
+
+def test_late_reply_after_timeout_is_discarded(caplog):
+    h = TeleportHelper(
+        TeleportHelperConfig(
+            executable=[sys.executable, FAKE],
+            extra_args=[],
+            env={
+                "BEAMER_FAKE_HELPER_MODE": "late",
+                "BEAMER_FAKE_HELPER_LATE_CMD": "transport.open",
+                "BEAMER_FAKE_HELPER_LATE_DELAY": "0.5",
+            },
+            restart_on_crash=False,
+        )
+    )
+    h.start()
+    hello(h, "test")
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(TeleportIPCTimeout):
+            h.request("transport.open", timeout=0.15)
+        time.sleep(0.6)
+        assert any("verspätete" in r.message for r in caplog.records)
+    r = h.request("transport.open", timeout=2.0)
+    assert r["ok"] is True
+    h.stop()
+
+
+def test_request_retry_busy():
+    h = TeleportHelper(
+        _fake_config(
+            BEAMER_FAKE_HELPER_MODE="busy",
+            BEAMER_FAKE_HELPER_BUSY_CMD="transport.open",
+            BEAMER_FAKE_HELPER_BUSY_COUNT="2",
+        )
+    )
+    h.start()
+    hello(h, "test")
+    r = h.request_retry_busy("transport.open", tries=4, delay=0.05)
+    assert r["ok"] is True
+    h.stop()
+
+
 def test_crash_restart_with_backoff():
     cfg = TeleportHelperConfig(
         executable=[sys.executable, FAKE],
@@ -142,7 +205,12 @@ def test_crash_restart_with_backoff():
         h.request("crash.test", timeout=1.0)
 
     deadline = time.time() + 3.0
+    restarted = False
     while time.time() < deadline:
+        for ev in h.pop_events():
+            if ev.get("ev") == "helper_restarted":
+                assert ev.get("code") == 1
+                restarted = True
         if h.running:
             try:
                 r = hello(h, "test", timeout=2.0)
@@ -151,6 +219,7 @@ def test_crash_restart_with_backoff():
             except TeleportHelperCrashed:
                 pass
         time.sleep(0.05)
+    assert restarted
     assert h.running
     hello(h, "after-restart")
     h._intentional_stop = True

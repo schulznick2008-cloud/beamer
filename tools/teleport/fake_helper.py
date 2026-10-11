@@ -13,9 +13,12 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 from typing import Any, Dict, Optional
 
 V = 1
+_BUSY_REMAINING: Optional[int] = None
 
 
 def _write(obj: Dict[str, Any]) -> None:
@@ -30,7 +33,25 @@ def _error_event(code: str, msg: str, req_id: Optional[int] = None) -> None:
         _write({"v": V, "ev": "error", "code": code, "msg": msg})
 
 
-def _handle(msg: Dict[str, Any], mode: str, hang_cmd: str, crash_cmd: str, busy_cmd: str) -> bool:
+def _flood_stderr() -> None:
+    line = "E" * 512 + "\n"
+    total = 0
+    target = int(os.environ.get("BEAMER_FAKE_HELPER_STDERR_MB", "1")) * 1024 * 1024
+    while total < target:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        total += len(line.encode("utf-8"))
+
+
+def _handle(
+    msg: Dict[str, Any],
+    mode: str,
+    hang_cmd: str,
+    crash_cmd: str,
+    busy_cmd: str,
+    late_cmd: str,
+    late_delay: float,
+) -> bool:
     """Returns False wenn der Prozess beendet werden soll."""
     if "cmd" not in msg:
         _error_event("bad_request", "cmd fehlt")
@@ -48,7 +69,27 @@ def _handle(msg: Dict[str, Any], mode: str, hang_cmd: str, crash_cmd: str, busy_
     if mode == "crash" and cmd == crash_cmd:
         os._exit(1)
     if mode == "busy" and cmd == busy_cmd:
+        count_env = os.environ.get("BEAMER_FAKE_HELPER_BUSY_COUNT")
+        if count_env not in (None, ""):
+            global _BUSY_REMAINING
+            if _BUSY_REMAINING is None:
+                _BUSY_REMAINING = int(count_env)
+            if _BUSY_REMAINING > 0:
+                _BUSY_REMAINING -= 1
+                _write({"v": V, "re": req_id, "ok": False, "error": {"code": "busy", "msg": "simuliert busy"}})
+                return True
+            _write({"v": V, "re": req_id, "ok": True, "local_port": 47001})
+            return True
         _write({"v": V, "re": req_id, "ok": False, "error": {"code": "busy", "msg": "simuliert busy"}})
+        return True
+    if mode == "late" and cmd == late_cmd:
+        rid = req_id
+
+        def delayed() -> None:
+            time.sleep(late_delay)
+            _write({"v": V, "re": rid, "ok": True, "late": True})
+
+        threading.Thread(target=delayed, daemon=True).start()
         return True
 
     if cmd == "hello":
@@ -80,7 +121,9 @@ def _handle(msg: Dict[str, Any], mode: str, hang_cmd: str, crash_cmd: str, busy_
                         "wid": 1,
                         "pid": 100,
                         "app": "FakeApp",
-                        "title": "Test",
+                        "title": os.environ.get(
+                            "BEAMER_FAKE_HELPER_TITLE", "Fenster – Übersicht"
+                        ),
                         "x": 0,
                         "y": 0,
                         "w": 800,
@@ -131,6 +174,11 @@ def main() -> int:
     hang_cmd = os.environ.get("BEAMER_FAKE_HELPER_HANG_CMD", "hang.test")
     crash_cmd = os.environ.get("BEAMER_FAKE_HELPER_CRASH_CMD", "crash.test")
     busy_cmd = os.environ.get("BEAMER_FAKE_HELPER_BUSY_CMD", "busy.test")
+    late_cmd = os.environ.get("BEAMER_FAKE_HELPER_LATE_CMD", "transport.open")
+    late_delay = float(os.environ.get("BEAMER_FAKE_HELPER_LATE_DELAY", "0.4"))
+
+    if os.environ.get("BEAMER_FAKE_HELPER_STDERR_FLOOD", "").strip() in ("1", "true", "yes"):
+        threading.Thread(target=_flood_stderr, daemon=True).start()
 
     for line in sys.stdin:
         line = line.strip()
@@ -146,7 +194,7 @@ def main() -> int:
             continue
         if msg.get("cmd") == "hang.test":
             continue
-        if not _handle(msg, mode, hang_cmd, crash_cmd, busy_cmd):
+        if not _handle(msg, mode, hang_cmd, crash_cmd, busy_cmd, late_cmd, late_delay):
             break
     return 0
 
