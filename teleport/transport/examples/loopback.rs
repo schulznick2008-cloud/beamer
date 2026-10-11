@@ -87,6 +87,7 @@ struct Report {
     dropped: u64,
     keyframe_reqs: u64,
     min_target: u32,
+    refused: u64,
     final_target: u32,
     kbps: f64,
 }
@@ -171,16 +172,21 @@ fn run(o: &Opts, loss: f64, secs: f64) -> Report {
     let start = Instant::now();
     let mut next = start;
     let mut bytes = 0u64;
+    let mut refused = 0u64;
     while start.elapsed().as_secs_f64() < secs {
         let key = i.is_multiple_of(key_every) || want_key.swap(false, Ordering::Relaxed);
+        // Wie ein echter Encoder die Zielbitrate beachten: Nennbitrate des Beispiels ca. 3000 kbit/s.
+        let scale = (tx.target_kbps(SID) as f64 / 3000.0).clamp(0.05, 1.0);
         let data: &[u8] = if key {
-            &big
+            &big[..(big.len() as f64 * scale) as usize]
         } else {
-            let n = 3000 + (rng.next_f64() * 5000.0) as usize;
-            &payload[..n]
+            let n = (3000.0 + rng.next_f64() * 5000.0) * scale;
+            &payload[..(n as usize).max(200)]
         };
         let pts = t0.elapsed().as_micros() as u64;
-        tx.send_frame(SID, 1, data, pts, key as u8).unwrap();
+        if tx.send_frame(SID, 1, data, pts, key as u8).is_err() {
+            refused += 1; // Sendewarteschlange voll
+        }
         bytes += data.len() as u64;
         min_target = min_target.min(tx.target_kbps(SID));
         i += 1;
@@ -210,6 +216,7 @@ fn run(o: &Opts, loss: f64, secs: f64) -> Report {
         dropped: rc.frames_dropped,
         keyframe_reqs: rc.keyframe_reqs_sent,
         min_target,
+        refused,
         final_target: tx.target_kbps(SID),
         kbps: bytes as f64 * 8.0 / 1000.0 / elapsed,
     };
@@ -272,6 +279,12 @@ fn main() {
         "  NACKs: {}  Wiederholungen: {}  FEC gesendet: {}  FEC repariert: {}",
         r.nacks, r.retransmits, r.fec_sent, r.fec_recovered
     );
+    if r.refused > 0 {
+        println!(
+            "  abgelehnt (Sendewarteschlange voll): {} Frames",
+            r.refused
+        );
+    }
     println!(
         "  Zielbitrate: min {} kbit/s, am Ende {} kbit/s (Maximum {})",
         r.min_target, r.final_target, o.max_kbps

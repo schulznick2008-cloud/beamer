@@ -68,7 +68,7 @@ fn c_abi_end_to_end() {
             bt_add_stream(
                 tx,
                 5,
-                BtRole::BT_ROLE_SENDER,
+                BtRole::BT_ROLE_SENDER as u32,
                 s2r_key.as_ptr(),
                 s2r_pfx.as_ptr(),
                 r2s_key.as_ptr(),
@@ -81,7 +81,7 @@ fn c_abi_end_to_end() {
             bt_add_stream(
                 rx,
                 5,
-                BtRole::BT_ROLE_RECEIVER,
+                BtRole::BT_ROLE_RECEIVER as u32,
                 s2r_key.as_ptr(),
                 s2r_pfx.as_ptr(),
                 r2s_key.as_ptr(),
@@ -119,7 +119,7 @@ fn c_abi_end_to_end() {
             bt_add_stream(
                 tx,
                 6,
-                BtRole::BT_ROLE_SENDER,
+                BtRole::BT_ROLE_SENDER as u32,
                 std::ptr::null(),
                 s2r_pfx.as_ptr(),
                 r2s_key.as_ptr(),
@@ -129,6 +129,27 @@ fn c_abi_end_to_end() {
         );
         assert!(last_error().contains("s2r_key"));
         assert!(bt_set_peer(tx, std::ptr::null(), 1) < 0);
+        // Ungueltige Rolle: Fehler statt undefiniertem Verhalten.
+        assert!(
+            bt_add_stream(
+                tx,
+                8,
+                7,
+                s2r_key.as_ptr(),
+                s2r_pfx.as_ptr(),
+                r2s_key.as_ptr(),
+                r2s_pfx.as_ptr(),
+                1
+            ) < 0
+        );
+        assert!(last_error().contains("Rolle"), "{}", last_error());
+        // Obergrenze aendern: Senkung wirkt sofort, Erhoehung springt auf 50 %.
+        assert_eq!(bt_set_max_kbps(tx, 5, 3000), 0);
+        assert_eq!(bt_target_kbps(tx, 5), 3000);
+        assert_eq!(bt_set_max_kbps(tx, 5, 10_000), 0);
+        assert_eq!(bt_target_kbps(tx, 5), 5000);
+        assert!(bt_set_max_kbps(tx, 5, 0) < 0);
+        assert!(bt_set_max_kbps(tx, 77, 1000) < 0);
         assert!(bt_remove_stream(tx, 77) < 0);
         assert_eq!(bt_target_kbps(tx, 77), 0);
         assert_eq!(bt_local_port(std::ptr::null()), 0);

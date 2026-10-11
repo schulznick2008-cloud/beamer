@@ -19,13 +19,34 @@ const MAX_OPEN_FRAMES: usize = 64;
 const MAX_RETX_ENTRIES: usize = 40_000;
 const MAX_NACK_TRIES: u8 = 8;
 const NACK_PER_PACKET: usize = (MAX_PLAINTEXT - 2) / 8;
-const ASM_MAX_AGE: Duration = Duration::from_millis(500);
+/// Hoechstalter eines unvollstaendigen Frames, egal wie lange noch Pakete tropfen.
+const ASM_MAX_AGE: Duration = Duration::from_millis(250);
+/// Pacing des Senders: Token-Bucket mit 1,5 x Zielbitrate, Burst hoechstens 64 KB.
+const PACE_BURST: f64 = 64.0 * 1024.0;
+const PACE_FACTOR: f64 = 1.5;
+/// Was hoechstens in der Sendewarteschlange stehen darf: 300 ms Bucket-Rate, mindestens 128 KB.
+const MAX_PACE_QUEUE_MS: f64 = 0.3;
+const MIN_PACE_QUEUE: usize = 128 * 1024;
+/// Restverlust (nach FEC/NACK) ab dem gedrosselt wird, und Rohverlust als Notbremse (je in Promille).
+const RESIDUAL_LOSS_LIMIT: u16 = 10;
+const RAW_LOSS_EMERGENCY: u16 = 80;
 const PING_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Sender,
     Receiver,
+}
+
+/// Angaben der Session, die in die Statistik eines Streams wandern.
+#[derive(Clone, Debug, Default)]
+pub struct TickInfo {
+    pub auth_fail: u64,
+    /// Aktuelle Gegenstelle als `ip:port` (leer = unbekannt).
+    pub peer: String,
+    /// Tatsaechliche Socket-Puffergroessen nach set_recv/send_buffer_size.
+    pub rcvbuf: u32,
+    pub sndbuf: u32,
 }
 
 /// Was die Session nach einem Aufruf erledigen muss.
@@ -144,8 +165,12 @@ struct Window {
     hold_sum_ms: f64,
     hold_n: u64,
     lost: u64,
+    /// Verloren und weder per NACK noch per FEC zurueckgekommen.
+    resid: u64,
     hi_at_start: Option<u64>,
+    /// Rohverlust und Restverlust des letzten Feedbacks (Promille).
     last_loss_permille: u16,
+    last_resid_permille: u16,
 }
 
 pub struct Stream {
@@ -172,7 +197,14 @@ pub struct Stream {
     prev_jitter_us: u32,
     jitter_rises: u8,
     fb_loss_permille: u16,
+    fb_raw_permille: u16,
     fb_recv_kbps: u32,
+    pace_q: VecDeque<Vec<u8>>,
+    pace_bytes: usize,
+    tokens: f64,
+    last_refill: Instant,
+    /// Das zuletzt verarbeitete Paket hatte die hoechste bisher gesehene seq (fuer Roaming).
+    pub last_new_max: bool,
 
     // Empfaenger
     hi: Option<u64>,
@@ -246,7 +278,13 @@ impl Stream {
             prev_jitter_us: 0,
             jitter_rises: 0,
             fb_loss_permille: 0,
+            fb_raw_permille: 0,
             fb_recv_kbps: 0,
+            pace_q: VecDeque::new(),
+            pace_bytes: 0,
+            tokens: PACE_BURST,
+            last_refill: now,
+            last_new_max: false,
             hi: None,
             missing: BTreeMap::new(),
             video: BTreeMap::new(),
@@ -277,7 +315,68 @@ impl Stream {
     }
 
     pub fn needs_fast_tick(&self) -> bool {
-        !self.missing.is_empty() || !self.video.is_empty() || !self.completed.is_empty()
+        !self.missing.is_empty()
+            || !self.video.is_empty()
+            || !self.completed.is_empty()
+            || !self.pace_q.is_empty()
+    }
+
+    /// Neue Obergrenze (z. B. nach Pfadwechsel). Erhoehung: Zielbitrate springt auf mindestens 50 %
+    /// der neuen Obergrenze. Senkung: Zielbitrate hoechstens die neue Obergrenze.
+    pub fn set_max_kbps(&mut self, max_kbps: u32) {
+        let new = max_kbps.max(1);
+        let old = self.max_kbps;
+        self.max_kbps = new;
+        if new > old {
+            self.target_kbps = self.target_kbps.max(new as f64 * 0.5);
+        }
+        self.target_kbps = self.target_kbps.min(new as f64);
+    }
+
+    pub fn max_kbps(&self) -> u32 {
+        self.max_kbps
+    }
+
+    /// Ein ping jetzt (nach Wechsel der Gegenstelle).
+    pub fn ping_now(&mut self, now: Instant, io: &mut Io) {
+        self.last_ping = Some(now);
+        let t = self.now_us(now).to_be_bytes();
+        self.packet(now, T_PING, &t, false, io);
+    }
+
+    /// Gibt wartende Sender-Pakete im Takt des Token-Buckets frei.
+    pub fn pace(&mut self, now: Instant, io: &mut Io) {
+        if self.role != Role::Sender {
+            return;
+        }
+        let dt = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.last_refill = now;
+        let rate = self.target_kbps * PACE_FACTOR * 125.0; // Byte je Sekunde
+        self.tokens = (self.tokens + dt * rate).min(PACE_BURST);
+        while let Some(front) = self.pace_q.front() {
+            if self.tokens < front.len() as f64 {
+                break;
+            }
+            let d = self.pace_q.pop_front().unwrap();
+            self.tokens -= d.len() as f64;
+            self.pace_bytes -= d.len();
+            io.out.push(d);
+        }
+    }
+
+    fn pace_queue_limit(&self) -> usize {
+        ((self.target_kbps * PACE_FACTOR * 125.0 * MAX_PACE_QUEUE_MS) as usize).max(MIN_PACE_QUEUE)
+    }
+
+    fn emit(&mut self, d: Vec<u8>, io: &mut Io) {
+        if self.role == Role::Sender {
+            self.pace_bytes += d.len();
+            self.pace_q.push_back(d);
+        } else {
+            io.out.push(d);
+        }
     }
 
     fn deadline(&self) -> Duration {
@@ -329,7 +428,7 @@ impl Stream {
             last_retx: None,
             datagram: if keep { Some(d.clone()) } else { None },
         });
-        io.out.push(d);
+        self.emit(d, io);
         Some(())
     }
 
@@ -350,6 +449,9 @@ impl Stream {
         }
         if data.is_empty() || data.len() > MAX_FRAME_BYTES {
             return Err("Frame leer oder groesser als 16 MiB".into());
+        }
+        if self.pace_bytes > self.pace_queue_limit() {
+            return Err("Sendewarteschlange voll (Bitrate zu hoch fuer die Leitung)".into());
         }
         let ptype = if kind == 1 { T_VIDEO } else { T_AUDIO };
         let frame_id = if kind == 1 {
@@ -387,6 +489,7 @@ impl Stream {
         }
         self.c.frames_sent += 1;
         self.win.frames += 1;
+        self.pace(now, io);
         Ok(())
     }
 
@@ -437,13 +540,16 @@ impl Stream {
         {
             return;
         }
-        if let Some(d) = &e.datagram {
+        if let Some(d) = e.datagram.clone() {
             e.last_retx = Some(now);
-            io.out.push(d.clone());
+            if self.pace_bytes > self.pace_queue_limit() {
+                return;
+            }
             self.c.retransmits += 1;
             self.c.packets_sent += 1;
             self.c.bytes_sent += d.len() as u64;
             self.win.bytes_sent += d.len() as u64;
+            self.emit(d, io);
         }
     }
 
@@ -452,7 +558,14 @@ impl Stream {
             return;
         }
         let recv_kbps = u32::from_be_bytes(fb[0..4].try_into().unwrap());
+        // loss_permille = Restverlust nach NACK/FEC; ein optionales Feld am Ende traegt den Rohverlust.
         let loss = u16::from_be_bytes(fb[4..6].try_into().unwrap());
+        let raw = if fb.len() >= 16 {
+            u16::from_be_bytes(fb[14..16].try_into().unwrap())
+        } else {
+            loss
+        };
+        self.fb_raw_permille = raw;
         let jitter = u32::from_be_bytes(fb[6..10].try_into().unwrap());
         self.fb_loss_permille = loss;
         self.fb_recv_kbps = recv_kbps;
@@ -471,8 +584,9 @@ impl Stream {
             self.jitter_rises = 0;
         }
         let jitter_rising = self.jitter_rises >= 2;
-        // 4.1: bei loss > 20 permille oder steigendem Jitter 15 % je Sekunde runter, sonst 5 % je Sekunde rauf.
-        if loss > 20 || jitter_rising {
+        // 4.1 (v1.1): bei Restverlust > 1 %, Rohverlust > 8 % (Notbremse) oder steigendem Jitter
+        // 15 % je Sekunde runter, sonst 5 % je Sekunde rauf.
+        if loss > RESIDUAL_LOSS_LIMIT || raw > RAW_LOSS_EMERGENCY || jitter_rising {
             self.target_kbps *= 0.85f64.powf(dt);
         } else {
             self.target_kbps *= 1.05f64.powf(dt);
@@ -488,8 +602,11 @@ impl Stream {
     /// Verarbeitet ein Datagramm, dessen Header schon als `h` gelesen wurde.
     pub fn receive(&mut self, now: Instant, d: &[u8], h: &Header, io: &mut Io) -> RxResult {
         let allowed = match self.role {
-            Role::Sender => matches!(h.ptype, T_NACK | T_KEYFRAME_REQ | T_FEEDBACK | T_PING),
-            Role::Receiver => matches!(h.ptype, T_VIDEO | T_AUDIO | T_FEC | T_PONG),
+            Role::Sender => matches!(
+                h.ptype,
+                T_NACK | T_KEYFRAME_REQ | T_FEEDBACK | T_PING | T_PONG
+            ),
+            Role::Receiver => matches!(h.ptype, T_VIDEO | T_AUDIO | T_FEC | T_PONG | T_PING),
         };
         if !allowed {
             self.c.malformed += 1;
@@ -503,6 +620,7 @@ impl Stream {
         let Some(plain) = self.rx.open(d, h) else {
             return RxResult::AuthFail;
         };
+        self.last_new_max = h.seq > self.replay.top();
         self.replay.commit(h.seq);
         self.c.packets_recv += 1;
         self.c.bytes_recv += d.len() as u64;
@@ -557,6 +675,7 @@ impl Stream {
             self.c.malformed += 1;
             return RxResult::Malformed;
         }
+        self.pace(now, io);
         RxResult::Ok
     }
 
@@ -569,6 +688,7 @@ impl Stream {
             let seq = u64::from_be_bytes(p[2 + i * 8..10 + i * 8].try_into().unwrap());
             self.retransmit(now, seq, io);
         }
+        self.pace(now, io);
     }
 
     /// Luecken in der Sequenz merken (fuer NACK).
@@ -898,12 +1018,25 @@ impl Stream {
 
     // ---------------------------------------------------------------- Zeitgesteuert
 
-    pub fn tick(&mut self, now: Instant, auth_fail: u64, io: &mut Io) {
+    pub fn tick(&mut self, now: Instant, info: &TickInfo, io: &mut Io) {
         if self.role == Role::Receiver {
             self.tick_receiver(now, io);
         }
+        // ping: Empfaenger sobald Verkehr da ist, Sender sobald er gesendet hat (misst die Sender-RTT).
+        let active = match self.role {
+            Role::Receiver => self.saw_traffic,
+            Role::Sender => self.tx_seq > 0,
+        };
+        if active {
+            match self.last_ping {
+                None if self.role == Role::Sender => self.last_ping = Some(now), // erstes ping nach 500 ms
+                Some(t) if now.saturating_duration_since(t) < PING_INTERVAL => {}
+                _ => self.ping_now(now, io),
+            }
+        }
+        self.pace(now, io);
         if now.saturating_duration_since(self.last_stats) >= Duration::from_secs(1) {
-            self.emit_stats(now, auth_fail, io);
+            self.emit_stats(now, info, io);
         }
     }
 
@@ -959,20 +1092,10 @@ impl Stream {
 
         self.send_nacks(now, io);
 
-        // ping
-        if self
-            .last_ping
-            .is_none_or(|t| now.saturating_duration_since(t) >= PING_INTERVAL)
-            && (self.last_ping.is_some() || self.saw_traffic)
-        {
-            self.last_ping = Some(now);
-            let t = self.now_us(now).to_be_bytes();
-            self.packet(now, T_PING, &t, false, io);
-        }
-
         // feedback
         if let Some(fm) = self.first_media {
-            let bad = self.win.last_loss_permille > 20;
+            let bad = self.win.last_resid_permille > RESIDUAL_LOSS_LIMIT
+                || self.win.last_loss_permille > RAW_LOSS_EMERGENCY;
             let every = if bad {
                 Duration::from_millis(500)
             } else {
@@ -1004,6 +1127,7 @@ impl Stream {
         );
         let mut ask: Vec<u64> = Vec::new();
         let mut judged = 0u64;
+        let mut resid = 0u64;
         self.missing.retain(|seq, m| {
             let age = now.saturating_duration_since(m.first);
             if !m.judged && age >= delay {
@@ -1011,6 +1135,9 @@ impl Stream {
                 judged += 1;
             }
             if age > RETX_WINDOW || m.tries >= MAX_NACK_TRIES {
+                if !m.settled {
+                    resid += 1; // nie zurueckgekommen und nicht per FEC ersetzt
+                }
                 return false;
             }
             let ready = !m.settled
@@ -1025,6 +1152,7 @@ impl Stream {
             true
         });
         self.win.lost += judged;
+        self.win.resid += resid;
         for chunk in ask.chunks(NACK_PER_PACKET) {
             let mut p = Vec::with_capacity(2 + chunk.len() * 8);
             p.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
@@ -1037,16 +1165,17 @@ impl Stream {
         }
     }
 
-    fn loss_permille_window(&self) -> u16 {
+    /// (Rohverlust, Restverlust) im laufenden Fenster in Promille.
+    fn loss_permille_window(&self) -> (u16, u16) {
         let (Some(hi), Some(start)) = (self.hi, self.win.hi_at_start) else {
-            return 0;
+            return (0, 0);
         };
         let expected = hi.saturating_sub(start);
         if expected == 0 {
-            return 0;
+            return (0, 0);
         }
-        let lost = self.win.lost.min(expected);
-        (((lost) as f64 / expected as f64) * 1000.0).round() as u16
+        let pm = |n: u64| ((n.min(expected) as f64 / expected as f64) * 1000.0).round() as u16;
+        (pm(self.win.lost), pm(self.win.resid))
     }
 
     fn send_feedback(&mut self, now: Instant, io: &mut Io) {
@@ -1057,20 +1186,23 @@ impl Stream {
             .unwrap_or(1.0)
             .max(0.05);
         let kbps = (self.win.bytes_recv as f64 * 8.0 / 1000.0 / secs) as u32;
-        let loss = self.loss_permille_window();
-        let mut p = Vec::with_capacity(14);
+        let (raw, resid) = self.loss_permille_window();
+        let mut p = Vec::with_capacity(16);
         p.extend_from_slice(&kbps.to_be_bytes());
-        p.extend_from_slice(&loss.to_be_bytes());
+        p.extend_from_slice(&resid.to_be_bytes());
         p.extend_from_slice(&(self.jitter_us as u32).to_be_bytes());
         p.extend_from_slice(&self.last_frame_id.to_be_bytes());
+        p.extend_from_slice(&raw.to_be_bytes());
         self.packet(now, T_FEEDBACK, &p, false, io);
         self.last_feedback = Some(now);
-        self.win.last_loss_permille = loss;
+        self.win.last_loss_permille = raw;
+        self.win.last_resid_permille = resid;
         self.win.lost = 0;
+        self.win.resid = 0;
         self.win.hi_at_start = self.hi;
     }
 
-    fn emit_stats(&mut self, now: Instant, auth_fail: u64, io: &mut Io) {
+    fn emit_stats(&mut self, now: Instant, info: &TickInfo, io: &mut Io) {
         let secs = now
             .saturating_duration_since(self.last_stats)
             .as_secs_f64()
@@ -1079,9 +1211,9 @@ impl Stream {
         let (bytes, loss_pct, latency_ms, rtt) = match self.role {
             Role::Sender => (
                 self.win.bytes_sent,
-                self.fb_loss_permille as f64 / 10.0,
+                self.fb_raw_permille as f64 / 10.0,
                 0.0,
-                0.0,
+                self.srtt_ms.unwrap_or(0.0),
             ),
             Role::Receiver => {
                 let hold = if self.win.hold_n > 0 {
@@ -1102,7 +1234,7 @@ impl Stream {
         let json = format!(
             "{{\"fps\":{:.1},\"kbps\":{:.0},\"rtt_ms\":{:.1},\"loss_pct\":{:.1},\"latency_ms\":{:.1},\
 \"role\":\"{}\",\"target_kbps\":{},\"jitter_ms\":{:.2},\"frames_complete\":{},\"frames_delivered\":{},\
-\"frames_dropped\":{},\"retransmits\":{},\"nacks\":{},\"fec_recovered\":{},\"auth_fail\":{},\"peer_recv_kbps\":{}}}",
+\"frames_dropped\":{},\"retransmits\":{},\"nacks\":{},\"fec_recovered\":{},\"auth_fail\":{},\"peer_recv_kbps\":{},\"resid_loss_pct\":{:.1},\"peer\":\"{}\",\"sock_rcvbuf\":{},\"sock_sndbuf\":{},\"pace_queue_bytes\":{}}}",
             fps,
             kbps,
             rtt,
@@ -1117,8 +1249,17 @@ impl Stream {
             self.c.retransmits,
             self.c.nacks_sent,
             self.c.fec_recovered,
-            auth_fail,
-            self.fb_recv_kbps
+            info.auth_fail,
+            self.fb_recv_kbps,
+            match self.role {
+                Role::Sender => self.fb_loss_permille,
+                Role::Receiver => self.win.last_resid_permille,
+            } as f64
+                / 10.0,
+            info.peer,
+            info.rcvbuf,
+            info.sndbuf,
+            self.pace_bytes
         );
         io.events.push(Event::Stats {
             stream: self.id,

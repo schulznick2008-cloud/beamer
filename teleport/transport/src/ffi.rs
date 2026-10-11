@@ -151,7 +151,7 @@ pub unsafe extern "C" fn bt_set_peer(s: *mut BtSession, host: *const c_char, por
 pub unsafe extern "C" fn bt_add_stream(
     s: *mut BtSession,
     stream_id: u32,
-    role: BtRole,
+    role: u32,
     s2r_key: *const u8,
     s2r_prefix: *const u8,
     r2s_key: *const u8,
@@ -166,9 +166,11 @@ pub unsafe extern "C" fn bt_add_stream(
             r2s_key: array(r2s_key, "r2s_key")?,
             r2s_prefix: array(r2s_prefix, "r2s_prefix")?,
         };
+        // Als uint32_t statt Enum, damit ein ungueltiger Wert aus C kein undefiniertes Verhalten ist.
         let role = match role {
-            BtRole::BT_ROLE_SENDER => Role::Sender,
-            BtRole::BT_ROLE_RECEIVER => Role::Receiver,
+            r if r == BtRole::BT_ROLE_SENDER as u32 => Role::Sender,
+            r if r == BtRole::BT_ROLE_RECEIVER as u32 => Role::Receiver,
+            r => return Err(format!("ungueltige Rolle {r} (1 = Sender, 2 = Receiver)")),
         };
         s.s.add_stream(stream_id, role, &keys, max_kbps)
     })
@@ -216,6 +218,18 @@ pub unsafe extern "C" fn bt_target_kbps(s: *const BtSession, stream_id: u32) -> 
         s.as_ref().map_or(0, |s| s.s.target_kbps(stream_id))
     }))
     .unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bt_set_max_kbps(
+    s: *mut BtSession,
+    stream_id: u32,
+    max_kbps: u32,
+) -> c_int {
+    guard_int(|| {
+        let s = s.as_ref().ok_or("session ist NULL")?;
+        s.s.set_max_kbps(stream_id, max_kbps)
+    })
 }
 
 #[no_mangle]

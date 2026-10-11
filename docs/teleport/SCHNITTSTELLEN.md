@@ -7,7 +7,7 @@ passen dann an. Unklarheiten nicht selbst auflösen, sondern im PR als Frage mel
 Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zeiten sind in µs
 (monotone Uhr des Senders).
 
-Änderungen: v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5.
+Änderungen: v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`.
 
 ## 0. Begriffe und Komponenten
 
@@ -117,20 +117,21 @@ Offset Größe Feld (Header = AAD, unverschlüsselt)
 - Ein Paket ist höchstens **1200 Byte** groß, inklusive Header und Tag.
 - Replay-Schutz: Fenster von 4096 seq-Werten, Duplikate und zu alte Pakete werden verworfen. Pakete, die die Authentifizierung nicht bestehen, werden still verworfen und gezählt.
 - Roaming: Die Gegenstelle ist an `stream_id` und Schlüssel gebunden, nicht an die IP. Kommt ein Paket von einer neuen Quelladresse, das die Authentifizierung besteht, kein Replay ist und dessen `seq` größer ist als jede bisher gesehene dieses Streams, übernimmt der Transport diese Adresse als Ziel für alle Streams der Session.
-- Medien laufen vom Sender zum Empfänger (Richtung `s2r`). `nack`, `keyframe_req`, `feedback`, `ping` und `pong` laufen in Gegenrichtung (`r2s`), `pong` als Antwort auch `s2r`.
+- Medien laufen vom Sender zum Empfänger (Richtung `s2r`). `nack`, `keyframe_req`, `feedback`, `ping` und `pong` laufen in Gegenrichtung (`r2s`), `pong` als Antwort auch `s2r`. Der Sender schickt zusätzlich eigene `ping` (`s2r`, ab 500 ms nach dem ersten Paket, dann alle 500 ms), der Empfänger antwortet mit `pong` (`r2s`); so kennt auch der Sender die RTT.
 
 Klartext je Typ:
 - **video/audio**: `frame_id` u32 ‖ `frag_idx` u16 ‖ `frag_cnt` u16 ‖ `pts_us` u64 ‖ `fflags` u8 (Bit0 = Keyframe, Bit1–3 Codec: 1=h264, 2=hevc, 3=opus) ‖ Nutzdaten. Video ist Annex-B. Jeder Keyframe enthält VPS/SPS/PPS inline.
 - **fec**: `frame_id` u32 ‖ `group_start` u16 ‖ `group_len` u16 ‖ XOR-Parität über die Klartexte der Gruppe (auf die gleiche Länge mit Nullen aufgefüllt, dazu die Länge als u16 je Quelle in der Parität). Standard ist eine Parität je 8 Fragmente, abschaltbar.
 - **nack**: Anzahl u16 ‖ n × seq u64.
 - **keyframe_req**: leer.
-- **feedback**: `recv_kbps` u32 ‖ `loss_permille` u16 ‖ `jitter_us` u32 ‖ `last_frame_id` u32.
+- **feedback**: `recv_kbps` u32 ‖ `loss_permille` u16 ‖ `jitter_us` u32 ‖ `last_frame_id` u32 ‖ optional `raw_loss_permille` u16. `loss_permille` ist der **Restverlust** nach NACK/FEC-Reparatur (Pakete, die weder nachgeliefert noch per FEC ersetzt wurden), `raw_loss_permille` der Rohverlust im Fenster. Fehlt das Feld (alte Gegenstelle), gilt `loss_permille` für beides.
 - **ping/pong**: `t_us` u64 (pong spiegelt das t_us des pings).
 
 Verhalten:
-- Der Empfänger schickt bei Lücken einen NACK. Ist ein Frame nach 2 × RTT noch unvollständig, wird er verworfen und ein `keyframe_req` geschickt (höchstens alle 300 ms).
+- Der Empfänger schickt bei Lücken einen NACK. Ist ein Frame nach 2 × RTT (mindestens 30 ms, höchstens 250 ms, gerechnet ab dem letzten Paket des Frames) noch unvollständig, wird er verworfen und ein `keyframe_req` geschickt (höchstens alle 300 ms).
 - Der Sender hält einen Puffer zum erneuten Senden von 300 ms.
-- Bitratenregelung (Sender): bei `loss_permille` > 20 oder steigendem Jitter um 15 % pro Sekunde senken, sonst um 5 % pro Sekunde anheben, bis zu `bitrate_kbps`.
+- Bitratenregelung (Sender, v1.1/C01a): Zielbitrate um 15 % pro Sekunde senken bei **Restverlust** `loss_permille` > 10 (1 %), bei **Rohverlust** `raw_loss_permille` > 80 (8 %, Notbremse) oder bei steigendem Jitter (zwei Anstiege in Folge um je ≥ 15 % und ≥ 2 ms). Sonst um 5 % pro Sekunde anheben, bis zur Obergrenze (`bitrate_kbps`, `bt_set_max_kbps`). Untergrenze: Obergrenze/20, mindestens 200 kbit/s. Grund: FEC und NACK heilen Verluste unterhalb dieser Schwellen, eine Drosselung nach Rohverlust würde nur Qualität kosten.
+- Pacing (Sender): Token-Bucket mit 1,5 × Zielbitrate, Burst höchstens 64 KB; Wiederholungen und Steuerpakete laufen durch denselben Bucket. Die Warteschlange fasst höchstens 300 ms der Bucket-Rate (mindestens 128 KB), darüber lehnt `bt_send_frame` mit einem Fehler ab (der Encoder soll das Frame auslassen).
 
 ### 4.2 Schlüssel
 
@@ -163,7 +164,7 @@ typedef void (*BtOnStats)(void *ctx, uint32_t stream_id, const char *json);
 BtSession *bt_open(uint16_t local_port, BtOnFrame, BtOnControl, BtOnStats, void *ctx); // NULL bei Fehler
 uint16_t   bt_local_port(const BtSession *);
 int        bt_set_peer(BtSession *, const char *host, uint16_t port);
-int        bt_add_stream(BtSession *, uint32_t stream_id, BtRole role,
+int        bt_add_stream(BtSession *, uint32_t stream_id, uint32_t role /* BtRole */,
                          const uint8_t s2r_key[32], const uint8_t s2r_prefix[4],
                          const uint8_t r2s_key[32], const uint8_t r2s_prefix[4],
                          uint32_t max_kbps);
@@ -177,7 +178,8 @@ void       bt_close(BtSession *);
 const char*bt_last_error(void);                                         // thread-lokal
 ```
 
-- Rückgabe 0 bedeutet OK, <0 einen Fehler.
+- Rückgabe 0 bedeutet OK, <0 einen Fehler. `role` ist ein `uint32_t` mit den Werten von `BtRole`; andere Werte liefern einen Fehler (kein undefiniertes Verhalten).
+- `bt_add_stream` lehnt ein Schlüsselpaar (Schlüssel + Präfix der Senderichtung) ab, das die Session schon benutzt hat, auch nach `bt_remove_stream`: gleiche Nonces mit neuem `seq` wären Nonce-Wiederverwendung. Python leitet pro Teleport frische Schlüssel ab (§4.2).
 - Die Callbacks kommen aus einem Transport-Thread. Der Aufrufer muss sie schnell verarbeiten (in eine Queue legen).
 - Ein Socket pro Session, beliebig viele Streams. Der Socket ist an `0.0.0.0` gebunden (alle Interfaces), damit derselbe Port über Kabel und WLAN erreichbar ist.
 - `bt_set_peer` darf jederzeit kommen, auch bei laufenden Streams. Es wirkt sofort, `seq`, Schlüssel und Puffer laufen weiter. Danach schickt der Transport sofort ein `ping` (Empfänger) bzw. das nächste Paket (Sender) an die neue Adresse.

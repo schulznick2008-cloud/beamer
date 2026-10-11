@@ -1,6 +1,6 @@
 //! Session: ein UDP-Socket, ein Transport-Thread, beliebig viele Streams.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::netem::{Netem, NetemConfig, Verdict};
 use crate::packet::{decode_header, MAX_PACKET};
-use crate::stream::{Counters, Event, Io, Role, RxResult, Stream};
+use crate::stream::{Counters, Event, Io, Role, RxResult, Stream, TickInfo};
 
 pub struct FrameRef<'a> {
     pub data: &'a [u8],
@@ -59,6 +59,11 @@ pub struct SessionCounters {
     /// Gueltiger Header, aber unbekannte stream_id.
     pub unknown_stream: u64,
     pub send_errors: u64,
+    /// Wie oft die Gegenstelle per Roaming auf eine neue Quelladresse umgestellt wurde.
+    pub roams: u64,
+    /// Tatsaechliche Socket-Puffergroessen (Byte), vom Betriebssystem bestaetigt.
+    pub rcvbuf: u32,
+    pub sndbuf: u32,
 }
 
 struct State {
@@ -66,6 +71,8 @@ struct State {
     peer: Option<SocketAddr>,
     netem: Netem,
     c: SessionCounters,
+    /// (Schluessel, Praefix) aller je zum Senden benutzten Richtungen: Wiederverwendung waere Nonce-Reuse.
+    used_tx: HashSet<([u8; 32], [u8; 4])>,
 }
 
 struct Inner {
@@ -145,8 +152,18 @@ impl Inner {
         };
         match s.receive(now, d, &h, io) {
             RxResult::Ok => {
+                // Roaming (4.1): authentifiziert, kein Replay, hoechste seq dieses Streams.
+                let new_max = s.last_new_max;
                 if st.peer.is_none() {
                     st.peer = Some(src);
+                } else if new_max && st.peer != Some(src) {
+                    st.peer = Some(src);
+                    st.c.roams += 1;
+                    for s in st.streams.values_mut() {
+                        if s.role == Role::Receiver {
+                            s.ping_now(now, io);
+                        }
+                    }
                 }
             }
             RxResult::AuthFail => st.c.auth_fail += 1,
@@ -204,9 +221,14 @@ impl Inner {
                 let mut st = lock(&self.state);
                 let now = Instant::now();
                 let mut io = Io::default();
-                let auth = st.c.auth_fail;
+                let info = TickInfo {
+                    auth_fail: st.c.auth_fail,
+                    peer: st.peer.map(|p| p.to_string()).unwrap_or_default(),
+                    rcvbuf: st.c.rcvbuf,
+                    sndbuf: st.c.sndbuf,
+                };
                 for s in st.streams.values_mut() {
-                    s.tick(now, auth, &mut io);
+                    s.tick(now, &info, &mut io);
                 }
                 self.after(&mut st, io)
             }))
@@ -238,6 +260,10 @@ impl Session {
             .map_err(|e| format!("socket: {e}"))?;
         let _ = sock.set_recv_buffer_size(4 << 20);
         let _ = sock.set_send_buffer_size(4 << 20);
+        // Das Betriebssystem darf kleiner liefern als gewuenscht (macOS: kern.ipc.maxsockbuf); den
+        // wirklichen Wert lesen, loggen und in den Statistiken ausgeben.
+        let rcvbuf = sock.recv_buffer_size().unwrap_or(0) as u32;
+        let sndbuf = sock.send_buffer_size().unwrap_or(0) as u32;
         sock.bind(&SocketAddr::from(([0, 0, 0, 0], local_port)).into())
             .map_err(|e| format!("bind {local_port}: {e}"))?;
         let socket: UdpSocket = sock.into();
@@ -245,13 +271,19 @@ impl Session {
             .set_read_timeout(Some(Duration::from_millis(10)))
             .map_err(|e| format!("timeout: {e}"))?;
         let port = socket.local_addr().map_err(|e| e.to_string())?.port();
+        eprintln!("beamer-transport: UDP-Port {port}, Socket-Puffer empfangen {rcvbuf} B, senden {sndbuf} B");
         let inner = Arc::new(Inner {
             socket,
             state: Mutex::new(State {
                 streams: HashMap::new(),
                 peer: None,
                 netem: Netem::default(),
-                c: SessionCounters::default(),
+                c: SessionCounters {
+                    rcvbuf,
+                    sndbuf,
+                    ..Default::default()
+                },
+                used_tx: HashSet::new(),
             }),
             stop: AtomicBool::new(false),
             cb,
@@ -284,8 +316,35 @@ impl Session {
             .map_err(|e| format!("Adresse {host}:{port}: {e}"))?
             .find(|a| a.is_ipv4())
             .ok_or_else(|| format!("keine IPv4-Adresse fuer {host}"))?;
-        lock(&self.inner.state).peer = Some(addr);
+        let mut st = lock(&self.inner.state);
+        st.peer = Some(addr);
+        // Wirkt sofort: Empfaenger melden sich auf dem neuen Pfad (der Sender folgt mit dem naechsten Paket).
+        let now = Instant::now();
+        let mut io = Io::default();
+        for s in st.streams.values_mut() {
+            if s.role == Role::Receiver {
+                s.ping_now(now, &mut io);
+            }
+        }
+        self.inner.transmit(&mut st, io.out);
         Ok(())
+    }
+
+    /// Aktuelle Gegenstelle (nach Roaming die neue Adresse).
+    pub fn peer(&self) -> Option<SocketAddr> {
+        lock(&self.inner.state).peer
+    }
+
+    /// Neue Obergrenze der Bitrate eines Streams (Pfadwechsel).
+    pub fn set_max_kbps(&self, stream_id: u32, max_kbps: u32) -> Result<(), String> {
+        if max_kbps == 0 {
+            return Err("max_kbps muss > 0 sein".into());
+        }
+        lock(&self.inner.state)
+            .streams
+            .get_mut(&stream_id)
+            .map(|s| s.set_max_kbps(max_kbps))
+            .ok_or_else(|| format!("stream {stream_id} unbekannt"))
     }
 
     pub fn add_stream(
@@ -301,6 +360,16 @@ impl Session {
         let mut st = lock(&self.inner.state);
         if st.streams.contains_key(&stream_id) {
             return Err(format!("stream {stream_id} existiert schon"));
+        }
+        let tx_pair = match role {
+            Role::Sender => (keys.s2r_key, keys.s2r_prefix),
+            Role::Receiver => (keys.r2s_key, keys.r2s_prefix),
+        };
+        if !st.used_tx.insert(tx_pair) {
+            return Err(
+                "Sendeschluessel schon benutzt (Nonce-Wiederverwendung): neue Schluessel ableiten"
+                    .into(),
+            );
         }
         st.streams.insert(
             stream_id,

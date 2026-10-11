@@ -22,6 +22,11 @@ impl ReplayWindow {
         }
     }
 
+    /// Hoechste bisher angenommene seq (0 = noch keine).
+    pub fn top(&self) -> u64 {
+        self.top
+    }
+
     fn slot(seq: u64) -> (usize, u64) {
         let i = seq % WINDOW;
         ((i / 64) as usize, 1u64 << (i % 64))

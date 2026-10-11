@@ -17,6 +17,9 @@ pub struct NetemConfig {
     pub seed: u64,
     /// Jeweils die erste Uebertragung dieser seq wird verworfen (deterministische Tests).
     pub drop_once: HashSet<u64>,
+    /// Verwirft die erste Uebertragung jedes n-ten Video-Pakets (0 = aus). Deterministisch, unabhaengig
+    /// von zwischengeschobenen ping/pong-Paketen.
+    pub drop_video_every: u64,
 }
 
 impl NetemConfig {
@@ -26,6 +29,7 @@ impl NetemConfig {
             && self.jitter_ms <= 0.0
             && self.reorder_pct <= 0.0
             && self.drop_once.is_empty()
+            && self.drop_video_every == 0
     }
 }
 
@@ -81,6 +85,8 @@ pub struct Netem {
     rng: Option<Rng>,
     heap: BinaryHeap<Delayed>,
     counter: u64,
+    video_seen: u64,
+    video_top: u64,
 }
 
 pub enum Verdict {
@@ -119,6 +125,13 @@ impl Netem {
         let rng = self.rng.get_or_insert_with(|| Rng::new(0));
         if self.cfg.drop_once.remove(&seq) {
             return Verdict::Held;
+        }
+        if self.cfg.drop_video_every > 0 && data.get(1) == Some(&1) && seq > self.video_top {
+            self.video_top = seq;
+            self.video_seen += 1;
+            if self.video_seen.is_multiple_of(self.cfg.drop_video_every) {
+                return Verdict::Held;
+            }
         }
         if self.cfg.loss_pct > 0.0 && rng.next_f64() * 100.0 < self.cfg.loss_pct {
             return Verdict::Held;

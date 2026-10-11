@@ -40,7 +40,7 @@ uint16_t bt_local_port(const BtSession *s);
 
 int bt_set_peer(BtSession *s, const char *host, uint16_t port);
 
-int bt_add_stream(BtSession *s, uint32_t stream_id, BtRole role, const uint8_t *s2r_key, const uint8_t *s2r_prefix, const uint8_t *r2s_key, const uint8_t *r2s_prefix, uint32_t max_kbps);
+int bt_add_stream(BtSession *s, uint32_t stream_id, uint32_t role, const uint8_t *s2r_key, const uint8_t *s2r_prefix, const uint8_t *r2s_key, const uint8_t *r2s_prefix, uint32_t max_kbps);
 
 int bt_remove_stream(BtSession *s, uint32_t stream_id);
 
@@ -49,6 +49,8 @@ int bt_send_frame(BtSession *s, uint32_t stream_id, uint8_t kind, const uint8_t 
 int bt_request_keyframe(BtSession *s, uint32_t stream_id);
 
 uint32_t bt_target_kbps(const BtSession *s, uint32_t stream_id);
+
+int bt_set_max_kbps(BtSession *s, uint32_t stream_id, uint32_t max_kbps);
 
 void bt_close(BtSession *s);
 

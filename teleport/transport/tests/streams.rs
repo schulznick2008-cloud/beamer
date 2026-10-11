@@ -65,7 +65,7 @@ impl Pair {
 
     fn tick_rx(&mut self) -> (Vec<Vec<u8>>, Vec<u32>) {
         let mut io = Io::default();
-        self.rx.tick(self.now, 0, &mut io);
+        self.rx.tick(self.now, &Default::default(), &mut io);
         let f = frames(&io);
         (io.out, f)
     }
@@ -314,4 +314,123 @@ fn frames_are_delivered_in_order_even_if_packets_arrive_interleaved() {
     }
     let (_, got) = p.feed_rx(&mixed);
     assert_eq!(got, vec![1, 2]);
+}
+
+fn out_bytes(ds: &[Vec<u8>]) -> usize {
+    ds.iter().map(|d| d.len()).sum()
+}
+
+#[test]
+fn pacing_limits_burst_and_rate() {
+    let now = Instant::now();
+    let (k1, k2) = ([1u8; 32], [2u8; 32]);
+    let mut tx = Stream::new(SID, Role::Sender, &k1, &[1; 4], &k2, &[2; 4], 2000, now);
+    let mut io = Io::default();
+    tx.send_frame(now, 1, &blob(200_000), 1, 1, &mut io)
+        .unwrap();
+    let burst = out_bytes(&io.out);
+    assert!(burst <= 64 * 1024, "Burst {burst}");
+    assert!(burst > 60 * 1024, "Burst nutzt den Bucket aus: {burst}");
+    // 100 ms spaeter: 1,5 x 2000 kbit/s = 375 kB/s -> ~37,5 kB neu.
+    let mut io = Io::default();
+    tx.tick(
+        now + Duration::from_millis(100),
+        &Default::default(),
+        &mut io,
+    );
+    let more = out_bytes(&io.out);
+    assert!((35_000..=40_000).contains(&more), "nach 100 ms: {more}");
+    // Irgendwann ist alles raus.
+    let mut total = burst + more;
+    for k in 2..40 {
+        let mut io = Io::default();
+        tx.tick(
+            now + Duration::from_millis(100 * k),
+            &Default::default(),
+            &mut io,
+        );
+        total += out_bytes(&io.out);
+    }
+    assert!(
+        total > 200_000 && !tx.needs_fast_tick(),
+        "Warteschlange leer: {total}"
+    );
+}
+
+fn feedback_dgram(seq: u64, resid: u16, raw: u16, with_raw: bool) -> Vec<u8> {
+    let c = beamer_transport::packet::Cipher::new(&[2u8; 32], &[2; 4]);
+    let mut p = Vec::new();
+    p.extend_from_slice(&4000u32.to_be_bytes());
+    p.extend_from_slice(&resid.to_be_bytes());
+    p.extend_from_slice(&1000u32.to_be_bytes());
+    p.extend_from_slice(&1u32.to_be_bytes());
+    if with_raw {
+        p.extend_from_slice(&raw.to_be_bytes());
+    }
+    c.seal(
+        &beamer_transport::packet::Header {
+            ptype: beamer_transport::packet::T_FEEDBACK,
+            flags: 0,
+            stream_id: SID,
+            seq,
+        },
+        &p,
+    )
+    .unwrap()
+}
+
+/// Schickt jede Sekunde ein Feedback und gibt die Zielbitrate danach zurueck.
+fn run_feedback(
+    p: &mut Pair,
+    seconds: u64,
+    resid: u16,
+    raw: u16,
+    with_raw: bool,
+    seq0: u64,
+) -> u32 {
+    for k in 0..seconds {
+        p.advance(1000);
+        let d = feedback_dgram(seq0 + k, resid, raw, with_raw);
+        p.feed_tx(&[d]);
+    }
+    p.tx.target_kbps()
+}
+
+#[test]
+fn rate_follows_residual_loss_not_raw_loss() {
+    // 5 % Rohverlust, aber 0 Restverlust (FEC/NACK haben alles repariert): keine Drosselung.
+    let mut p = pair(true);
+    assert_eq!(run_feedback(&mut p, 3, 0, 50, true, 1), 8000);
+
+    // Restverlust 2 % (> 1 %): runter, ca. 15 % je Sekunde.
+    let mut p = pair(true);
+    let t = run_feedback(&mut p, 3, 20, 20, true, 1);
+    assert!((4800..=5300).contains(&t), "nach 3 s Restverlust: {t}");
+
+    // Restverlust knapp unter der Schwelle (0,9 %): keine Drosselung.
+    let mut p = pair(true);
+    assert_eq!(run_feedback(&mut p, 3, 9, 30, true, 1), 8000);
+
+    // Notbremse: 10 % Rohverlust trotz 0 Restverlust.
+    let mut p = pair(true);
+    let t = run_feedback(&mut p, 3, 0, 100, true, 1);
+    assert!(t < 5400, "Notbremse greift: {t}");
+
+    // Genau 8 % roh ist noch keine Notbremse.
+    let mut p = pair(true);
+    assert_eq!(run_feedback(&mut p, 3, 0, 80, true, 1), 8000);
+
+    // Altes Feedback ohne Rohverlust-Feld: loss_permille gilt auch als Rohwert.
+    let mut p = pair(true);
+    let t = run_feedback(&mut p, 3, 90, 0, false, 1);
+    assert!(t < 5400, "{t}");
+}
+
+#[test]
+fn rate_recovers_after_throttling() {
+    let mut p = pair(true);
+    let low = run_feedback(&mut p, 4, 50, 50, true, 1);
+    assert!(low < 4800);
+    let up = run_feedback(&mut p, 4, 0, 0, true, 100);
+    assert!(up > low, "{low} -> {up}");
 }

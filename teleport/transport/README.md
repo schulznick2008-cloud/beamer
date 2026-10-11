@@ -8,10 +8,12 @@ Spezifikation: `docs/teleport/SCHNITTSTELLEN.md` §4 (Strom) und §5 (C-ABI). Cr
 - **Fragmentieren/Zusammensetzen**, Puffer zum erneuten Senden (300 ms), **NACK**, **XOR-FEC** (1 Parität je 8 Fragmente),
   `keyframe_req` (höchstens alle 300 ms), `feedback` jede Sekunde, `ping`/`pong` für die RTT, Bitratenregelung
   (`bt_target_kbps`).
+- Sender-Pacing (Token-Bucket 1,5 × Zielbitrate, Burst ≤ 64 KB), Roaming der Gegenstelle (§4.1), `bt_set_peer` jederzeit,
+  `bt_set_max_kbps` für Pfadwechsel.
 - Ein UDP-Socket (IPv4) und ein Transport-Thread je Session, beliebig viele Streams. Callbacks laufen im Transport-Thread,
   nie unter einem Lock, damit sie `bt_send_frame` aufrufen dürfen.
-- Video wird in Reihenfolge ausgeliefert. Geht ein Frame verloren (Frist 2 × RTT, mindestens 30 ms ab dem letzten Paket des
-  Frames, höchstens 500 ms), gibt es `keyframe_req`, und bis zum nächsten Keyframe werden keine abhängigen Frames geliefert.
+- Video wird in Reihenfolge ausgeliefert. Geht ein Frame verloren (Frist 2 × RTT, mindestens 30 ms, höchstens 250 ms, ab dem letzten Paket
+  des Frames), gibt es `keyframe_req`, und bis zum nächsten Keyframe werden keine abhängigen Frames geliefert.
 
 ## Benutzen
 
@@ -37,7 +39,9 @@ Die Zusatzlatenz ist der Median gegen einen verlustfreien Basislauf mit demselbe
 - Der `BtFrame`-Zeiger und `data` sind nur während des Callbacks gültig. Daten kopieren und zurückkehren.
 - Der Stats-JSON enthält die Felder aus §1.2 (`fps`, `kbps`, `rtt_ms`, `loss_pct`, `latency_ms`) und zusätzlich
   `role`, `target_kbps`, `jitter_ms`, `frames_*`, `retransmits`, `nacks`, `fec_recovered`, `auth_fail`, `peer_recv_kbps`.
-  Beim Sender sind `rtt_ms` und `latency_ms` 0 (die RTT misst nur der Empfänger).
+  `peer` ist die aktuelle Gegenstelle (`ip:port`), `sock_rcvbuf`/`sock_sndbuf` die vom Betriebssystem bestätigten Socket-Puffer, `resid_loss_pct` der Restverlust nach FEC/NACK (Grundlage der Bitratenregelung). `loss_pct` ist der Rohverlust. Beim Sender ist `latency_ms` 0, `rtt_ms` kommt aus eigenen ping/pong.
+- `role` ist `uint32_t` (1 = Sender, 2 = Receiver); ungültige Werte liefern -1 und `bt_last_error`.
+- Header neu erzeugen: `BEAMER_UPDATE_HEADER=1 cargo build`. `tests/header.rs` (und damit die CI) schlägt an, wenn `include/beamer_transport.h` veraltet ist.
 - Nur im Rust-API, nicht in der C-ABI: `Session::set_fec_enabled`, `Session::set_netem`, `Session::counters`.
 
 ## Auslegung des Vertrags (siehe REPORT im PR)
