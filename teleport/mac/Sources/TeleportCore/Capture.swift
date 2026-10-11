@@ -42,9 +42,13 @@ public protocol FrameSource: AnyObject {
     func refresh() -> (state: String, sizeChanged: Bool)
     /// Effektive Bildrate senken oder wieder anheben (langsamer Encoder, Energiesparmodus).
     func setMaxFps(_ fps: Int)
+    /// Aktuelle Groesse der Quelle in Punkten, billig (ohne ScreenCaptureKit), um Groessenaenderungen schnell zu
+    /// bemerken. `nil`, wenn unbekannt.
+    func currentPointSize() -> CGSize?
 }
 
 extension FrameSource {
+    public func currentPointSize() -> CGSize? { nil }
     public func refresh() -> (state: String, sizeChanged: Bool) { (state, false) }
     public func setMaxFps(_ fps: Int) {}
 }
@@ -255,23 +259,43 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         _ = try? runBlocking(timeout: SCKTimeouts.update, "updateConfiguration") { try await s.updateConfiguration(cfg) }
     }
 
+    public func currentPointSize() -> CGSize? {
+        switch mode {
+        case .window(let id): return WindowGeometry.frame(windowID: id)?.size
+        case .display(let id): return CGDisplayBounds(id).size
+        }
+    }
+
     public func refresh() -> (state: String, sizeChanged: Bool) {
-        guard case .window(let id) = mode, let cfg = config, let s = stream else { return (state, false) }
+        guard let cfg = config, let s = stream else { return (state, false) }
         guard let content = try? runBlockingLocked(timeout: SCKTimeouts.query, "SCShareableContent (refresh)", {
             try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         }) else { return (state, false) }
-        guard let win = content.windows.first(where: { $0.windowID == id }) else {
-            state = "gone"
-            return (state, false)
+        let framePoints: CGRect
+        var visible = true
+        switch mode {
+        case .window(let id):
+            guard let win = content.windows.first(where: { $0.windowID == id }) else {
+                state = "gone"
+                return (state, false)
+            }
+            framePoints = win.frame
+            visible = win.isOnScreen
+        case .display(let id):
+            guard let d = content.displays.first(where: { $0.displayID == id }) ?? (id == 0 ? content.displays.first : nil) else {
+                state = "gone"  // z. B. der virtuelle Monitor wurde entfernt
+                return (state, false)
+            }
+            framePoints = d.frame
         }
         stateLock.lock()
         let st = lastStatus
         stateLock.unlock()
-        let hidden = !win.isOnScreen || st == .suspended || st == .blank
+        let hidden = !visible || st == .suspended || st == .blank
         state = hidden ? "minimized_or_other_space" : "ok"
-        let w = max(2, Int((Double(win.frame.width) * scale).rounded()) & ~1)
-        let h = max(2, Int((Double(win.frame.height) * scale).rounded()) & ~1)
-        guard win.isOnScreen, w != width || h != height else { return (state, false) }
+        let w = max(2, Int((Double(framePoints.width) * scale).rounded()) & ~1)
+        let h = max(2, Int((Double(framePoints.height) * scale).rounded()) & ~1)
+        guard visible, w != width || h != height else { return (state, false) }
         cfg.width = w
         cfg.height = h
         do {

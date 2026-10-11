@@ -15,10 +15,12 @@ public final class VideoDecoder {
     private var paramKey: [[UInt8]] = []
     private let codec: Codec
     private let onDecoded: (UInt64) -> Void
+    private let onImage: ((CVPixelBuffer) -> Void)?
     public private(set) var errors = 0
 
-    public init(codec: Codec, onDecoded: @escaping (UInt64) -> Void) {
+    public init(codec: Codec, onImage: ((CVPixelBuffer) -> Void)? = nil, onDecoded: @escaping (UInt64) -> Void) {
         self.codec = codec
+        self.onImage = onImage
         self.onDecoded = onDecoded
     }
 
@@ -101,11 +103,13 @@ public final class VideoDecoder {
         guard st == noErr, let sb = sample else { throw DecoderError(message: "SampleBuffer: \(st)") }
 
         let cb = onDecoded
+        let img = onImage
         var flags = VTDecodeInfoFlags()
         st = VTDecompressionSessionDecodeFrame(
             sess, sampleBuffer: sb, flags: [._EnableAsynchronousDecompression], infoFlagsOut: &flags
         ) { status, _, image, pts, _ in
-            guard status == noErr, image != nil else { return }
+            guard status == noErr, let image = image else { return }
+            img?(image)
             cb(UInt64(max(0, pts.seconds * 1_000_000)))
         }
         if st != noErr {

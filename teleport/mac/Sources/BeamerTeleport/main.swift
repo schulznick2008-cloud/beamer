@@ -11,7 +11,7 @@ func usage() -> Never {
 
       BeamerTeleport --ipc stdio
           JSON-Lines-Protokoll auf stdin/stdout (hello, transport.*, windows.list, send.*, shutdown)
-      BeamerTeleport --selftest-recv <port> [--seconds N] [--tid N]
+      BeamerTeleport --selftest-recv <port> [--seconds N] [--tid N] [--dump-dir DIR]
           Empfaenger ohne Anzeige: dekodiert mit VideoToolbox, protokolliert fps, Latenz, Verlust
       BeamerTeleport --selftest-synth <host:port> [--seconds N] [--size WxH] [--fps N] [--codec hevc|h264] [--kbps N]
           Sender mit Muster-Quelle (ohne Bildschirmaufnahme-Freigabe) ueber denselben Encoder-/Transportweg
@@ -41,6 +41,20 @@ case "--ipc":
     guard args.count >= 2, args[1] == "stdio" else { usage() }
     let writer = LineWriter()
     let engine = SenderEngine { writer.write(JSONLine.encode($0)) }
+    // SIGTERM/SIGINT/SIGHUP: Fenster zurueckschieben, virtuelle Monitore entfernen, dann beenden.
+    var signalSources: [DispatchSourceSignal] = []
+    for sig in [SIGTERM, SIGINT, SIGHUP] {
+        signal(sig, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: sig, queue: .global(qos: .userInitiated))
+        src.setEventHandler {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1.8) { exit(0) }
+            engine.shutdown()
+            exit(0)
+        }
+        src.resume()
+        signalSources.append(src)
+    }
+    CrashRestore.install()
     IPCServer(engine: engine, writer: writer).run()
     exit(0)
 
@@ -49,6 +63,7 @@ case "--selftest-recv":
     StopSignal.install()
     let r = SelfTestReceiver(port: port, tid: UInt32(option("--tid") ?? "1") ?? 1,
                              seconds: Int(option("--seconds") ?? "0") ?? 0) { print($0) }
+    r.dumpDir = option("--dump-dir")
     do { printJSON(try r.run()) } catch { logErr("selftest-recv: \(error)"); exit(1) }
 
 case "--selftest-synth":

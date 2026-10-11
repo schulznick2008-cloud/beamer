@@ -25,6 +25,8 @@ public final class SenderPipeline {
     /// Kehrt ein Aufruf nicht zurueck, steht nur diese Queue, der Strom und `stop` laufen weiter.
     private let sckQueue = DispatchQueue(label: "teleport.pipeline.sck")
     private var refreshRunning = false
+    /// Zuletzt gemeldete Stream-Groesse (damit `send.size` nicht doppelt kommt).
+    private var reportedSize: (w: Int, h: Int)?
     private var lastRefresh: (state: String, resized: Bool) = ("ok", false)
     private var timer: DispatchSourceTimer?
 
@@ -74,6 +76,10 @@ public final class SenderPipeline {
     }
 
     public func start() throws {
+        let px = source.pixelSize
+        lock.lock()
+        if reportedSize == nil, px.width > 0 { reportedSize = (px.width, px.height) }
+        lock.unlock()
         try source.start(
             onFrame: { [weak self] pb, t in self?.handleFrame(pb, t) },
             onStop: { [weak self] reason in self?.sourceStopped(reason) })
@@ -138,6 +144,7 @@ public final class SenderPipeline {
         lastFrameHost = HostClock.nowUS()
         let force = forceKey
         forceKey = false
+        if reportedSize == nil { reportedSize = (CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb)) }
         lock.unlock()
         submit(pb, t, force: force)
     }
@@ -174,9 +181,7 @@ public final class SenderPipeline {
         }
         lock.unlock()
         if let old = replaced { old.retire() }
-        if sizeChanged {
-            emit(["v": 1, "ev": "send.size", "tid": Int(tid), "width": w, "height": h, "scale": source.scale])
-        }
+        if sizeChanged { reportSize(w, h) }
         enc?.encode(pb, hostTime: t, forceKeyframe: forceNow)
     }
 
@@ -223,6 +228,32 @@ public final class SenderPipeline {
         if retry { requestKeyframe() }
     }
 
+    /// `send.size` melden, wenn sich die Groesse seit der letzten Meldung geaendert hat.
+    private func reportSize(_ w: Int, _ h: Int) {
+        lock.lock()
+        let changed = reportedSize.map { $0.w != w || $0.h != h } ?? false
+        reportedSize = (w, h)
+        lock.unlock()
+        if changed {
+            emit(["v": 1, "ev": "send.size", "tid": Int(tid), "width": w, "height": h, "scale": source.scale])
+        }
+    }
+
+    /// Nach einer Groessenaenderung von aussen (`send.resize`): Quelle sofort neu lesen, `send.size` melden und einen
+    /// Keyframe anfordern. Wartet hoechstens `timeout` Sekunden (ScreenCaptureKit kann haengen) und liefert die
+    /// aktuelle Stream-Groesse in Pixeln.
+    @discardableResult
+    public func syncSize(timeout: TimeInterval = 1.5) -> (width: Int, height: Int) {
+        let src = source
+        let r = try? runBounded(timeout: timeout, "Groesse neu lesen") { src.refresh() }
+        let size = src.pixelSize
+        if r?.sizeChanged == true {
+            reportSize(size.width, size.height)
+            requestKeyframe()
+        }
+        return size
+    }
+
     private func sourceStopped(_ reason: String) {
         lock.lock()
         let was = stopped || goneSent
@@ -250,12 +281,35 @@ public final class SenderPipeline {
         if idleUS > 1_700_000, let buf = buf {
             submit(buf, HostClock.nowTime(), force: true)
         }
+        // Groessenaenderung der App selbst schnell bemerken (billige Abfrage alle 250 ms) und dann sofort neu lesen.
+        if let pt = source.currentPointSize() {
+            let px = source.pixelSize
+            let sc = source.scale
+            let w = max(2, Int((Double(pt.width) * sc).rounded()) & ~1), h = max(2, Int((Double(pt.height) * sc).rounded()) & ~1)
+            if (w != px.width || h != px.height) && pt.width > 0 { scheduleRefresh() }
+        }
+        consumeRefreshResult()
         guard second else { return }
-
-        // Zustand (geschlossen / minimiert) und Fenstergroesse einmal pro Sekunde neu lesen. Aendert sich die
-        // Groesse, wird der Encoder mit dem ersten Bild neuer Groesse neu angelegt und `send.size` gemeldet.
-        // Die Abfrage selbst laeuft asynchron auf `sckQueue`; hier gilt das Ergebnis der vorigen Runde.
         scheduleRefresh()
+        lock.lock()
+        let state = lastRefresh.state
+        lock.unlock()
+
+        // Bitrate jede Sekunde auf den Transport-Zielwert (nie ueber die Obergrenze) nachfuehren.
+        let target = transport.targetKbps(stream: tid)
+        lock.lock()
+        let ceiling = capCeilingKbps
+        let enc = encoder
+        lock.unlock()
+        let eff = Int(min(max(target, 100), ceiling))
+        enc?.setBitrate(kbps: eff)
+
+        adaptFrameRate()
+        emitStats(state: state, effectiveKbps: eff)
+    }
+
+    /// Ergebnis der letzten Zustandsabfrage uebernehmen (geschlossen, Groesse geaendert).
+    private func consumeRefreshResult() {
         lock.lock()
         let (state, resized) = lastRefresh
         lastRefresh.resized = false
@@ -269,19 +323,11 @@ public final class SenderPipeline {
             stop()
             return
         }
-        if resized { requestKeyframe() }
-
-        // Bitrate jede Sekunde auf den Transport-Zielwert (nie ueber die Obergrenze) nachfuehren.
-        let target = transport.targetKbps(stream: tid)
-        lock.lock()
-        let ceiling = capCeilingKbps
-        let enc = encoder
-        lock.unlock()
-        let eff = Int(min(max(target, 100), ceiling))
-        enc?.setBitrate(kbps: eff)
-
-        adaptFrameRate()
-        emitStats(state: state, effectiveKbps: eff)
+        if resized {
+            let px = source.pixelSize
+            reportSize(px.width, px.height)
+            requestKeyframe()
+        }
     }
 
     private func scheduleRefresh() {

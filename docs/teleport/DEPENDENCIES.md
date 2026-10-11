@@ -12,6 +12,9 @@ Verboten: AGPL, SSPL, proprietär, „source-available“, Code ohne klare Lizen
 | cbindgen | 0.27 | MPL-2.0 | transport (nur Build) | erzeugt `include/beamer_transport.h` aus `src/ffi.rs`, landet nicht im Binary | crate (build-dependency) |
 | ScreenCaptureKit, VideoToolbox, CoreMedia, CoreVideo, CoreGraphics, AppKit, Foundation | macOS 14+ SDK | Systemframeworks (Systembibliotheks-Ausnahme der GPL) | mac | Capture, Hardware-Encoder und -Decoder, Zeit/Puffer | `.linkedFramework` in `teleport/mac/Package.swift` |
 | beamer-transport | 0.1 | GPL-3.0 (eigener Code, `teleport/transport`) | mac | UDP-Strom | `libbeamer_transport.a` per `teleport/mac/build.sh`, Header per Symlink |
+| ApplicationServices (Accessibility/AX), IOKit (IOPMAssertion), CoreImage, ImageIO | macOS 14+ SDK | Systemframeworks (Systembibliotheks-Ausnahme der GPL) | mac | Fenster per AX steuern, Schlaf verhindern, PNG-Dump des Selbsttests | `.linkedFramework` in `teleport/mac/Package.swift` |
+| CGVirtualDisplay (privates CoreGraphics-API) | macOS 14+ | Teil von macOS, kein Quelltext; eigene Deklarationen in `teleport/mac/Sources/CVirtualDisplay`, das Muster ist von DeskPad (MIT) bekannt, es wurde kein Code kopiert | mac | virtueller Monitor fuer teleportierte Fenster | Laufzeit-Klassen aus CoreGraphics (`NSClassFromString`), kein Link auf ein Drittpaket |
+| `_AXUIElementGetWindow` (privates AX-API) | macOS 14+ | Teil von macOS, kein Quelltext | mac | AX-Fenster zur Fenster-ID finden (Rueckfall: Rahmenvergleich) | `@_silgen_name` |
 
 Systemframeworks (ScreenCaptureKit, VideoToolbox, Windows Graphics Capture, D3D11, Media Foundation) fallen unter die Systembibliotheks-Ausnahme der GPL und werden nur der Vollständigkeit halber genannt.
 
