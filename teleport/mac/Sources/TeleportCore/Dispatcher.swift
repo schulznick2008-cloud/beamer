@@ -11,6 +11,10 @@ public protocol TeleportBackend: AnyObject {
     func sendStop(tid: UInt32, restore: Bool) throws
     func sendKeyframe(tid: UInt32) throws
     func sendBitrate(tid: UInt32, kbps: UInt32) throws
+    func inject(tid: UInt32, input: InputEvent) throws
+    func sendActivate(tid: UInt32) throws
+    /// Groesse in Punkten; liefert die neue Stream-Groesse in Pixeln.
+    func sendResize(tid: UInt32, width: Double, height: Double) throws -> (width: Int, height: Int)
     func shutdown()
 }
 
@@ -18,7 +22,7 @@ public protocol TeleportBackend: AnyObject {
 public final class Dispatcher {
     public static let protocolVersion = 1
     public static let helperVersion = "0.1.0"
-    public static let caps = ["send_window", "send_display"]
+    public static let caps = ["send_window", "send_display", "inject"]
 
     public struct Result: Equatable {
         public var line: String
@@ -121,6 +125,26 @@ public final class Dispatcher {
             }
             try backend.sendBitrate(tid: try tid(msg), kbps: UInt32(k))
             return [:]
+
+        case "inject":
+            guard let input = msg.dict("input") else { throw IPCError(.badRequest, "input fehlt") }
+            try backend.inject(tid: try tid(msg), input: try InputEvent.parse(input))
+            return [:]
+
+        case "send.activate":
+            try backend.sendActivate(tid: try tid(msg))
+            return [:]
+
+        case "send.resize":
+            func points(_ k: String) throws -> Double {
+                guard let n = msg[k] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite,
+                      n.doubleValue >= 50, n.doubleValue <= 8000 else {
+                    throw IPCError(.badRequest, "\(k) muss eine Zahl zwischen 50 und 8000 (Punkte) sein")
+                }
+                return n.doubleValue
+            }
+            let r = try backend.sendResize(tid: try tid(msg), width: try points("w"), height: try points("h"))
+            return ["width": r.width, "height": r.height]
 
         case "shutdown":
             quit = true // das Aufraeumen (backend.shutdown) macht der IPC-Server nach der Antwort, mit Zeitlimit

@@ -42,6 +42,21 @@ final class FakeBackend: TeleportBackend {
         guard running.contains(tid) else { throw IPCError(.notFound, "tid unbekannt") }
         calls.append("bitrate \(tid) \(kbps)")
     }
+    var failInject: IPCError?
+    func inject(tid: UInt32, input: InputEvent) throws {
+        if let e = failInject { throw e }
+        guard running.contains(tid) else { throw IPCError(.notFound, "tid unbekannt") }
+        calls.append("inject \(tid) \(input)")
+    }
+    func sendActivate(tid: UInt32) throws {
+        guard running.contains(tid) else { throw IPCError(.notFound, "tid unbekannt") }
+        calls.append("activate \(tid)")
+    }
+    func sendResize(tid: UInt32, width: Double, height: Double) throws -> (width: Int, height: Int) {
+        guard running.contains(tid) else { throw IPCError(.notFound, "tid unbekannt") }
+        calls.append("resize \(tid) \(width) \(height)")
+        return (Int(width) * 2, Int(height) * 2)
+    }
     func shutdown() { calls.append("shutdown") }
 }
 
@@ -69,12 +84,12 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(r.int("re"), 1)
         XCTAssertEqual(r.int("v"), 1)
         XCTAssertEqual(r.string("platform"), "mac")
-        XCTAssertEqual(r["caps"] as? [String], ["send_window", "send_display"])
+        XCTAssertEqual(r["caps"] as? [String], ["send_window", "send_display", "inject"])
         XCTAssertNotNil(r.string("helper_version"))
     }
 
     func testUnsupportedCommandsAnswerUnsupported() {
-        for cmd in ["recv.open", "recv.update", "recv.close", "inject", "send.resize", "send.activate", "bogus"] {
+        for cmd in ["recv.open", "recv.update", "recv.close", "bogus"] {
             let r = send(["v": 1, "id": 2, "cmd": cmd])
             XCTAssertEqual(r.bool("ok"), false, cmd)
             XCTAssertEqual(r.dict("error")?.string("code"), "unsupported", cmd)
@@ -152,8 +167,8 @@ final class DispatcherTests: XCTestCase {
     func testStartRejectsBadFields() {
         var m = startMsg(); m["codec"] = "av1"
         XCTAssertEqual(send(m).dict("error")?.string("code"), "bad_request")
-        m = startMsg(); m["virtual_display"] = true
-        XCTAssertEqual(send(m).dict("error")?.string("code"), "unsupported")
+        m = startMsg(); m["virtual_display"] = true; m["mode"] = "display"; m["display"] = 1
+        XCTAssertEqual(send(m).dict("error")?.string("code"), "bad_request")
         XCTAssertTrue(backend.calls.isEmpty)
     }
 
@@ -188,5 +203,64 @@ final class HelloAndFilterTests: XCTestCase {
         XCTAssertFalse(keep(layer: 25), "Menueleiste / Overlays")
         XCTAssertFalse(keep(w: 1800, h: 39), "Menueleisten-Streifen")
         XCTAssertFalse(keep(w: 64, h: 64), "winziges Hilfsfenster")
+    }
+}
+
+final class InputCommandTests: XCTestCase {
+    var backend = FakeBackend()
+    var d: Dispatcher!
+    override func setUp() { backend = FakeBackend(); d = Dispatcher(backend: backend); backend.running = [1] }
+    private func send(_ obj: JSON) -> JSON { try! JSONLine.parse(d.handle(line: JSONLine.encode(obj)).line) }
+
+    func testInjectParsesEveryKindOfInput() {
+        let inputs: [JSON] = [
+            ["k": "move", "x": 512.0, "y": 300.5],
+            ["k": "down", "x": 512.0, "y": 300.5, "b": "left", "n": 2],
+            ["k": "up", "x": 1, "y": 2, "b": "right"],
+            ["k": "scroll", "x": 5, "y": 6, "dx": 0, "dy": -3.0, "unit": "line"],
+            ["k": "key", "key": "a", "down": true],
+            ["k": "text", "text": "\u{E4}"],
+        ]
+        for (i, input) in inputs.enumerated() {
+            let r = send(["v": 1, "id": i + 1, "cmd": "inject", "tid": 1, "input": input])
+            XCTAssertEqual(r.bool("ok"), true, "\(input) -> \(r)")
+        }
+        XCTAssertEqual(backend.calls.count, 6)
+        XCTAssertTrue(backend.calls[1].contains("down(x: 512.0, y: 300.5, button: TeleportCore.MouseButton.left, clicks: 2)"), backend.calls[1])
+    }
+
+    func testInjectRejectsBadInput() {
+        let bad: [JSON] = [
+            ["k": "move", "x": "1", "y": 2], ["k": "down", "x": 1, "y": 2, "b": "left", "n": 5],
+            ["k": "down", "x": 1, "y": 2, "b": "laser"], ["k": "scroll", "x": 1, "y": 2, "dx": 0, "dy": 1, "unit": "mm"],
+            ["k": "key", "key": "a"], ["k": "text", "text": ""], ["k": "tap"], [:],
+        ]
+        for (i, input) in bad.enumerated() {
+            let r = send(["v": 1, "id": i + 1, "cmd": "inject", "tid": 1, "input": input])
+            XCTAssertEqual(r.dict("error")?.string("code"), "bad_request", "\(input)")
+        }
+        XCTAssertEqual(send(["v": 1, "id": 99, "cmd": "inject", "tid": 1]).dict("error")?.string("code"), "bad_request")
+        XCTAssertEqual(send(["v": 1, "id": 98, "cmd": "inject", "tid": 7, "input": ["k": "move", "x": 1, "y": 1]]).dict("error")?.string("code"), "not_found")
+        XCTAssertTrue(backend.calls.isEmpty)
+    }
+
+    func testPermissionErrorFromInject() {
+        backend.failInject = IPCError(.permission, "Bedienungshilfen nicht freigegeben")
+        let r = send(["v": 1, "id": 1, "cmd": "inject", "tid": 1, "input": ["k": "move", "x": 1, "y": 1]])
+        XCTAssertEqual(r.dict("error")?.string("code"), "permission")
+    }
+
+    func testActivateAndResize() {
+        XCTAssertEqual(send(["v": 1, "id": 1, "cmd": "send.activate", "tid": 1]).bool("ok"), true)
+        let r = send(["v": 1, "id": 2, "cmd": "send.resize", "tid": 1, "w": 800.0, "h": 600])
+        XCTAssertEqual(r.int("width"), 1600)
+        XCTAssertEqual(r.int("height"), 1200)
+        for bad in [["w": 10, "h": 600], ["w": 800, "h": 99999], ["w": "x", "h": 1], ["h": 600]] as [JSON] {
+            var m: JSON = ["v": 1, "id": 3, "cmd": "send.resize", "tid": 1]
+            bad.forEach { m[$0.key] = $0.value }
+            XCTAssertEqual(send(m).dict("error")?.string("code"), "bad_request", "\(bad)")
+        }
+        XCTAssertEqual(send(["v": 1, "id": 4, "cmd": "send.resize", "tid": 5, "w": 800, "h": 600]).dict("error")?.string("code"), "not_found")
+        XCTAssertEqual(send(["v": 1, "id": 5, "cmd": "send.activate", "tid": 5]).dict("error")?.string("code"), "not_found")
     }
 }

@@ -1,4 +1,8 @@
+import CoreImage
+import CoreVideo
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 private func percentile(_ v: [Double], _ p: Double) -> Double {
     guard !v.isEmpty else { return .nan }
@@ -26,6 +30,9 @@ public final class SelfTestReceiver {
     private let tid: UInt32
     private let seconds: Int
     private let out: (String) -> Void
+    /// Wenn gesetzt, wird alle 2 s das zuletzt dekodierte Bild als PNG dorthin geschrieben (Sichtpruefung des Streams).
+    public var dumpDir: String?
+    private var latestImage: CVPixelBuffer?
     private let decodeQueue = DispatchQueue(label: "teleport.selftest.decode")
     private let lock = NSLock()
     private var decoder: VideoDecoder?
@@ -60,6 +67,7 @@ public final class SelfTestReceiver {
             Thread.sleep(forTimeInterval: 1)
             tick += 1
             report(t: tick, cpu: cpu.sample())
+            if tick % 2 == 0 { dumpLatest(tick) }
             if seconds > 0 && tick >= seconds { break }
         }
         t.close()
@@ -78,7 +86,9 @@ public final class SelfTestReceiver {
         lastFrameId = f.frameId
         bytesWindow += f.data.count
         if decoder == nil || decoderCodec != codec {
-            decoder = VideoDecoder(codec: codec) { [weak self] pts in self?.decoded(pts) }
+            decoder = VideoDecoder(codec: codec, onImage: { [weak self] px in
+                self?.lock.lock(); self?.latestImage = px; self?.lock.unlock()
+            }) { [weak self] pts in self?.decoded(pts) }
             decoderCodec = codec
         }
         let dec = decoder!
@@ -88,6 +98,18 @@ public final class SelfTestReceiver {
         } catch {
             lock.lock(); decodeErrors += 1; lock.unlock()
         }
+    }
+
+    private func dumpLatest(_ tick: Int) {
+        guard let dir = dumpDir else { return }
+        lock.lock(); let img = latestImage; lock.unlock()
+        guard let px = img else { return }
+        let ci = CIImage(cvPixelBuffer: px)
+        guard let cg = CIContext().createCGImage(ci, from: ci.extent) else { return }
+        let url = URL(fileURLWithPath: dir).appendingPathComponent(String(format: "stream_%03d.png", tick))
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dest, cg, nil)
+        CGImageDestinationFinalize(dest)
     }
 
     private func decoded(_ ptsUS: UInt64) {

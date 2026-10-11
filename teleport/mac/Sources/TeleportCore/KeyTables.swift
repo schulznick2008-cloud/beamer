@@ -1,0 +1,195 @@
+// GENERIERT von tools/teleport/gen_swift_keycodes.py aus mac_app/key_codes.py und
+// mac_app/input_injector_mac.py. Nicht von Hand aendern; `--check` prueft, ob sie aktuell ist.
+
+/// Beamers Tastennamen und macOS-Tastencodes (dieselben Tabellen wie die Python-Seite).
+public enum KeyTables {
+    /// Sondertasten: Tastencode zu Beamer-Name (`SPECIAL_KEY_NAMES`). Mehrere Codes koennen denselben Namen haben.
+    public static let specialKeyNames: [UInt16: String] = [
+        0x24: "enter",
+        0x30: "tab",
+        0x31: "space",
+        0x33: "backspace",
+        0x35: "esc",
+        0x36: "cmd_r",
+        0x37: "cmd",
+        0x38: "shift",
+        0x39: "caps_lock",
+        0x3A: "alt",
+        0x3B: "ctrl",
+        0x3C: "shift_r",
+        0x3D: "alt_r",
+        0x3E: "ctrl_r",
+        0x40: "f17",
+        0x4C: "enter",
+        0x4F: "f18",
+        0x50: "f19",
+        0x5A: "f20",
+        0x60: "f5",
+        0x61: "f6",
+        0x62: "f7",
+        0x63: "f3",
+        0x64: "f8",
+        0x65: "f9",
+        0x67: "f11",
+        0x69: "f13",
+        0x6A: "f16",
+        0x6B: "f14",
+        0x6D: "f10",
+        0x6F: "f12",
+        0x71: "f15",
+        0x72: "insert",
+        0x73: "home",
+        0x74: "page_up",
+        0x75: "delete",
+        0x76: "f4",
+        0x77: "end",
+        0x78: "f2",
+        0x79: "page_down",
+        0x7A: "f1",
+        0x7B: "left",
+        0x7C: "right",
+        0x7D: "down",
+        0x7E: "up",
+    ]
+
+    /// Name zu Tastencode; bei doppelten Namen gilt der kleinste Code (`KEY_NAME_TO_CODE.setdefault`).
+    public static let keyNameToCode: [String: UInt16] = [
+        "alt": 0x3A,
+        "alt_r": 0x3D,
+        "backspace": 0x33,
+        "caps_lock": 0x39,
+        "cmd": 0x37,
+        "cmd_r": 0x36,
+        "ctrl": 0x3B,
+        "ctrl_r": 0x3E,
+        "delete": 0x75,
+        "down": 0x7D,
+        "end": 0x77,
+        "enter": 0x24,
+        "esc": 0x35,
+        "f1": 0x7A,
+        "f10": 0x6D,
+        "f11": 0x67,
+        "f12": 0x6F,
+        "f13": 0x69,
+        "f14": 0x6B,
+        "f15": 0x71,
+        "f16": 0x6A,
+        "f17": 0x40,
+        "f18": 0x4F,
+        "f19": 0x50,
+        "f2": 0x78,
+        "f20": 0x5A,
+        "f3": 0x63,
+        "f4": 0x76,
+        "f5": 0x60,
+        "f6": 0x61,
+        "f7": 0x62,
+        "f8": 0x64,
+        "f9": 0x65,
+        "home": 0x73,
+        "insert": 0x72,
+        "left": 0x7B,
+        "page_down": 0x79,
+        "page_up": 0x74,
+        "right": 0x7C,
+        "shift": 0x38,
+        "shift_r": 0x3C,
+        "space": 0x31,
+        "tab": 0x30,
+        "up": 0x7E,
+    ]
+
+    public static let modifierKeyCodes: Set<UInt16> = [0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E]
+
+    /// US-Tastatur: Tastencode zu unverschobenem Zeichen (`PRINTABLE_KEY_FALLBACKS`).
+    public static let printableFallbacks: [UInt16: String] = [
+        0x00: "a",
+        0x01: "s",
+        0x02: "d",
+        0x03: "f",
+        0x04: "h",
+        0x05: "g",
+        0x06: "z",
+        0x07: "x",
+        0x08: "c",
+        0x09: "v",
+        0x0B: "b",
+        0x0C: "q",
+        0x0D: "w",
+        0x0E: "e",
+        0x0F: "r",
+        0x10: "y",
+        0x11: "t",
+        0x12: "1",
+        0x13: "2",
+        0x14: "3",
+        0x15: "4",
+        0x16: "6",
+        0x17: "5",
+        0x18: "=",
+        0x19: "9",
+        0x1A: "7",
+        0x1B: "-",
+        0x1C: "8",
+        0x1D: "0",
+        0x1E: "]",
+        0x1F: "o",
+        0x20: "u",
+        0x21: "[",
+        0x22: "i",
+        0x23: "p",
+        0x25: "l",
+        0x26: "j",
+        0x27: "'",
+        0x28: "k",
+        0x29: ";",
+        0x2A: "\\",
+        0x2B: ",",
+        0x2C: "/",
+        0x2D: "n",
+        0x2E: "m",
+        0x2F: ".",
+        0x32: "`",
+    ]
+
+    /// Tasten, die ein PC hat und ein Mac nicht (`WINDOWS_ONLY_KEY_CODES`).
+    public static let windowsOnlyKeyCodes: [String: UInt16] = [
+        "num_lock": 0x47,
+        "pause": 0x71,
+        "print_screen": 0x69,
+        "scroll_lock": 0x6B,
+    ]
+
+    /// Modifier-Namen zum Flag (`MODIFIER_FLAG_NAMES`, ohne das Praefix kCGEventFlagMask).
+    public static let modifierFlagNames: [String: String] = [
+        "alt": "Alternate",
+        "alt_r": "Alternate",
+        "caps_lock": "AlphaShift",
+        "cmd": "Command",
+        "cmd_r": "Command",
+        "ctrl": "Control",
+        "ctrl_r": "Control",
+        "shift": "Shift",
+        "shift_r": "Shift",
+    ]
+
+    /// Modifier, die einen Tastendruck zum Kuerzel machen (`CHORD_MODIFIERS`).
+    public static let chordModifiers: Set<String> = ["alt", "alt_r", "cmd", "cmd_r", "ctrl", "ctrl_r"]
+
+    /// Medientasten (NX-Tastencodes aus IOKit `ev_keymap.h`, `MEDIA_NX_KEYS`).
+    public static let mediaNXKeys: [String: Int] = [
+        "media_next": 17,
+        "media_play_pause": 16,
+        "media_prev": 18,
+        "volume_down": 1,
+        "volume_mute": 7,
+        "volume_up": 0,
+    ]
+
+    /// Browser-Vor/Zurueck als Kuerzel (`BROWSER_KEY_CHORDS`).
+    public static let browserKeyChords: [String: String] = [
+        "browser_back": "[",
+        "browser_forward": "]",
+    ]
+}

@@ -75,10 +75,14 @@ public struct SendParams: Equatable {
     public var maxFps: Int
     public var bitrateKbps: UInt32
     public var keys: StreamKeys
+    /// Fenster auf einen eigenen virtuellen Monitor holen und diesen ganz aufnehmen (Menues und Popover kommen mit).
+    public var virtualDisplay: Bool
 
-    public init(tid: UInt32, mode: CaptureMode, codec: Codec, maxFps: Int, bitrateKbps: UInt32, keys: StreamKeys) {
+    public init(tid: UInt32, mode: CaptureMode, codec: Codec, maxFps: Int, bitrateKbps: UInt32, keys: StreamKeys,
+                virtualDisplay: Bool = false) {
         self.tid = tid; self.mode = mode; self.codec = codec
         self.maxFps = maxFps; self.bitrateKbps = bitrateKbps; self.keys = keys
+        self.virtualDisplay = virtualDisplay
     }
 
     /// Prueft die Felder von `send.start` (§1.1).
@@ -111,12 +115,13 @@ public struct SendParams: Equatable {
         guard (100...1_000_000).contains(kbps) else {
             throw IPCError(.badRequest, "bitrate_kbps muss 100...1000000 sein")
         }
-        if j.bool("virtual_display") == true {
-            throw IPCError(.unsupported, "virtual_display wird in diesem Helfer-Stand nicht unterstuetzt")
+        let virtual = j.bool("virtual_display") ?? false
+        if virtual, case .display = mode {
+            throw IPCError(.badRequest, "virtual_display gilt nur fuer mode window")
         }
         guard let keysObj = j.dict("keys") else { throw IPCError(.badRequest, "keys fehlt") }
         return SendParams(tid: UInt32(tidRaw), mode: mode, codec: codec, maxFps: fps,
-                          bitrateKbps: UInt32(kbps), keys: try StreamKeys.parse(keysObj))
+                          bitrateKbps: UInt32(kbps), keys: try StreamKeys.parse(keysObj), virtualDisplay: virtual)
     }
 }
 
