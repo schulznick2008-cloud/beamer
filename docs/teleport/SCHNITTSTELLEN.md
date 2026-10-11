@@ -7,7 +7,7 @@ passen dann an. Unklarheiten nicht selbst auflösen, sondern im PR als Frage mel
 Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zeiten sind in µs
 (monotone Uhr des Senders).
 
-Änderungen: v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`.
+Änderungen: v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
 
 ## 0. Begriffe und Komponenten
 
@@ -121,7 +121,7 @@ Offset Größe Feld (Header = AAD, unverschlüsselt)
 
 Klartext je Typ:
 - **video/audio**: `frame_id` u32 ‖ `frag_idx` u16 ‖ `frag_cnt` u16 ‖ `pts_us` u64 ‖ `fflags` u8 (Bit0 = Keyframe, Bit1–3 Codec: 1=h264, 2=hevc, 3=opus) ‖ Nutzdaten. Video ist Annex-B. Jeder Keyframe enthält VPS/SPS/PPS inline.
-- **fec**: `frame_id` u32 ‖ `group_start` u16 ‖ `group_len` u16 ‖ XOR-Parität über die Klartexte der Gruppe (auf die gleiche Länge mit Nullen aufgefüllt, dazu die Länge als u16 je Quelle in der Parität). Standard ist eine Parität je 8 Fragmente, abschaltbar.
+- **fec**: `frame_id` u32 ‖ `group_start` u16 (`frag_idx` des ersten Fragments) ‖ `group_len` u16 (1–8 aufeinanderfolgende Fragmente desselben Frames) ‖ `len_xor` u16 (XOR der Klartextlängen der Gruppe) ‖ XOR-Parität über die Klartexte der Gruppe. Klartext heißt hier das ganze video-Klartextpaket inklusive Media-Kopf. Kürzere Klartexte werden mit Nullen aufgefüllt, die Parität ist so lang wie der längste. Rekonstruktion bei genau einem fehlenden Fragment: Klartext = Parität XOR übrige Klartexte, gekürzt auf `len_xor` XOR übrige Längen. Standard ist eine Parität je 8 Fragmente, nur für Video, abschaltbar. Die Nutzlast eines Fragments ist höchstens 1141 Byte, damit auch das FEC-Paket in 1200 Byte passt.
 - **nack**: Anzahl u16 ‖ n × seq u64.
 - **keyframe_req**: leer.
 - **feedback**: `recv_kbps` u32 ‖ `loss_permille` u16 ‖ `jitter_us` u32 ‖ `last_frame_id` u32 ‖ optional `raw_loss_permille` u16. `loss_permille` ist der **Restverlust** nach NACK/FEC-Reparatur (Pakete, die weder nachgeliefert noch per FEC ersetzt wurden), `raw_loss_permille` der Rohverlust im Fenster. Fehlt das Feld (alte Gegenstelle), gilt `loss_permille` für beides.
