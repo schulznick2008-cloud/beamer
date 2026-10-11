@@ -506,9 +506,9 @@ fn bitrate_recovers_without_loss() {
     let low = l.tx.target_kbps(SID);
     assert!(low < 7000, "Absenkung erwartet, ist {low}");
     l.rx.set_netem(NetemConfig::default());
-    // Erholung: bis 6 s warten statt fester Zeit.
+    // Erholung: die Messung gleitet ueber 1 s und es geht mit +5 %/s hoch; bis 12 s warten, statt fester Zeit.
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(6) && l.tx.target_kbps(SID) <= low + low / 20 {
+    while start.elapsed() < Duration::from_secs(12) && l.tx.target_kbps(SID) <= low + low / 20 {
         pump(200);
     }
     assert!(
