@@ -51,7 +51,11 @@ jobs:
         if: runner.os == 'Windows' && hashFiles('teleport/win/Cargo.toml') != ''
         working-directory: teleport/win
         shell: bash
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
         run: |
+          pwsh -NoProfile -File scripts/fetch-ffmpeg.ps1
+          cargo fmt --check
           cargo clippy --all-targets -- -D warnings
           cargo test
 
