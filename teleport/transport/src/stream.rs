@@ -21,7 +21,7 @@ const MAX_NACK_TRIES: u8 = 8;
 const NACK_PER_PACKET: usize = (MAX_PLAINTEXT - 2) / 8;
 /// Hoechstalter eines unvollstaendigen Frames, egal wie lange noch Pakete tropfen.
 /// Ab dieser Wartezeit zaehlt ein noch fehlendes Paket vorlaeufig als verloren (Rohverlust/Restverlust).
-const PROVISIONAL_LOSS: Duration = Duration::from_millis(80);
+const PROVISIONAL_LOSS: Duration = Duration::from_millis(50);
 const ASM_MAX_AGE: Duration = Duration::from_millis(250);
 /// Pacing des Senders: Token-Bucket mit 1,5 x Zielbitrate, Burst hoechstens 64 KB.
 const PACE_BURST: f64 = 64.0 * 1024.0;
@@ -1152,13 +1152,13 @@ impl Stream {
             let bad = self.win.last_resid_permille > RESIDUAL_LOSS_LIMIT
                 || self.win.last_loss_permille > RAW_LOSS_EMERGENCY;
             let every = if bad {
-                Duration::from_millis(250)
+                Duration::from_millis(200)
             } else {
                 Duration::from_secs(1)
             };
             let due = match self.last_feedback {
                 Some(t) => now.saturating_duration_since(t) >= every,
-                None => now.saturating_duration_since(fm) >= Duration::from_millis(300),
+                None => now.saturating_duration_since(fm) >= Duration::from_millis(150),
             };
             if due {
                 self.send_feedback(now, io);
