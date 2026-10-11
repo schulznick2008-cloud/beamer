@@ -434,3 +434,57 @@ fn rate_recovers_after_throttling() {
     let up = run_feedback(&mut p, 4, 0, 0, true, 100);
     assert!(up > low, "{low} -> {up}");
 }
+
+#[test]
+fn send_queue_is_limited_by_time_not_bytes() {
+    let now = Instant::now();
+    let (k1, k2) = ([1u8; 32], [2u8; 32]);
+    // 1000 kbit/s -> Bucket-Rate 187,5 kB/s -> 150 ms = ~28 KB Warteschlange.
+    let mut tx = Stream::new(SID, Role::Sender, &k1, &[1; 4], &k2, &[2; 4], 1000, now);
+    let mut io = Io::default();
+    // Ein einzelnes grosses Keyframe wird bei leerer Warteschlange immer angenommen.
+    tx.send_frame(now, 1, &blob(150_000), 1, 1, &mut io)
+        .unwrap();
+    // Die Warteschlange hat jetzt weit mehr als 150 ms: das naechste Frame wird abgelehnt.
+    let mut io2 = Io::default();
+    let e = tx
+        .send_frame(now, 1, &blob(3000), 2, 0, &mut io2)
+        .unwrap_err();
+    assert!(e.contains("Sendewarteschlange"), "{e}");
+    // Nach dem Abfliessen unter 150 ms geht es wieder: Rest ~90 KB, 187,5 kB/s -> nach 0,6 s < 28 KB.
+    let mut io3 = Io::default();
+    // Wie im Betrieb in kleinen Schritten ticken (ein Tick gibt hoechstens den Burst frei).
+    for k in 1..=6 {
+        tx.tick(
+            now + Duration::from_millis(100 * k),
+            &Default::default(),
+            &mut io3,
+        );
+    }
+    assert!(tx
+        .send_frame(
+            now + Duration::from_millis(600),
+            1,
+            &blob(3000),
+            3,
+            0,
+            &mut io3
+        )
+        .is_ok());
+    // Stats nennen die Wartezeit.
+    let mut io4 = Io::default();
+    tx.tick(
+        now + Duration::from_millis(1100),
+        &Default::default(),
+        &mut io4,
+    );
+    let json = io4
+        .events
+        .iter()
+        .find_map(|e| match e {
+            Event::Stats { json, .. } => Some(json.clone()),
+            _ => None,
+        })
+        .expect("Stats nach 1 s");
+    assert!(json.contains("\"pace_queue_ms\":"), "{json}");
+}

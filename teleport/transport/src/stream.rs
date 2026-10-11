@@ -20,13 +20,15 @@ const MAX_RETX_ENTRIES: usize = 40_000;
 const MAX_NACK_TRIES: u8 = 8;
 const NACK_PER_PACKET: usize = (MAX_PLAINTEXT - 2) / 8;
 /// Hoechstalter eines unvollstaendigen Frames, egal wie lange noch Pakete tropfen.
+/// Ab dieser Wartezeit zaehlt ein noch fehlendes Paket vorlaeufig als verloren (Rohverlust/Restverlust).
+const PROVISIONAL_LOSS: Duration = Duration::from_millis(80);
 const ASM_MAX_AGE: Duration = Duration::from_millis(250);
 /// Pacing des Senders: Token-Bucket mit 1,5 x Zielbitrate, Burst hoechstens 64 KB.
 const PACE_BURST: f64 = 64.0 * 1024.0;
 const PACE_FACTOR: f64 = 1.5;
-/// Was hoechstens in der Sendewarteschlange stehen darf: 300 ms Bucket-Rate, mindestens 128 KB.
-const MAX_PACE_QUEUE_MS: f64 = 0.3;
-const MIN_PACE_QUEUE: usize = 128 * 1024;
+/// Was die Sendewarteschlange hoechstens an Wartezeit enthalten darf (bei aktueller Bucket-Rate). Ein
+/// neues Frame wird angenommen, solange die Warteschlange davor darunter liegt, egal wie gross es ist.
+const MAX_PACE_QUEUE_S: f64 = 0.15;
 /// Restverlust (nach FEC/NACK) ab dem gedrosselt wird, und Rohverlust als Notbremse (je in Promille).
 const RESIDUAL_LOSS_LIMIT: u16 = 10;
 const RAW_LOSS_EMERGENCY: u16 = 80;
@@ -117,8 +119,9 @@ struct Miss {
     /// Der Frame ist ohne dieses Paket fertig geworden (FEC): nicht mehr nachfordern, aber weiter
     /// als Verlust bzw. spaete Ankunft verbuchen.
     settled: bool,
-    /// Schon laenger fehlend als die Umordnungs-Toleranz: zaehlt als Verlust.
-    judged: bool,
+    /// Schon als roh verloren bzw. als Restverlust verbucht (nicht doppelt zaehlen).
+    lost_counted: bool,
+    resid_counted: bool,
 }
 
 struct FecPkt {
@@ -198,6 +201,7 @@ pub struct Stream {
     last_adjust: Instant,
     prev_jitter_us: u32,
     jitter_rises: u8,
+    fb_count: u32,
     fb_loss_permille: u16,
     fb_raw_permille: u16,
     fb_recv_kbps: u32,
@@ -227,6 +231,10 @@ pub struct Stream {
     jitter_us: f64,
     /// Wie lange ein spaeter, aber unversehrt eingetroffenes Paket hinterherhinkt (Umordnung), in ms.
     reorder_ms: f64,
+    /// (Zeit, erwartete Pakete, roh verloren, Restverlust) je Feedback-Fenster der letzten Sekunde.
+    loss_hist: VecDeque<(Instant, u64, u64, u64)>,
+    /// Nach einem NACK eingetroffene seqs (als verloren gebucht), um ein spaeteres Duplikat zu erkennen.
+    late_nacked: BTreeMap<u64, Instant>,
     last_arrival: Option<(Instant, u64)>,
     last_frame_id: u32,
 }
@@ -280,6 +288,7 @@ impl Stream {
             last_adjust: now,
             prev_jitter_us: 0,
             jitter_rises: 0,
+            fb_count: 0,
             fb_loss_permille: 0,
             fb_raw_permille: 0,
             fb_recv_kbps: 0,
@@ -305,6 +314,8 @@ impl Stream {
             first_media: None,
             jitter_us: 0.0,
             reorder_ms: 0.0,
+            loss_hist: VecDeque::new(),
+            late_nacked: BTreeMap::new(),
             last_arrival: None,
             last_frame_id: 0,
         }
@@ -369,8 +380,17 @@ impl Stream {
         }
     }
 
+    fn pace_rate(&self) -> f64 {
+        self.target_kbps * PACE_FACTOR * 125.0 // Byte je Sekunde
+    }
+
     fn pace_queue_limit(&self) -> usize {
-        ((self.target_kbps * PACE_FACTOR * 125.0 * MAX_PACE_QUEUE_MS) as usize).max(MIN_PACE_QUEUE)
+        (self.pace_rate() * MAX_PACE_QUEUE_S) as usize
+    }
+
+    /// Wartezeit der Sendewarteschlange in ms bei aktueller Bucket-Rate.
+    fn pace_queue_ms(&self) -> f64 {
+        self.pace_bytes as f64 / self.pace_rate().max(1.0) * 1000.0
     }
 
     fn emit(&mut self, d: Vec<u8>, io: &mut Io) {
@@ -586,7 +606,9 @@ impl Stream {
         } else {
             self.jitter_rises = 0;
         }
-        let jitter_rising = self.jitter_rises >= 2;
+        // Der Schaetzer laeuft sich in den ersten Sekunden erst ein (Anstieg von 0): da noch nicht werten.
+        self.fb_count = self.fb_count.saturating_add(1);
+        let jitter_rising = self.jitter_rises >= 2 && self.fb_count > 6;
         // 4.1 (v1.1): bei Restverlust > 1 %, Rohverlust > 8 % (Notbremse) oder steigendem Jitter
         // 15 % je Sekunde runter, sonst 5 % je Sekunde rauf.
         if loss > RESIDUAL_LOSS_LIMIT || raw > RAW_LOSS_EMERGENCY || jitter_rising {
@@ -616,8 +638,13 @@ impl Stream {
             return RxResult::Malformed;
         }
         if !self.replay.check(h.seq) {
-            // Zu alt oder doppelt. Vor der Authentifizierung nur zaehlen, nichts aendern.
+            // Zu alt oder doppelt. Vor der Authentifizierung nur zaehlen, nichts aendern; nur ein
+            // authentifiziertes Duplikat einer nach NACK eingetroffenen seq nimmt die Verlustbuchung zurueck.
             self.c.replay_dropped += 1;
+            if self.late_nacked.contains_key(&h.seq) && self.rx.open(d, h).is_some() {
+                self.late_nacked.remove(&h.seq);
+                self.win.lost = self.win.lost.saturating_sub(1);
+            }
             return RxResult::Replay;
         }
         let Some(plain) = self.rx.open(d, h) else {
@@ -719,10 +746,34 @@ impl Stream {
             }
             Some(_) => {
                 // Verspaetet eingetroffen. Ohne vorherigen NACK war es reine Umordnung: daraus lernen.
+                // Roh verloren zaehlt eine seq nur, wenn das Original nicht mehr kommt: sie laeuft ab, oder
+                // sie trifft nach einem NACK ein, und zwar so spaet, dass es die Wiederholung sein kann
+                // (frueher als eine halbe RTT nach dem NACK kann nur das verspaetete Original sein).
                 if let Some(m) = self.missing.remove(&seq) {
-                    if m.last_nack.is_none() {
-                        let late = now.saturating_duration_since(m.first).as_secs_f64() * 1000.0;
-                        self.reorder_ms = late.max(self.reorder_ms * 0.98);
+                    match m.last_nack {
+                        None => {
+                            let late =
+                                now.saturating_duration_since(m.first).as_secs_f64() * 1000.0;
+                            self.reorder_ms = late.max(self.reorder_ms * 0.98);
+                        }
+                        Some(t) => {
+                            let since_nack =
+                                now.saturating_duration_since(t).as_secs_f64() * 1000.0;
+                            if since_nack >= self.srtt_ms.unwrap_or(0.0) / 2.0 {
+                                // Vorlaeufig verloren. Taucht die Wiederholung spaeter als Duplikat auf,
+                                // war es das verspaetete Original und die Buchung wird zurueckgenommen.
+                                if !m.lost_counted {
+                                    self.win.lost += 1;
+                                }
+                                self.late_nacked.insert(seq, now);
+                            } else {
+                                // Das Original war nur spaeter als die NACK-Verzoegerung: die naechsten
+                                // Male laenger warten.
+                                let late =
+                                    now.saturating_duration_since(m.first).as_secs_f64() * 1000.0;
+                                self.reorder_ms = late.max(self.reorder_ms * 0.98);
+                            }
+                        }
                     }
                 }
             }
@@ -737,7 +788,8 @@ impl Stream {
                 last_nack: None,
                 tries: 0,
                 settled: false,
-                judged: false,
+                lost_counted: false,
+                resid_counted: false,
             },
         );
     }
@@ -1100,13 +1152,13 @@ impl Stream {
             let bad = self.win.last_resid_permille > RESIDUAL_LOSS_LIMIT
                 || self.win.last_loss_permille > RAW_LOSS_EMERGENCY;
             let every = if bad {
-                Duration::from_millis(500)
+                Duration::from_millis(250)
             } else {
                 Duration::from_secs(1)
             };
             let due = match self.last_feedback {
                 Some(t) => now.saturating_duration_since(t) >= every,
-                None => now.saturating_duration_since(fm) >= Duration::from_millis(500),
+                None => now.saturating_duration_since(fm) >= Duration::from_millis(300),
             };
             if due {
                 self.send_feedback(now, io);
@@ -1117,9 +1169,9 @@ impl Stream {
     fn nack_delay(&self) -> Duration {
         let by_jitter = (self.jitter_us / 1000.0) * 2.0 + 2.0;
         let by_reorder = self.reorder_ms * 1.2 + 1.0;
-        // Nie laenger warten als ein Drittel der Frist, sonst verfaellt der Frame vor dem ersten NACK
+        // Nie laenger warten als die halbe Frist, sonst verfaellt der Frame vor dem ersten NACK
         // (z. B. wenn der Jitter-Schaetzer wegen unregelmaessiger pts hohe Werte liefert).
-        let cap = (self.deadline().as_secs_f64() * 1000.0 / 3.0).max(2.0);
+        let cap = (self.deadline().as_secs_f64() * 1000.0 / 2.0).max(2.0);
         Duration::from_secs_f64(by_jitter.max(by_reorder).clamp(2.0, cap) / 1000.0)
     }
 
@@ -1128,20 +1180,33 @@ impl Stream {
             return;
         }
         let delay = self.nack_delay();
+        self.late_nacked
+            .retain(|_, t| now.saturating_duration_since(*t) <= RETX_WINDOW);
         let renack = Duration::from_secs_f64(
             (self.srtt_ms.unwrap_or(0.0) * 1.5).clamp(10.0, 100.0) / 1000.0,
         );
         let mut ask: Vec<u64> = Vec::new();
-        let mut judged = 0u64;
+        let mut lost = 0u64;
         let mut resid = 0u64;
         self.missing.retain(|seq, m| {
             let age = now.saturating_duration_since(m.first);
-            if !m.judged && age >= delay {
-                m.judged = true;
-                judged += 1;
+            // Wer nach PROVISIONAL_LOSS noch fehlt, wird schon jetzt verbucht, damit die Regelung nicht
+            // bis zum Ablauf (300 ms) blind ist; spaeter nicht noch einmal.
+            if age >= PROVISIONAL_LOSS {
+                if !m.lost_counted {
+                    m.lost_counted = true;
+                    lost += 1;
+                }
+                if !m.settled && !m.resid_counted {
+                    m.resid_counted = true;
+                    resid += 1;
+                }
             }
             if age > RETX_WINDOW || m.tries >= MAX_NACK_TRIES {
-                if !m.settled {
+                if !m.lost_counted {
+                    lost += 1; // Original kam nie
+                }
+                if !m.settled && !m.resid_counted {
                     resid += 1; // nie zurueckgekommen und nicht per FEC ersetzt
                 }
                 return false;
@@ -1157,7 +1222,7 @@ impl Stream {
             }
             true
         });
-        self.win.lost += judged;
+        self.win.lost += lost;
         self.win.resid += resid;
         for chunk in ask.chunks(NACK_PER_PACKET) {
             let mut p = Vec::with_capacity(2 + chunk.len() * 8);
@@ -1172,16 +1237,34 @@ impl Stream {
     }
 
     /// (Rohverlust, Restverlust) im laufenden Fenster in Promille.
-    fn loss_permille_window(&self) -> (u16, u16) {
-        let (Some(hi), Some(start)) = (self.hi, self.win.hi_at_start) else {
-            return (0, 0);
+    ///
+    /// Gemessen ueber die letzte Sekunde (gleitend), damit haeufigere Feedbacks bei Verlust nicht von
+    /// kurzen, zufaellig verlustfreien Fenstern verfaelscht werden.
+    fn loss_permille_window(&mut self, now: Instant) -> (u16, u16) {
+        let expected = match (self.hi, self.win.hi_at_start) {
+            (Some(hi), Some(start)) => hi.saturating_sub(start),
+            _ => 0,
         };
-        let expected = hi.saturating_sub(start);
-        if expected == 0 {
+        self.loss_hist
+            .push_back((now, expected, self.win.lost, self.win.resid));
+        while self
+            .loss_hist
+            .front()
+            .is_some_and(|(t, ..)| now.saturating_duration_since(*t) > Duration::from_secs(1))
+        {
+            self.loss_hist.pop_front();
+        }
+        let (e, l, r) = self
+            .loss_hist
+            .iter()
+            .fold((0u64, 0u64, 0u64), |a, (_, e, l, r)| {
+                (a.0 + e, a.1 + l, a.2 + r)
+            });
+        if e == 0 {
             return (0, 0);
         }
-        let pm = |n: u64| ((n.min(expected) as f64 / expected as f64) * 1000.0).round() as u16;
-        (pm(self.win.lost), pm(self.win.resid))
+        let pm = |n: u64| ((n.min(e) as f64 / e as f64) * 1000.0).round() as u16;
+        (pm(l), pm(r))
     }
 
     fn send_feedback(&mut self, now: Instant, io: &mut Io) {
@@ -1192,7 +1275,7 @@ impl Stream {
             .unwrap_or(1.0)
             .max(0.05);
         let kbps = (self.win.bytes_recv as f64 * 8.0 / 1000.0 / secs) as u32;
-        let (raw, resid) = self.loss_permille_window();
+        let (raw, resid) = self.loss_permille_window(now);
         let mut p = Vec::with_capacity(16);
         p.extend_from_slice(&kbps.to_be_bytes());
         p.extend_from_slice(&resid.to_be_bytes());
@@ -1240,7 +1323,7 @@ impl Stream {
         let json = format!(
             "{{\"fps\":{:.1},\"kbps\":{:.0},\"rtt_ms\":{:.1},\"loss_pct\":{:.1},\"latency_ms\":{:.1},\
 \"role\":\"{}\",\"target_kbps\":{},\"jitter_ms\":{:.2},\"frames_complete\":{},\"frames_delivered\":{},\
-\"frames_dropped\":{},\"retransmits\":{},\"nacks\":{},\"fec_recovered\":{},\"auth_fail\":{},\"peer_recv_kbps\":{},\"resid_loss_pct\":{:.1},\"peer\":\"{}\",\"sock_rcvbuf\":{},\"sock_sndbuf\":{},\"pace_queue_bytes\":{}}}",
+\"frames_dropped\":{},\"retransmits\":{},\"nacks\":{},\"fec_recovered\":{},\"auth_fail\":{},\"peer_recv_kbps\":{},\"resid_loss_pct\":{:.1},\"peer\":\"{}\",\"sock_rcvbuf\":{},\"sock_sndbuf\":{},\"pace_queue_bytes\":{},\"pace_queue_ms\":{:.0}}}",
             fps,
             kbps,
             rtt,
@@ -1265,7 +1348,8 @@ impl Stream {
             info.peer,
             info.rcvbuf,
             info.sndbuf,
-            self.pace_bytes
+            self.pace_bytes,
+            self.pace_queue_ms()
         );
         io.events.push(Event::Stats {
             stream: self.id,

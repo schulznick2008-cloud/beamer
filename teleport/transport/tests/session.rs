@@ -504,11 +504,11 @@ fn bitrate_recovers_without_loss() {
     };
     pump(2500);
     let low = l.tx.target_kbps(SID);
-    assert!(low < 6000, "Absenkung erwartet, ist {low}");
+    assert!(low < 7000, "Absenkung erwartet, ist {low}");
     l.rx.set_netem(NetemConfig::default());
-    // Erholung: bis 6 s warten statt fester Zeit.
+    // Erholung: die Messung gleitet ueber 1 s und es geht mit +5 %/s hoch; bis 12 s warten, statt fester Zeit.
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(6) && l.tx.target_kbps(SID) <= low + low / 20 {
+    while start.elapsed() < Duration::from_secs(12) && l.tx.target_kbps(SID) <= low + low / 20 {
         pump(200);
     }
     assert!(
@@ -523,6 +523,7 @@ fn moderate_loss_repaired_by_fec_and_nack_does_not_throttle() {
     let l = link(8000);
     l.rx.set_netem(NetemConfig {
         loss_pct: 3.0,
+        jitter_ms: 10.0,
         seed: 11,
         ..Default::default()
     });
@@ -543,7 +544,7 @@ fn moderate_loss_repaired_by_fec_and_nack_does_not_throttle() {
     let t = l.tx.target_kbps(SID);
     eprintln!("target_kbps nach 5 s bei 3 % Rohverlust: {t} von 8000");
     assert!(
-        t >= 4800,
+        t >= 7200,
         "keine harte Drosselung bei geheiltem Verlust erwartet, ist {t}"
     );
 }
@@ -929,4 +930,62 @@ fn roaming_follows_a_changed_source_address() {
         tx.counters(SID).unwrap().packets_recv > tx_recv_before + 3,
         "Rueckkanal laeuft ueber den neuen Pfad"
     );
+}
+
+/// Hoechster Wert eines Zahlenfelds ueber alle Stats-Zeilen.
+fn max_field(stats: &[String], key: &str) -> f64 {
+    stats
+        .iter()
+        .filter_map(|s| {
+            s.split(&format!("\"{key}\":"))
+                .nth(1)
+                .and_then(|r| r.split([',', '}']).next())
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn reordering_without_loss_is_not_raw_loss() {
+    // 0 % Verlust, aber bis zu 10 ms Umordnung: Rohverlust < 1 %, Zielbitrate bleibt am Maximum.
+    for fec in [true, false] {
+        let l = link(8000);
+        l.tx.set_fec_enabled(SID, fec).unwrap();
+        l.rx.set_netem(NetemConfig {
+            jitter_ms: 10.0,
+            seed: 5,
+            ..Default::default()
+        });
+        let start = Instant::now();
+        let mut i = 0u64;
+        while start.elapsed() < Duration::from_millis(4500) {
+            l.tx.send_frame(
+                SID,
+                1,
+                &blob(5000, 0),
+                i * 16_666,
+                i.is_multiple_of(120) as u8,
+            )
+            .unwrap();
+            i += 1;
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let rx_stats = l.rx_sink.stats.lock().unwrap();
+        let tx_stats = l.tx_sink.stats.lock().unwrap();
+        assert!(rx_stats.len() >= 3 && tx_stats.len() >= 3);
+        let raw_rx = max_field(&rx_stats, "loss_pct");
+        let raw_tx = max_field(&tx_stats, "loss_pct");
+        eprintln!(
+            "FEC {fec}: Rohverlust Empfaenger max {raw_rx} %, Sender (aus Feedback) max {raw_tx} %"
+        );
+        assert!(
+            raw_rx < 1.0 && raw_tx < 1.0,
+            "Umordnung zaehlt als Verlust: {raw_rx} / {raw_tx}"
+        );
+        assert!(
+            l.tx.target_kbps(SID) >= 7600,
+            "Zielbitrate muss (fast) am Maximum bleiben: {}",
+            l.tx.target_kbps(SID)
+        );
+    }
 }

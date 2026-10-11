@@ -131,7 +131,7 @@ Verhalten:
 - Der Empfänger schickt bei Lücken einen NACK. Ist ein Frame nach 2 × RTT (mindestens 30 ms, höchstens 250 ms, gerechnet ab dem letzten Paket des Frames) noch unvollständig, wird er verworfen und ein `keyframe_req` geschickt (höchstens alle 300 ms).
 - Der Sender hält einen Puffer zum erneuten Senden von 300 ms.
 - Bitratenregelung (Sender, v1.1/C01a): Zielbitrate um 15 % pro Sekunde senken bei **Restverlust** `loss_permille` > 10 (1 %), bei **Rohverlust** `raw_loss_permille` > 80 (8 %, Notbremse) oder bei steigendem Jitter (zwei Anstiege in Folge um je ≥ 15 % und ≥ 2 ms). Sonst um 5 % pro Sekunde anheben, bis zur Obergrenze (`bitrate_kbps`, `bt_set_max_kbps`). Untergrenze: Obergrenze/20, mindestens 200 kbit/s. Grund: FEC und NACK heilen Verluste unterhalb dieser Schwellen, eine Drosselung nach Rohverlust würde nur Qualität kosten.
-- Pacing (Sender): Token-Bucket mit 1,5 × Zielbitrate, Burst höchstens 64 KB; Wiederholungen und Steuerpakete laufen durch denselben Bucket. Die Warteschlange fasst höchstens 300 ms der Bucket-Rate (mindestens 128 KB), darüber lehnt `bt_send_frame` mit einem Fehler ab (der Encoder soll das Frame auslassen).
+- Pacing (Sender): Token-Bucket mit 1,5 × Zielbitrate, Burst höchstens 64 KB; Wiederholungen und Steuerpakete laufen durch denselben Bucket. Die Sendewarteschlange ist zeitlich begrenzt: Liegt die Wartezeit der bereits wartenden Pakete bei aktueller Bucket-Rate über 150 ms, lehnt `bt_send_frame` mit einem Fehler ab (der Encoder soll das Frame auslassen); darunter wird auch ein einzelnes großes Keyframe angenommen.
 
 ### 4.2 Schlüssel
 
@@ -179,7 +179,7 @@ const char*bt_last_error(void);                                         // threa
 ```
 
 - Rückgabe 0 bedeutet OK, <0 einen Fehler. `role` ist ein `uint32_t` mit den Werten von `BtRole`; andere Werte liefern einen Fehler (kein undefiniertes Verhalten).
-- `bt_add_stream` lehnt ein Schlüsselpaar (Schlüssel + Präfix der Senderichtung) ab, das die Session schon benutzt hat, auch nach `bt_remove_stream`: gleiche Nonces mit neuem `seq` wären Nonce-Wiederverwendung. Python leitet pro Teleport frische Schlüssel ab (§4.2).
+- `bt_add_stream` lehnt ein Schlüsselpaar (Schlüssel + Präfix der Senderichtung) ab, das die Session schon benutzt hat, auch nach `bt_remove_stream`: gleiche Nonces mit neuem `seq` wären Nonce-Wiederverwendung. Die Sperre gilt nur innerhalb einer Session (sie merkt sich die Schlüssel nicht über einen Neustart hinaus): Frische Schlüssel pro Teleport sind Pflicht der Python-Seite (§4.2).
 - Die Callbacks kommen aus einem Transport-Thread. Der Aufrufer muss sie schnell verarbeiten (in eine Queue legen).
 - Ein Socket pro Session, beliebig viele Streams. Der Socket ist an `0.0.0.0` gebunden (alle Interfaces), damit derselbe Port über Kabel und WLAN erreichbar ist.
 - `bt_set_peer` darf jederzeit kommen, auch bei laufenden Streams. Es wirkt sofort, `seq`, Schlüssel und Puffer laufen weiter. Danach schickt der Transport sofort ein `ping` (Empfänger) bzw. das nächste Paket (Sender) an die neue Adresse.
