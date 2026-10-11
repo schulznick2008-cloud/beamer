@@ -243,10 +243,19 @@ public final class SenderPipeline {
     /// Keyframe anfordern. Wartet hoechstens `timeout` Sekunden (ScreenCaptureKit kann haengen) und liefert die
     /// aktuelle Stream-Groesse in Pixeln.
     @discardableResult
-    public func syncSize(expecting target: CGSize? = nil, timeout: TimeInterval = 1.5) -> (width: Int, height: Int) {
+    /// Capture schon vor dem Ende einer Fenster-/Monitor-Aenderung auf die bekannte Zielgroesse stellen (virtueller
+    /// Monitor: das Bild ist der ganze Monitor, seine Zielgroesse steht vorher fest). `true`, wenn sich die
+    /// Pixelgroesse geaendert hat; das Ergebnis geht danach an `syncSize(alreadyChanged:)`.
+    public func applySizeEarly(points: CGSize, timeout: TimeInterval = 1.5) -> Bool {
+        let src = source
+        return (try? runBounded(timeout: timeout, "Groesse umstellen") { src.applySize(points: points) }) ?? false
+    }
+
+    public func syncSize(expecting target: CGSize? = nil, timeout: TimeInterval = 1.5,
+                         alreadyChanged: Bool = false) -> (width: Int, height: Int) {
         let src = source
         let t0 = Date()
-        var changed = false
+        var changed = alreadyChanged
         // Das Fenster uebernimmt eine per AX gesetzte Groesse erst nach einigen Millisekunden: erst billig auf die
         // neue Groesse warten (CoreGraphics-Rahmen), dann ScreenCaptureKit neu lesen lassen.
         if let t = target {
@@ -259,11 +268,13 @@ public final class SenderPipeline {
         // Die neue Groesse steht fest (CoreGraphics-Rahmen): direkt umstellen, ohne ScreenCaptureKit zu befragen.
         let known = src.currentPointSize() ?? target
         if let pt = known {
-            changed = (try? runBounded(timeout: max(0.2, timeout - Date().timeIntervalSince(t0)), "Groesse umstellen") {
+            let c = (try? runBounded(timeout: max(0.2, timeout - Date().timeIntervalSince(t0)), "Groesse umstellen") {
                 src.applySize(points: pt)
             }) ?? false
+            changed = changed || c
         } else {
-            changed = (try? runBounded(timeout: timeout, "Groesse neu lesen") { src.refresh().sizeChanged }) ?? false
+            let c = (try? runBounded(timeout: timeout, "Groesse neu lesen") { src.refresh().sizeChanged }) ?? false
+            changed = changed || c
         }
         let size = src.pixelSize
         if changed {

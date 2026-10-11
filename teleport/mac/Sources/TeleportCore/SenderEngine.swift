@@ -155,6 +155,7 @@ public final class SenderEngine: TeleportBackend {
                 try accessibilityCheck()
                 guard let pid = pid else { throw IPCError(.notFound, "Fenster \(wid) nicht gefunden") }
                 let frame = try windowController.frame(windowID: wid, pid: pid)
+                windowController.prepare(windowID: wid, pid: pid)
                 let vd = try virtualDisplayFactory(Int(frame.width.rounded()),
                                                    Int(frame.height.rounded()) + Self.menuBarAllowance)
                 virtual = vd
@@ -311,9 +312,18 @@ public final class SenderEngine: TeleportBackend {
             if debug { logErr("resize: \(what) \(Int(Date().timeIntervalSince(mark) * 1000)) ms") }
             mark = Date()
         }
+        var captureChanged = false
+        let captureGroup = DispatchGroup()
         if let vd = c.virtual {
             let newMonitorH = Int(size.height) + Self.menuBarAllowance
             let shrinking = Int(size.width) <= vd.widthPoints && newMonitorH <= vd.heightPoints
+            // Das Bild ist der ganze Monitor: seine Zielgroesse steht fest. Die Capture-Umstellung (ScreenCaptureKit,
+            // 60-180 ms) laeuft deshalb gleichzeitig mit Monitor- und Fensterwechsel statt danach.
+            captureGroup.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                captureChanged = pipe.applySizeEarly(points: CGSize(width: size.width, height: CGFloat(newMonitorH)))
+                captureGroup.leave()
+            }
             func moveWindow() throws {
                 // Der Monitor sitzt nach der Groessenaenderung an einer neuen Stelle (macOS legt ihn buendig links vom
                 // Hauptbildschirm ab): Fenster samt Position neu setzen.
@@ -358,7 +368,8 @@ public final class SenderEngine: TeleportBackend {
             lap("Fenster")
         }
         let expected = c.virtual != nil ? CGSize(width: size.width, height: size.height + CGFloat(Self.menuBarAllowance)) : size
-        let px = pipe.syncSize(expecting: expected)
+        captureGroup.wait()
+        let px = pipe.syncSize(expecting: expected, alreadyChanged: captureChanged)
         lap("Capture")
         return (px.width, px.height)
     }

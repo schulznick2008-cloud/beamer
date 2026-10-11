@@ -135,6 +135,12 @@ public protocol WindowController: AnyObject {
     func frame(windowID: UInt32, pid: pid_t) throws -> CGRect
     func setFrame(windowID: UInt32, pid: pid_t, origin: CGPoint?, size: CGSize?) throws
     func isFrontmost(windowID: UInt32, pid: pid_t) -> Bool
+    /// Optional: Fenster-Zugriff vorab aufbauen, damit das spaetere `setFrame` schneller ist.
+    func prepare(windowID: UInt32, pid: pid_t)
+}
+
+extension WindowController {
+    public func prepare(windowID: UInt32, pid: pid_t) {}
 }
 
 public final class AXWindowController: WindowController {
@@ -142,6 +148,34 @@ public final class AXWindowController: WindowController {
 
     @_silgen_name("_AXUIElementGetWindow")
     private static func _axGetWindow(_ element: AXUIElement, _ out: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+    // Das AX-Element eines Fensters bleibt gueltig, solange das Fenster lebt: einmal suchen (Fensterliste der App
+    // durchgehen kostet je nach App 10-40 ms), danach merken. Ein Fehler beim Setzen wirft den Eintrag weg.
+    private let cacheLock = NSLock()
+    private var cache: [UInt32: AXUIElement] = [:]
+
+    private func cachedAXWindow(windowID: UInt32, pid: pid_t) throws -> AXUIElement {
+        cacheLock.lock()
+        let hit = cache[windowID]
+        cacheLock.unlock()
+        if let w = hit { return w }
+        let w = try axWindow(windowID: windowID, pid: pid)
+        cacheLock.lock()
+        cache[windowID] = w
+        cacheLock.unlock()
+        return w
+    }
+
+    private func forget(_ windowID: UInt32) {
+        cacheLock.lock()
+        cache[windowID] = nil
+        cacheLock.unlock()
+    }
+
+    /// Das AX-Element schon vorab aufloesen (z. B. waehrend der Monitor noch umschaltet).
+    public func prepare(windowID: UInt32, pid: pid_t) {
+        _ = try? cachedAXWindow(windowID: windowID, pid: pid)
+    }
 
     private func axWindow(windowID: UInt32, pid: pid_t) throws -> AXUIElement {
         try AccessibilityPermission.check()
@@ -195,7 +229,16 @@ public final class AXWindowController: WindowController {
     }
 
     public func setFrame(windowID: UInt32, pid: pid_t, origin: CGPoint?, size: CGSize?) throws {
-        let w = try axWindow(windowID: windowID, pid: pid)
+        do {
+            try setFrame(try cachedAXWindow(windowID: windowID, pid: pid), origin: origin, size: size)
+        } catch {
+            // Veralteter Eintrag (Fenster neu aufgebaut)? Einmal frisch suchen.
+            forget(windowID)
+            try setFrame(try cachedAXWindow(windowID: windowID, pid: pid), origin: origin, size: size)
+        }
+    }
+
+    private func setFrame(_ w: AXUIElement, origin: CGPoint?, size: CGSize?) throws {
         // Erst die Groesse, dann die Position und die Groesse noch einmal: Verschiebt man zuerst, kappt macOS
         // die Groesse am Rand des alten Bildschirms.
         func setSize(_ s: CGSize) throws {
