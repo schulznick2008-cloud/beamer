@@ -1114,7 +1114,10 @@ impl Stream {
     fn nack_delay(&self) -> Duration {
         let by_jitter = (self.jitter_us / 1000.0) * 2.0 + 2.0;
         let by_reorder = self.reorder_ms * 1.2 + 1.0;
-        Duration::from_secs_f64(by_jitter.max(by_reorder).clamp(2.0, 30.0) / 1000.0)
+        // Nie laenger warten als ein Drittel der Frist, sonst verfaellt der Frame vor dem ersten NACK
+        // (z. B. wenn der Jitter-Schaetzer wegen unregelmaessiger pts hohe Werte liefert).
+        let cap = (self.deadline().as_secs_f64() * 1000.0 / 3.0).max(2.0);
+        Duration::from_secs_f64(by_jitter.max(by_reorder).clamp(2.0, cap) / 1000.0)
     }
 
     fn send_nacks(&mut self, now: Instant, io: &mut Io) {
