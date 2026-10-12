@@ -2,7 +2,7 @@
 //! sich ohne Windows-Nachrichten testen laesst: Koordinaten-Umrechnung, Tastennamen, gehaltene Tasten und
 //! Buttons (fuer das `up` bei Fokusverlust), Klickzaehler und Text.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -110,7 +110,10 @@ struct LastClick {
 }
 
 pub struct InputState {
-    keys: BTreeSet<String>,
+    /// Gehaltene Tasten nach seitenrichtigem VK (oder Scan-Code) -> Name vom `down`.
+    /// Der Name haengt an Shift/Feststelltaste; der VK nicht. Sonst verfehlt das `up` die Taste
+    /// ("A" gedrueckt, Shift los, "a" losgelassen) und sie bleibt beim Sender unten.
+    keys: BTreeMap<u32, String>,
     buttons: BTreeSet<Button>,
     pos: (f64, f64),
     last_click: Option<LastClick>,
@@ -147,7 +150,17 @@ impl InputState {
     }
 
     pub fn held_keys(&self) -> impl Iterator<Item = &String> {
-        self.keys.iter()
+        self.keys.values()
+    }
+
+    /// Shift links oder rechts ist unten. Das Fenster braucht das fuer das Zeichen beim `down`,
+    /// wenn `GetKeyState` den Tastaturzustand nicht mitbekommt (Tasten per `PostMessage`).
+    pub fn holds_shift(&self) -> bool {
+        const VK_LSHIFT: u32 = 0xA0;
+        const VK_RSHIFT: u32 = 0xA1;
+        self.keys.contains_key(&VK_LSHIFT)
+            || self.keys.contains_key(&VK_RSHIFT)
+            || self.keys.contains_key(&VK_SHIFT)
     }
 
     pub fn moved(&mut self, s: (f64, f64)) -> Value {
@@ -205,17 +218,25 @@ impl InputState {
         json!({"k": "scroll", "x": r2(s.0), "y": r2(s.1), "dx": dx, "dy": dy, "unit": "line"})
     }
 
-    /// Taste gedrueckt/losgelassen. Gedrueckt halten meldet nur ein `down` (die Wiederholung macht der
-    /// Sender selbst). Ein `up` ohne vorheriges `down` wird verworfen.
-    pub fn key(&mut self, name: &str, down: bool) -> Option<Value> {
+    /// Taste gedrueckt/losgelassen, gefuehrt ueber `id` (seitenrichtiger VK oder Scan-Code, wie
+    /// `held = vk` in `win_app/sender.py` `on_key`).
+    ///
+    /// Der Name wird beim `down` gespeichert und beim `up` genau so gemeldet. Shift oder
+    /// Feststelltaste koennen dazwischen umspringen ("A"/"a", "2"/"\""); der Aufrufer berechnet
+    /// den Namen dann neu und wuerde die Taste sonst verfehlen. `name` gilt deshalb nur beim
+    /// `down`. Gedrueckt halten (gleiche `id`, auch mit anderem Namen) meldet nur ein `down`;
+    /// die Wiederholung macht der Sender selbst. Ein `up` ohne vorheriges `down` wird verworfen.
+    pub fn key(&mut self, id: u32, name: &str, down: bool) -> Option<Value> {
         if down {
-            if !self.keys.insert(name.to_owned()) {
+            if self.keys.contains_key(&id) {
                 return None;
             }
-        } else if !self.keys.remove(name) {
-            return None;
+            self.keys.insert(id, name.to_owned());
+            Some(json!({"k": "key", "key": name, "down": true}))
+        } else {
+            let stored = self.keys.remove(&id)?;
+            Some(json!({"k": "key", "key": stored, "down": false}))
         }
-        Some(json!({"k": "key", "key": name, "down": down}))
     }
 
     /// Ein WM_CHAR-Zeichen (UTF-16-Einheit) als `text`: zusammengesetzte Zeichen (Akzent-Tasten), IME,
@@ -246,8 +267,11 @@ impl InputState {
             .into_iter()
             .map(|b| json!({"k": "up", "x": x, "y": y, "b": b.name()}))
             .collect();
+        // Reihenfolge wie bisher (nach Name), nicht nach VK.
+        let mut names: Vec<String> = std::mem::take(&mut self.keys).into_values().collect();
+        names.sort();
         out.extend(
-            std::mem::take(&mut self.keys)
+            names
                 .into_iter()
                 .map(|k| json!({"k": "key", "key": k, "down": false})),
         );
@@ -399,9 +423,9 @@ mod tests {
     fn release_all_lifts_everything_once() {
         let mut s = InputState::default();
         let t = Instant::now();
-        s.key("ctrl", true);
-        s.key("a", true);
-        assert!(s.key("a", true).is_none()); // Wiederholung: kein zweites down
+        s.key(0xA2, "ctrl", true);
+        s.key(0x41, "a", true);
+        assert!(s.key(0x41, "a", true).is_none()); // Wiederholung: kein zweites down
         s.button(Button::Right, true, (5.0, 6.0), (1.0, 1.0), t);
         let ups = s.release_all();
         assert_eq!(ups.len(), 3);
@@ -411,10 +435,84 @@ mod tests {
             .any(|v| *v == json!({"k":"key","key":"ctrl","down":false})));
         assert!(s.release_all().is_empty());
         // Das echte `up` danach wird nicht doppelt gemeldet.
-        assert!(s.key("ctrl", false).is_none());
+        assert!(s.key(0xA2, "ctrl", false).is_none());
         assert!(s
             .button(Button::Right, false, (0.0, 0.0), (0.0, 0.0), t)
             .is_none());
+    }
+
+    #[test]
+    fn shift_released_before_the_key_uses_the_down_name() {
+        // Shift runter, A runter, Shift hoch, A hoch: der Aufrufer berechnet beim Loslassen "a".
+        // Gemeldet wird trotzdem "A", und das naechste Shift+A ist kein verschlucktes Repeat.
+        let mut s = InputState::default();
+        assert_eq!(
+            s.key(0xA0, "shift", true),
+            Some(json!({"k": "key", "key": "shift", "down": true}))
+        );
+        assert!(s.holds_shift());
+        assert_eq!(
+            s.key(0x41, "A", true),
+            Some(json!({"k": "key", "key": "A", "down": true}))
+        );
+        // Wiederholung nach VK, auch wenn der Name inzwischen "a" waere.
+        assert!(s.key(0x41, "a", true).is_none());
+        assert_eq!(
+            s.key(0xA0, "shift", false),
+            Some(json!({"k": "key", "key": "shift", "down": false}))
+        );
+        assert!(!s.holds_shift());
+        assert_eq!(
+            s.key(0x41, "a", false),
+            Some(json!({"k": "key", "key": "A", "down": false}))
+        );
+        assert_eq!(
+            s.key(0xA0, "shift", true),
+            Some(json!({"k": "key", "key": "shift", "down": true}))
+        );
+        assert_eq!(
+            s.key(0x41, "A", true),
+            Some(json!({"k": "key", "key": "A", "down": true}))
+        );
+        assert_eq!(
+            s.key(0xA0, "shift", false),
+            Some(json!({"k": "key", "key": "shift", "down": false}))
+        );
+        assert_eq!(
+            s.key(0x41, "a", false),
+            Some(json!({"k": "key", "key": "A", "down": false}))
+        );
+        assert!(s.release_all().is_empty());
+    }
+
+    #[test]
+    fn symbol_and_caps_keep_the_name_from_down() {
+        let mut s = InputState::default();
+        // Zifferntaste: down "\"", up kommt als "2" an.
+        let quote = "\"";
+        assert_eq!(
+            s.key(0x32, quote, true),
+            Some(json!({"k": "key", "key": quote, "down": true}))
+        );
+        assert_eq!(
+            s.key(0x32, "2", false),
+            Some(json!({"k": "key", "key": quote, "down": false}))
+        );
+        // Feststelltaste dazwischen: der Name vom down bleibt.
+        assert_eq!(
+            s.key(0x41, "a", true),
+            Some(json!({"k": "key", "key": "a", "down": true}))
+        );
+        s.key(0x14, "caps_lock", true);
+        assert_eq!(
+            s.key(0x41, "A", false),
+            Some(json!({"k": "key", "key": "a", "down": false}))
+        );
+        let ups = s.release_all();
+        assert!(ups
+            .iter()
+            .any(|v| *v == json!({"k": "key", "key": "caps_lock", "down": false})));
+        assert!(s.key(0x41, "A", false).is_none());
     }
 
     #[test]

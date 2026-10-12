@@ -554,10 +554,12 @@ fn key_down(vk: u32) -> bool {
 /// Zeichen einer Zeichentaste: nur Shift und Feststelltaste zaehlen (wie win_app/capture_win.py),
 /// Strg/Alt nicht. Mit `altgr` zusaetzlich Strg+Alt (so erzeugt Windows AltGr-Zeichen wie "@").
 /// Tote Tasten (Akzente) liefern nichts; ihr Ergebnis kommt als WM_CHAR -> `text`.
-fn key_char(vk: u32, scan: u32, altgr: bool) -> Option<String> {
+/// `shift` ist der Tastaturzustand oder eine von uns selbst gesehene Shift-Taste (PostMessage
+/// setzt `GetKeyState` nicht).
+fn key_char(vk: u32, scan: u32, altgr: bool, shift: bool) -> Option<String> {
     unsafe {
         let mut state = [0u8; 256];
-        if key_down(input::VK_SHIFT) {
+        if shift {
             state[input::VK_SHIFT as usize] = 0x80;
         }
         if altgr {
@@ -674,9 +676,11 @@ fn on_key_inner(
         st.altgr = down;
         return Some(LRESULT(0));
     }
+    // GetKeyState sieht per PostMessage eingespieltes Shift nicht; die gehaltene Taste schon.
+    let shift = key_down(input::VK_SHIFT) || st.holds_shift();
     if st.altgr && input::named_key(svk).is_none() {
         if down {
-            let c = key_char(vk, scan, true);
+            let c = key_char(vk, scan, true, shift);
             // Das WM_CHAR zur Taste darf nicht doppelt als Text raus. Tote Taste (kein Zeichen): nichts
             // entfernen, das zusammengesetzte Zeichen kommt spaeter als WM_CHAR.
             *drop_char = c.is_some();
@@ -687,19 +691,25 @@ fn on_key_inner(
         }
         return Some(LRESULT(0));
     }
-    let name = match input::named_key(svk) {
+    let computed = match input::named_key(svk) {
         Some(n) => Some(n.to_owned()),
-        None => key_char(vk, scan, false),
+        None => key_char(vk, scan, false, shift),
     };
-    if let Some(name) = name {
-        if down && input::named_key(svk).is_none() {
-            *drop_char = true;
+    // down: Name von jetzt. up: Name vom down (InputState, nach VK), auch wenn Shift/Caps ihn
+    // inzwischen geaendert haben oder die Taste tot geworden ist. Sonst bleibt sie beim Sender unten.
+    let ev = match (down, computed) {
+        (true, Some(name)) => {
+            if input::named_key(svk).is_none() {
+                *drop_char = true;
+            }
+            st.key(svk, &name, true)
         }
-        let ev = st.key(&name, down);
-        drop(st);
-        if let Some(v) = ev {
-            s.send_input(v);
-        }
+        (true, None) => None,
+        (false, name) => st.key(svk, name.as_deref().unwrap_or(""), false),
+    };
+    drop(st);
+    if let Some(v) = ev {
+        s.send_input(v);
     }
     if msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP {
         // Alt+Leertaste (Systemmenue) bleibt bei Windows; den Rest nicht an DefWindowProc (kein Menue-Modus).

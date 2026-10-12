@@ -368,6 +368,42 @@ fn main() {
         &mut fails,
     );
 
+    // --- Shift vor der Taste loslassen: up traegt den Namen vom down ("A"), nicht "a".
+    // Sonst bleibt A beim Sender unten und das naechste Shift+A gilt als Wiederholung.
+    post(hw, WM_KEYDOWN, 0x10, key_lp(0x2A, false)); // Shift links
+    post(hw, WM_KEYDOWN, 0x41, key_lp(0x1E, false)); // A
+    post(hw, WM_KEYUP, 0x10, key_lp(0x2A, true));
+    post(hw, WM_KEYUP, 0x41, key_lp(0x1E, true));
+    post(hw, WM_KEYDOWN, 0x10, key_lp(0x2A, false));
+    post(hw, WM_KEYDOWN, 0x41, key_lp(0x1E, false));
+    post(hw, WM_KEYUP, 0x41, key_lp(0x1E, true));
+    post(hw, WM_KEYUP, 0x10, key_lp(0x2A, true));
+    let ev = inputs(&h.collect(Duration::from_millis(400)));
+    println!("  Shift vor A: {ev:?}");
+    let shift_keys: Vec<(String, bool)> = ev
+        .iter()
+        .filter(|v| v["k"] == "key")
+        .map(|v| (v["key"].as_str().unwrap().to_owned(), v["down"] == true))
+        .collect();
+    check(
+        shift_keys
+            == vec![
+                ("shift".into(), true),
+                ("A".into(), true),
+                ("shift".into(), false),
+                ("A".into(), false),
+                ("shift".into(), true),
+                ("A".into(), true),
+                ("A".into(), false),
+                ("shift".into(), false),
+            ]
+            && !ev.iter().any(|v| v["k"] == "text"),
+        &format!(
+            "Shift vor A losgelassen: up bleibt \"A\", zweites Shift+A kommt an: {shift_keys:?}"
+        ),
+        &mut fails,
+    );
+
     // --- AltGr: kuenstliches linkes Strg + rechtes Alt (erweitert), dann Q -> Text (z. B. "@" auf Deutsch)
     match altgr_char(0x51, 0x10) {
         Some(want) => {
