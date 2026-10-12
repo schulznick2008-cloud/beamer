@@ -131,7 +131,7 @@ pub struct InputState {
 impl Default for InputState {
     fn default() -> Self {
         InputState {
-            keys: BTreeSet::new(),
+            keys: BTreeMap::new(),
             buttons: BTreeSet::new(),
             pos: (0.0, 0.0),
             last_click: None,
