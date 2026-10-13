@@ -4950,6 +4950,12 @@ def main(argv=None):
         cfg = editable_default_config()
     book, identity = bridge.links_from_store(settings_store, VERSION)
     controller = WakingController(cfg, logger=logger, book=book, identity=identity, hardware=hardware_mac.hardware_address_towards)
+    try:
+        from core.teleport_bridge import attach_mac_controller
+
+        attach_mac_controller(controller)
+    except Exception:
+        logger.exception("Teleport konnte nicht initialisiert werden")
     app = TrayApp(controller, settings_store, logger, hidden=args.hidden)
     instance_server = InstanceSignalServer(
         instance_socket_path(), lambda: AppHelper.callAfter(app.open_window, None)

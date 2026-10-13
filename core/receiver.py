@@ -346,9 +346,24 @@ class _Link:
     the `ack`s when they are due, so nothing that holds the responder's lock ever waits on a
     socket."""
 
-    def __init__(self, sock, session, peer_id, key_id, host, name, caps, own_id, own_caps, allow_drive, platform="") -> None:
+    def __init__(
+        self,
+        sock,
+        session,
+        peer_id,
+        key_id,
+        host,
+        name,
+        caps,
+        own_id,
+        own_caps,
+        allow_drive,
+        platform="",
+        peer_teleport: bool = False,
+    ) -> None:
         self.sock = sock
         self.peer_platform = platform  # the hello's: the Mac scales a PC's wheel lines by it
+        self.peer_teleport = peer_teleport
         self.session = session
         self.peer_id = peer_id
         self.key_id = key_id
@@ -480,6 +495,7 @@ class LinkResponder:
         paired_callback=None,
         link_callback=None,
         announce=None,
+        teleport_callback=None,
     ) -> None:
         self._book = book
         self._identity = identity
@@ -497,6 +513,7 @@ class LinkResponder:
             "arrangement": arrangement_callback, "settings": settings_callback, "paired": paired_callback,
             "link": link_callback,
         }
+        self._teleport_callback = teleport_callback
         self._announce = announce or (lambda peer: [])
         # This machine's speed for a peer's pointer and scroll, and whether
         # its edges are held (Pause crossing, a full-screen app), which keeps the zones from firing.
@@ -756,14 +773,33 @@ class LinkResponder:
                 return None
             allow_drive = entry.get("allow_drive") is True
             welcome = protocol.welcome_v6(
-                own_id, identity["name"], identity["platform"], identity["app"], identity["caps"], allow_drive, self._hardware_towards(host, identity)
+                own_id,
+                identity["name"],
+                identity["platform"],
+                identity["app"],
+                identity["caps"],
+                allow_drive,
+                self._hardware_towards(host, identity),
+                teleport=bool(identity.get("teleport")),
             )
             protocol.send_msg(connection, session, welcome)
         except (socket.timeout, protocol.ConnectionClosed, protocol.ProtocolError, OSError) as exc:
             LOGGER.info("Handshake with %s ended: %s", host, exc)
             return None
-        return _Link(connection, session, hello["id"], key_id, host, hello["name"], hello["caps"], own_id, identity["caps"], allow_drive,
-                     hello["platform"])
+        return _Link(
+            connection,
+            session,
+            hello["id"],
+            key_id,
+            host,
+            hello["name"],
+            hello["caps"],
+            own_id,
+            identity["caps"],
+            allow_drive,
+            hello["platform"],
+            peer_teleport=bool(hello.get("teleport")),
+        )
 
     def _hardware_towards(self, host, identity):
         """The `hw` for the welcome to `host`, as the initiator's hook does for its hello: the hook is
@@ -951,6 +987,8 @@ class LinkResponder:
                 ids = protocol.read_paired(message)
                 if ids is not None:
                     self._callback("paired", link.peer_id, ids)
+            elif isinstance(kind, str) and kind.startswith("tp_") and self._teleport_callback is not None:
+                self._teleport_callback(link.peer_id, message)
         except Exception:
             LOGGER.exception("A %r from %s could not be dealt with", kind, link.name)
 

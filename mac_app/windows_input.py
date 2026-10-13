@@ -50,6 +50,9 @@ class WindowsInput:
         self.detail = "Not listening"
         self.settings_callback = None
         self.paired_callback = None
+        teleport_cb = None
+        if getattr(controller, "teleport", None) is not None:
+            teleport_cb = lambda peer_id, message: controller.teleport.handle_link_message(peer_id, message)
         self.server = LinkResponder(
             controller.book,
             controller.identity,
@@ -72,8 +75,13 @@ class WindowsInput:
             settings_callback=self._on_settings,
             paired_callback=self._on_paired,
             announce=self._announce,
+            teleport_callback=teleport_cb,
         )
         controller.responder = self.server
+        if getattr(controller, "teleport", None) is not None:
+            from core.teleport_bridge import wire_responder_teleport
+
+            wire_responder_teleport(self.server, controller.teleport, self._token_for_peer)
         controller.send_peer_home = self.server.send_home
         # Pause crossing and the full-screen hold are about this screen: a peer's pointer does not
         # go onward or home through a held edge either.
@@ -119,6 +127,12 @@ class WindowsInput:
             self.server.start(wanted)
         except Exception:
             self._logger.exception("The listener for other machines' input could not start")
+
+    def _token_for_peer(self, peer_id: str) -> str:
+        for entry in self._controller.book.peers():
+            if entry.get("id") == peer_id:
+                return str(entry.get("token") or "")
+        return ""
 
     def _held(self):
         """What the responder arms and answers from: the peers' ids, tokens, sides and switches, and the zones."""

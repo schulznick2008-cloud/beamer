@@ -69,6 +69,7 @@ ROUND_TRIP_MAX_AGE_SECONDS = 5.0
 LET_GO_WAIT_SECONDS = 1.3
 OWN_PLATFORM = "macos"
 CAPABILITIES = ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "displays", "ping_rtt")
+TELEPORT_HOTKEY = "ctrl+alt+cmd+t"  # Vorschlag (nicht im Vertrag); siehe docs/teleport/BENUTZEN.md
 MEDIA_KEY_NAMES = frozenset({"volume_mute", "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause", "brightness_up", "brightness_down"})
 
 # Why input came home, in words, for the alert. A why that is not here comes home quietly.
@@ -424,8 +425,15 @@ def links_from_store(settings_store, app_version):
     def identity():
         settings = settings_store.current()
         name = (settings.get("name") or socket.gethostname().split(".")[0] or "Mac")[:48]
-        return {"id": protocol.read_id(settings["machine_id"]), "name": name, "platform": OWN_PLATFORM, "app": app_version,
-                "caps": list(CAPABILITIES), "port": settings["port"]}
+        return {
+            "id": protocol.read_id(settings["machine_id"]),
+            "name": name,
+            "platform": OWN_PLATFORM,
+            "app": app_version,
+            "caps": list(CAPABILITIES),
+            "port": settings["port"],
+            "teleport": True,
+        }
 
     return settings_store.book(), identity
 
@@ -1442,6 +1450,8 @@ class KVMController:
                 if self.event_tap is not None:
                     self.quartz.CGEventTapEnable(self.event_tap, True)
                 return event
+            if not self._was_injected(event) and self._handle_teleport_hotkey(event_type, event):
+                return None
             if not self._was_injected(event) and self._handle_jump_key(event_type, event):
                 return None
             if self.receiving:
@@ -1705,6 +1715,41 @@ class KVMController:
         if step.pressure > 0:
             self._notify_crossing("tick" if step.tick else "pressure", step)
         return event
+
+    def _handle_teleport_hotkey(self, event_type, event):
+        """Fenster teleportieren / zurückholen (Mac → PC)."""
+        teleport = getattr(self, "teleport", None)
+        if teleport is None:
+            return False
+        quartz = self.quartz
+        if event_type not in (quartz.kCGEventKeyDown, quartz.kCGEventKeyUp):
+            return False
+        if event_type != quartz.kCGEventKeyDown or self.jump_recording:
+            return False
+        if quartz.CGEventGetIntegerValueField(event, quartz.kCGKeyboardEventAutorepeat):
+            return False
+        keycode = int(quartz.CGEventGetIntegerValueField(event, quartz.kCGKeyboardEventKeycode))
+        key = SPECIAL_KEY_NAMES.get(keycode) or PRINTABLE_KEY_FALLBACKS.get(keycode)
+        if key is None:
+            character = self.translator._unicode_character(event, keycode)
+            key = character.lower() if character and len(character) == 1 else None
+        if key is None or key in ("shift", "shift_r", "alt", "alt_r", "ctrl", "ctrl_r", "cmd", "cmd_r"):
+            return False
+        flags = quartz.CGEventGetFlags(event)
+        modifiers = []
+        for name, mask in (
+            ("ctrl", quartz.kCGEventFlagMaskControl),
+            ("alt", quartz.kCGEventFlagMaskAlternate),
+            ("shift", quartz.kCGEventFlagMaskShift),
+            ("cmd", quartz.kCGEventFlagMaskCommand),
+        ):
+            if flags & mask:
+                modifiers.append(name)
+        chord = ways.jump_chord(modifiers, key)
+        if chord != TELEPORT_HOTKEY:
+            return False
+        teleport.toggle_front_window_mac()
+        return True
 
     def _handle_jump_key(self, event_type, event):
         """Moves input to the peer named by a local jump chord and consumes its key press."""

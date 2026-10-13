@@ -699,6 +699,7 @@ class LinkSession:
             raise ValueError("an ephemeral secret is 32 bytes")
         self.share = crypto_scalarmult_base(self._secret)
         self.peer_share = None
+        self._handshake_shared: bytes | None = None
 
     def preamble(self) -> bytes:
         if self.role == ROLE_RESPONDER and self.peer_prefix is None:
@@ -720,6 +721,7 @@ class LinkSession:
             elif peer_prefix == self.prefix:
                 raise PreambleRefused("the peer sent this side's own nonce prefix back")
             shared = _x25519_shared(self._secret, peer_share)
+            self._handshake_shared = shared
         finally:
             self._secret = None
         if self.role == ROLE_INITIATOR:
@@ -732,6 +734,16 @@ class LinkSession:
         self._recv_key = link_key(self._token, shared, self.key_id, *order, 3 - sending)
         self.peer_share = peer_share
         self.peer_prefix = peer_prefix
+
+    def teleport_handshake_material(self) -> tuple[bytes, bytes, bytes, bytes, bytes, bytes] | None:
+        """(shared, key_id, prefix_i, prefix_r, share_i, share_r) for TeleportKeySession, or None."""
+        if self._handshake_shared is None or self.peer_prefix is None or self.peer_share is None:
+            return None
+        if self.role == ROLE_INITIATOR:
+            order = (self.prefix, self.peer_prefix, self.share, self.peer_share)
+        else:
+            order = (self.peer_prefix, self.prefix, self.peer_share, self.share)
+        return (self._handshake_shared, self.key_id, *order)
 
     def seal(self, msg: dict) -> bytes:
         return self.seal_raw(dumps_message(msg))
@@ -865,6 +877,7 @@ def _identity_fields(data, error):
     ident = read_id(data.get("id"))
     caps = data.get("caps")
     hw = data.get("hw")
+    teleport = data.get("teleport")
     if (
         not _int(data.get("version"), LINK_VERSION, LINK_VERSION)
         or ident is None
@@ -875,6 +888,7 @@ def _identity_fields(data, error):
         or len(caps) > MAX_CAPS
         or not all(_ascii_field(cap) for cap in caps)
         or ("hw" in data and not (isinstance(hw, str) and _HW_SHAPE.fullmatch(hw)))
+        or ("teleport" in data and teleport != 1)
     ):
         raise error("malformed first frame")
     return {
@@ -885,6 +899,7 @@ def _identity_fields(data, error):
         "app": data["app"],
         "caps": list(caps),
         "hw": hw if "hw" in data else None,
+        "teleport": teleport == 1,
     }
 
 
@@ -920,7 +935,7 @@ def read_welcome(message) -> dict:
     return fields
 
 
-def _identity(machine_id, name, platform, app, caps, hw):
+def _identity(machine_id, name, platform, app, caps, hw, teleport: bool = False):
     # The sender cuts its name, as PAIRING.md says: a hostname can be 63 characters.
     name = name[:MAX_NAME_CHARS]
     if not name:
@@ -928,17 +943,37 @@ def _identity(machine_id, name, platform, app, caps, hw):
     data = {"version": LINK_VERSION, "id": id_text(machine_id), "name": name, "platform": platform, "app": app, "caps": list(caps)}
     if hw:
         data["hw"] = hw
+    if teleport:
+        data["teleport"] = 1
     return data
 
 
-def hello_v6(machine_id: bytes, name: str, platform: str, app: str, caps, port: int, hw: str = None) -> dict:
-    data = _identity(machine_id, name, platform, app, caps, hw)
+def hello_v6(
+    machine_id: bytes,
+    name: str,
+    platform: str,
+    app: str,
+    caps,
+    port: int,
+    hw: str = None,
+    teleport: bool = False,
+) -> dict:
+    data = _identity(machine_id, name, platform, app, caps, hw, teleport=teleport)
     data["port"] = port
     return {"type": MSG_HELLO, "data": data}
 
 
-def welcome_v6(machine_id: bytes, name: str, platform: str, app: str, caps, accepts: bool, hw: str = None) -> dict:
-    data = _identity(machine_id, name, platform, app, caps, hw)
+def welcome_v6(
+    machine_id: bytes,
+    name: str,
+    platform: str,
+    app: str,
+    caps,
+    accepts: bool,
+    hw: str = None,
+    teleport: bool = False,
+) -> dict:
+    data = _identity(machine_id, name, platform, app, caps, hw, teleport=teleport)
     data["accepts"] = bool(accepts)
     return {"type": MSG_WELCOME, "data": data}
 

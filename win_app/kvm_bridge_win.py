@@ -568,6 +568,7 @@ class WindowsApplication(QWidget):
             lambda settings: app_config.write_settings(self.config_path, settings),
             app_config.SETTINGS_LOCK,
         )
+        self._teleport_service_holder: list = []
         self.server = LinkResponder(
             self.book,
             self._identity,
@@ -592,6 +593,7 @@ class WindowsApplication(QWidget):
             hardware=hardware_win.hardware_address_towards,
             desktop=platform_parts.desktop,
             injector=platform_parts.injector,
+            teleport_callback=lambda peer_id, message: self._teleport_inbound(peer_id, message),
         )
         # The links outwards: this PC's keyboard and mouse on its peers.
         self.sender = LinkSender(
@@ -631,6 +633,14 @@ class WindowsApplication(QWidget):
         self.sender.paired_callback = self._store_paired
         self.sender.hw_learned = self._learn_peer_hardware
         self.sender.announce = self._announce
+        try:
+            from core.teleport_bridge import attach_win_sender, wire_responder_teleport
+
+            svc = attach_win_sender(self.sender, self._identity)
+            self._teleport_service_holder[:] = [svc]
+            wire_responder_teleport(self.server, svc, self._token_for_peer)
+        except Exception:
+            LOGGER.exception("Teleport konnte nicht initialisiert werden")
         self.scope_labels: dict = {}
         self.own_notes: list = []
         self._same_seen = None
@@ -1616,7 +1626,22 @@ class WindowsApplication(QWidget):
             "caps": [cap for cap in ("clipboard", "clipboard_image", "gestures", "media_keys", "text", "settings", "design_sync", "layout", "displays", "ping_rtt")
                      if not (cap == "gestures" and OWN_PLATFORM == "linux")],
             "port": self._settings_port,
+            "teleport": True,
         }
+
+    def _teleport_inbound(self, peer_id: str, message: dict) -> None:
+        svc = self._teleport_service_holder[0] if self._teleport_service_holder else getattr(self.sender, "teleport", None)
+        if svc is not None:
+            svc.handle_link_message(peer_id, message)
+
+    def _token_for_peer(self, peer_id: str) -> str:
+        try:
+            for entry in self.book.peers():
+                if entry.get("id") == peer_id:
+                    return str(entry.get("token") or "")
+        except (ConfigError, OSError):
+            pass
+        return ""
 
     def _zones(self) -> list:
         try:
@@ -4089,6 +4114,9 @@ class WindowsApplication(QWidget):
     def _on_hook_mouse(self, message: int, x: int, y: int, mouse_data: int) -> bool:
         """Every mouse message, on the hook thread: what Windows said becomes the sender's neutral
         call. True when the event belongs to a peer and Windows must not see it."""
+        teleport = getattr(self.sender, "teleport", None)
+        if teleport is not None and teleport.proxy_swallow_input:
+            return True
         event = capture_win.mouse_event(message, mouse_data)
         if event is None:
             return False
@@ -4107,6 +4135,9 @@ class WindowsApplication(QWidget):
         if isinstance(name, DeadKey):
             return self.sender.on_dead_key(vk)
         if self.sender.handle_jump_key(name, down, vk):
+            return True
+        teleport = getattr(self.sender, "teleport", None)
+        if teleport is not None and teleport.proxy_swallow_input:
             return True
         if not self.sender.shortcut_armed:
             self._trigger.disarmed(name, down)
