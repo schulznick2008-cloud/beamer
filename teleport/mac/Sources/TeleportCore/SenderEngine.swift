@@ -58,8 +58,12 @@ public final class SenderEngine: TeleportBackend {
 
     public init(emit: @escaping (JSON) -> Void) {
         self.emit = emit
-        injector.releaseAll(at: nil)
         if let test = TestSources.fromEnvironment() { makeSource = test }
+    }
+
+    /// 04c: beim Helfer-Start alle noch gedrückten Tasten/Buttons loslassen (nur echter Prozess, nicht Unit-Tests).
+    public func releaseStuckInputOnStartup() {
+        injector.releaseAll(at: nil)
     }
 
     // MARK: Transport
