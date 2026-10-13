@@ -846,6 +846,14 @@ def check_jump_key(settings: dict, peer: str, value, trigger_key: str) -> Option
     """Validate and clash-check a peer's jump chord before it is stored; empty clears it."""
     if value in (None, ""):
         return None
+    try:
+        from core.teleport_protocol import DEFAULT_MAC_TELEPORT_HOTKEY
+
+        if value == DEFAULT_MAC_TELEPORT_HOTKEY:
+            raise ValueError("that chord is reserved for Teleport (Ctrl+Alt+Cmd+T)")
+    except ImportError:
+        if value == "ctrl+alt+cmd+t":
+            raise ValueError("that chord is reserved for Teleport (Ctrl+Alt+Cmd+T)")
     entry = _entry(settings, peer)
     if entry is not None and entry.get("port") == 0:
         raise ValueError("a phone cannot be a jump target")

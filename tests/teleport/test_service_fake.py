@@ -43,12 +43,12 @@ class FakeLinkSession:
 def test_mac_offer_win_accept_roundtrip(vectors):
     inbox = []
 
-    def post_mac(peer, msg):
-        inbox.append(("mac", msg))
+    def post_mac(peer, msg, outbound):
+        inbox.append(("mac", outbound, msg))
         return True
 
-    def post_win(peer, msg):
-        inbox.append(("win", msg))
+    def post_win(peer, msg, outbound):
+        inbox.append(("win", outbound, msg))
         return True
 
     mac = TeleportService("macos", post_to_peer=post_mac, helper_config=_fake_cfg("macos", 47201))
@@ -60,13 +60,13 @@ def test_mac_offer_win_accept_roundtrip(vectors):
 
     assert mac.toggle_front_window_mac("peer-win") is True
 
-    offers = [m for side, m in inbox if read_tp(m) and read_tp(m)[0] == "tp_offer"]
+    offers = [m for side, _out, m in inbox if read_tp(m) and read_tp(m)[0] == "tp_offer"]
     assert offers
-    win.handle_link_message("peer-mac", offers[0])
+    win.handle_link_message("peer-mac", offers[0], outbound=False)
 
-    accepts = [m for side, m in inbox if read_tp(m) and read_tp(m)[0] == "tp_accept"]
+    accepts = [m for side, _out, m in inbox if read_tp(m) and read_tp(m)[0] == "tp_accept"]
     assert accepts
-    mac.handle_link_message("peer-win", accepts[0])
+    mac.handle_link_message("peer-win", accepts[0], outbound=True)
 
     mac.shutdown()
     win.shutdown()

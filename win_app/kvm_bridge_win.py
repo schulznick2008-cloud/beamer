@@ -636,7 +636,7 @@ class WindowsApplication(QWidget):
         try:
             from core.teleport_bridge import attach_win_sender, wire_responder_teleport
 
-            svc = attach_win_sender(self.sender, self._identity)
+            svc = attach_win_sender(self.sender, self._identity, server=self.server)
             self._teleport_service_holder[:] = [svc]
             wire_responder_teleport(self.server, svc, self._token_for_peer)
         except Exception:
@@ -1632,7 +1632,7 @@ class WindowsApplication(QWidget):
     def _teleport_inbound(self, peer_id: str, message: dict) -> None:
         svc = self._teleport_service_holder[0] if self._teleport_service_holder else getattr(self.sender, "teleport", None)
         if svc is not None:
-            svc.handle_link_message(peer_id, message)
+            svc.handle_link_message(peer_id, message, outbound=False)
 
     def _token_for_peer(self, peer_id: str) -> str:
         try:
@@ -4114,9 +4114,6 @@ class WindowsApplication(QWidget):
     def _on_hook_mouse(self, message: int, x: int, y: int, mouse_data: int) -> bool:
         """Every mouse message, on the hook thread: what Windows said becomes the sender's neutral
         call. True when the event belongs to a peer and Windows must not see it."""
-        teleport = getattr(self.sender, "teleport", None)
-        if teleport is not None and teleport.proxy_swallow_input:
-            return True
         event = capture_win.mouse_event(message, mouse_data)
         if event is None:
             return False
@@ -4138,7 +4135,7 @@ class WindowsApplication(QWidget):
             return True
         teleport = getattr(self.sender, "teleport", None)
         if teleport is not None and teleport.proxy_swallow_input:
-            return True
+            return False
         if not self.sender.shortcut_armed:
             self._trigger.disarmed(name, down)
             return self.sender.on_key(name, down, vk, us)

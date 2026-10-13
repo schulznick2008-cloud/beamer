@@ -15,6 +15,7 @@ MSG_UPDATE = "tp_update"
 MSG_CLOSE = "tp_close"
 
 CLOSE_REASONS = frozenset({"user", "gone", "error", "return"})
+REJECT_REASONS = frozenset({"busy", "unsupported", "denied", "error"})
 
 # Vorschlag: nicht im Vertrag; kollidiert nicht mit Standard-Shortcut (alt_r) noch typischen jump_keys.
 DEFAULT_MAC_TELEPORT_HOTKEY = "ctrl+alt+cmd+t"
@@ -41,23 +42,29 @@ def offer_msg(
     mode: str,
     udp_port: int,
     salt_b64: str,
+    place_x: Optional[float] = None,
+    place_y: Optional[float] = None,
+    drag: bool = False,
 ) -> dict:
-    return {
-        "type": MSG_OFFER,
-        "data": {
-            "tid": tid,
-            "app": app,
-            "title": title,
-            "icon_png": icon_png,
-            "w": w,
-            "h": h,
-            "scale": scale,
-            "codec": codec,
-            "mode": mode,
-            "udp_port": udp_port,
-            "salt": salt_b64,
-        },
+    data = {
+        "tid": tid,
+        "app": app,
+        "title": title,
+        "icon_png": icon_png,
+        "w": w,
+        "h": h,
+        "scale": scale,
+        "codec": codec,
+        "mode": mode,
+        "udp_port": udp_port,
+        "salt": salt_b64,
     }
+    if place_x is not None and place_y is not None:
+        data["place_x"] = place_x
+        data["place_y"] = place_y
+    if drag:
+        data["drag"] = True
+    return {"type": MSG_OFFER, "data": data}
 
 
 def accept_msg(tid: int, udp_port: int) -> dict:
@@ -65,6 +72,8 @@ def accept_msg(tid: int, udp_port: int) -> dict:
 
 
 def reject_msg(tid: int, reason: str) -> dict:
+    if reason not in REJECT_REASONS:
+        raise ValueError(f"tp_reject reason must be one of {sorted(REJECT_REASONS)}")
     return {"type": MSG_REJECT, "data": {"tid": tid, "reason": reason}}
 
 

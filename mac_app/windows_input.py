@@ -52,7 +52,9 @@ class WindowsInput:
         self.paired_callback = None
         teleport_cb = None
         if getattr(controller, "teleport", None) is not None:
-            teleport_cb = lambda peer_id, message: controller.teleport.handle_link_message(peer_id, message)
+            teleport_cb = lambda peer_id, message: controller.teleport.handle_link_message(
+                peer_id, message, outbound=False
+            )
         self.server = LinkResponder(
             controller.book,
             controller.identity,

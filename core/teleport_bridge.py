@@ -5,6 +5,7 @@ import logging
 from typing import Callable
 
 from core import protocol
+from core.teleport_mac_pick import pick_frontmost_window
 from core.teleport_protocol import read_tp
 from core.teleport_service import TeleportService, default_helper_config
 
@@ -20,11 +21,24 @@ def enable_teleport_identity(identity: dict) -> dict:
 def attach_mac_controller(controller) -> TeleportService:
     """Registriert Teleport auf dem Mac-KVMController."""
 
-    def post(peer_id: str, message: dict) -> bool:
-        link = controller._peers_up.get(peer_id)
-        if link is None or not link.live():
+    def post(peer_id: str, message: dict, outbound: bool) -> bool:
+        if outbound:
+            link = controller._peers_up.get(peer_id)
+            if link is None or not link.live():
+                return False
+            return link.post(message)
+        responder = controller.responder
+        ident = protocol.read_id(peer_id)
+        if responder is None or ident is None:
             return False
-        return link.post(message)
+        return responder.send(ident, message)
+
+    def pick_front():
+        svc = getattr(controller, "teleport", None)
+        if svc is None:
+            return None
+        helper = svc._ensure_helper()
+        return pick_frontmost_window(lambda: helper.request("windows.list"))
 
     service = TeleportService(
         "macos",
@@ -32,10 +46,23 @@ def attach_mac_controller(controller) -> TeleportService:
         helper_config=default_helper_config("macos"),
         key_style=getattr(controller.cfg, "key_map", "semantic"),
         logger=controller.logger,
+        pick_front_window=pick_front,
     )
     controller.teleport = service
     _wrap_mac_link_handlers(controller, service)
+    _attach_mac_edge_drag(controller, service)
     return service
+
+
+def _attach_mac_edge_drag(controller, service: TeleportService) -> None:
+    from core.teleport_edge_drag import EdgeDragController
+
+    def start(intent):
+        return service.start_drag_teleport_mac(
+            intent.peer_id, intent.wid, intent.place_x, intent.place_y
+        )
+
+    controller.edge_drag = EdgeDragController(start, is_title_drag=lambda: controller._edge_drag_title_hint())
 
 
 def _wrap_mac_link_handlers(controller, service: TeleportService) -> None:
@@ -59,14 +86,14 @@ def _wrap_mac_link_handlers(controller, service: TeleportService) -> None:
 
     def link_message(link, message):
         if read_tp(message) is not None:
-            service.handle_link_message(link.peer_id, message)
+            service.handle_link_message(link.peer_id, message, outbound=True)
             return
         orig_msg(link, message)
 
     def drop_up(link):
         peer = link.peer_id
         if peer:
-            service.on_link_down(peer)
+            service.on_link_down(peer, outbound=True)
         orig_drop(link)
 
     controller._link_up = link_up
@@ -82,7 +109,7 @@ def wire_responder_teleport(responder, service: TeleportService, token_for_peer:
         if orig_cb is not None:
             orig_cb(peer_id, up)
         if not up:
-            service.on_link_down(peer_id)
+            service.on_link_down(peer_id, outbound=False)
             return
         link = responder._links.get(peer_id)
         if link is None:
@@ -99,12 +126,16 @@ def wire_responder_teleport(responder, service: TeleportService, token_for_peer:
     responder._callbacks["link"] = link_cb
 
 
-def attach_win_sender(sender, identity_fn: Callable[[], dict]) -> TeleportService:
-    def post(peer_id: str, message: dict) -> bool:
+def attach_win_sender(sender, identity_fn: Callable[[], dict], server=None) -> TeleportService:
+    def post(peer_id: str, message: dict, outbound: bool) -> bool:
         peer = protocol.read_id(peer_id)
         if peer is None:
             return False
-        return sender.send_to(peer, message)
+        if outbound:
+            return sender.send_to(peer, message)
+        if server is None:
+            return False
+        return server.send(peer, message)
 
     service = TeleportService(
         "windows",
@@ -118,7 +149,7 @@ def attach_win_sender(sender, identity_fn: Callable[[], dict]) -> TeleportServic
 
     def on_message(peer, message, began_at=None):
         if read_tp(message) is not None:
-            service.handle_link_message(protocol.id_text(peer), message)
+            service.handle_link_message(protocol.id_text(peer), message, outbound=True)
             return
         orig_msg(peer, message, began_at)
 
@@ -130,7 +161,7 @@ def attach_win_sender(sender, identity_fn: Callable[[], dict]) -> TeleportServic
         orig_link(peer, up, accepts)
         peer_text = protocol.id_text(peer)
         if not up:
-            service.on_link_down(peer_text)
+            service.on_link_down(peer_text, outbound=True)
             return
         link = sender.links._by_peer.get(peer)
         session = link.session if link is not None else None
