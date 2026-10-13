@@ -141,8 +141,8 @@ public final class AXTitleBarProbe: TitleBarHitTesting {
             windowRef = element
         }
         let win: AXUIElement
-        if let w = windowRef as? AXUIElement {
-            win = w
+        if let ref = windowRef {
+            win = unsafeBitCast(ref, to: AXUIElement.self)
         } else {
             win = element
         }
