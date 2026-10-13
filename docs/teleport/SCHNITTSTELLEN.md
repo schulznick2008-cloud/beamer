@@ -1,4 +1,4 @@
-# Beamer-Teleport – Schnittstellen-Verträge (v1.5)
+# Beamer-Teleport – Schnittstellen-Verträge (v1.6)
 
 Verbindlich für alle Beteiligten (Claude Code und Cursor). Liegt im Fork unter
 `docs/teleport/SCHNITTSTELLEN.md`. Änderungen nur per PR mit dem Label `vertrag`, und beide Seiten
@@ -7,7 +7,7 @@ passen dann an. Unklarheiten nicht selbst auflösen, sondern im PR als Frage mel
 Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zeiten sind in µs
 (monotone Uhr des Senders).
 
-Änderungen: v1.5 – §1.1: `restore` gilt nur für den Fenster-Rückfall, im virtuellen Modus geht das Fenster immer zurück; virtueller Modus ist Standard, Fenster-Rückfall nur Notlösung (ohne Menüs/Popups); bekannte Punkte (Akzentmenü, gedrückte Taste nach Helfer-Absturz). v1.4 – §3: Vorzeichen und Einheit von `scroll` wie Beamer, gehaltene Tasten nur ein `down` (Wiederholung macht der Sender), AltGr-Zeichen als `text`, System-Kürzel (Windows-Taste, Alt+Tab, Strg+Alt+Entf) werden nicht weitergeleitet; §1.2: `proxy.resize` mit optionalen `px_w`/`px_h`/`dpi` und Pixel-Regel (1 Stream-Pixel = 1 Bildschirm-Pixel). v1.3 – §1: optionale Zusatzfelder in `hello` und `stats` zugelassen (z. B. `low_power`, `encoder_slow`), Python-seitige Ereignisse wie `helper_restarted` abgegrenzt; §4.2: Einmal-Regel für `salt16`/`tid` und Testvektoren nur für Python. v1.2 – §4.1 Frame-Frist bei unvollständigen Frames: `2×RTT + 4×Jitter`, mindestens 60 ms (statt 30 ms), Maximum 250 ms unverändert. v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
+Änderungen: v1.6 – §2: `tp_*` und Schlüssel strikt pro Beamer-TCP-Link (Mac→PC und PC→Mac haben getrennte Master); `tp_reject.reason` nur `busy`|`unsupported`|`denied`|`error`; optional `place_x`/`place_y`/`drag` in `tp_offer` (Kanten-Drag); Standard-Hotkey Teleport **Ctrl+Alt+Cmd+T** (zusätzlich zum Kanten-Drag); M2-Pfadwahl zuerst **WLAN**, Make-before-break Kabel später; IPC-Vorschlag `proxy.drag`/`recv.place` (siehe §2.1). v1.5 – §1.1: `restore` gilt nur für den Fenster-Rückfall, im virtuellen Modus geht das Fenster immer zurück; virtueller Modus ist Standard, Fenster-Rückfall nur Notlösung (ohne Menüs/Popups); bekannte Punkte (Akzentmenü, gedrückte Taste nach Helfer-Absturz). v1.4 – §3: Vorzeichen und Einheit von `scroll` wie Beamer, gehaltene Tasten nur ein `down` (Wiederholung macht der Sender), AltGr-Zeichen als `text`, System-Kürzel (Windows-Taste, Alt+Tab, Strg+Alt+Entf) werden nicht weitergeleitet; §1.2: `proxy.resize` mit optionalen `px_w`/`px_h`/`dpi` und Pixel-Regel (1 Stream-Pixel = 1 Bildschirm-Pixel). v1.3 – §1: optionale Zusatzfelder in `hello` und `stats` zugelassen (z. B. `low_power`, `encoder_slow`), Python-seitige Ereignisse wie `helper_restarted` abgegrenzt; §4.2: Einmal-Regel für `salt16`/`tid` und Testvektoren nur für Python. v1.2 – §4.1 Frame-Frist bei unvollständigen Frames: `2×RTT + 4×Jitter`, mindestens 60 ms (statt 30 ms), Maximum 250 ms unverändert. v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
 
 ## 0. Begriffe und Komponenten
 
@@ -82,14 +82,26 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 
 | type | Richtung | Felder |
 |---|---|---|
-| `tp_offer` | Sender→Empf. | `tid`, `app`, `title`, `icon_png`, `w`, `h`, `scale`, `codec`, `mode`, `udp_port`, `salt` (b64, 16 B zufällig) |
+| `tp_offer` | Sender→Empf. | `tid`, `app`, `title`, `icon_png`, `w`, `h`, `scale`, `codec`, `mode`, `udp_port`, `salt` (b64, 16 B zufällig); optional `place_x`, `place_y` (float, Bildschirmkoordinaten Empfängerseite beim Loslassen), `drag` (bool: Kanten-Drag, Fenster folgt der Maus bis `up`) |
 | `tp_accept` | Empf.→Sender | `tid`, `udp_port` |
-| `tp_reject` | Empf.→Sender | `tid`, `reason` |
+| `tp_reject` | Empf.→Sender | `tid`, `reason` (`busy`, `unsupported`, `denied`, `error`) |
 | `tp_input` | Empf.→Sender | `tid`, `input` |
 | `tp_resize` | Empf.→Sender | `tid`, `w`, `h` |
 | `tp_focus` | Empf.→Sender | `tid` |
 | `tp_update` | Sender→Empf. | `tid`, optional `title`, `w`, `h`, `scale` |
 | `tp_close` | beide | `tid`, `reason` (`user`,`gone`,`error`,`return`) |
+
+- **Link-Bindung (v1.6):** Pro gekoppeltem Rechnerpaar können zwei TCP-Links bestehen (jede Seite kann die Gegenstelle anrufen). Der Teleport-Master (§4.2) gilt **pro Link**, nicht pro Peer-ID. `tp_*` und Schlüsselableitung nutzen immer den Link, auf dem die Nachricht ankommt bzw. gesendet wird. Ein `tp_offer` und die zugehörige `tp_accept`/`tp_reject` laufen über **denselben** Link. Ein doppeltes `tp_offer` mit gleichem (`salt`, `tid`) auf demselben Link wird mit `tp_reject` `reason:"error"` abgewiesen.
+- **Hauptweg Kanten-Drag (v1.6):** Wie Beamer-KVM: Fenster an der Titelleiste halten, über die Übergangskante zum anderen Rechner ziehen → Teleport mit `drag:true` und Platzierung an der Maus. Zurückholen: Proxy-Fenster an die Kante zum Sender ziehen. **Hotkey** (Mac): Ctrl+Alt+Cmd+T teleportiert das vorderste Fenster bzw. holt es zurück (Zusatz zum Drag).
+- **Eingabe bei Proxy-Fokus:** Der Windows-Proxy erfasst Tastatur/Maus nativ (C05); Python-Hooks dürfen Eingaben **nicht** systemweit verschlucken (`return false` zum KVM, kein globales Blockieren der Maus).
+
+### 2.1 IPC-Vorschlag Kanten-Drag (Helfer, noch nicht implementiert)
+
+| cmd / ev | Felder | Seite | Bedeutung |
+|---|---|---|---|
+| `windows.drag_state` | `dragging` (bool), optional `wid`, `title_bar` (bool) | Sender | Meldet Titelleisten-Zug (Mac: AX/CGWindow; Win: NC-Hit-Test) |
+| `recv.place` | `tid`, `x`, `y` (Punkte), `dragging` (bool) | Empfänger | Proxy-Fenster an Cursor legen / Drag fortsetzen bis `dragging:false` |
+| `proxy.drag` | `tid`, `x`, `y`, `dragging` | Empfänger→Python | Native Proxy-Position während Drag (Python leitet optional `tp_input` move) |
 
 ## 3. Fenster-Eingabe (`input`-Objekt)
 
@@ -238,6 +250,7 @@ Ziel: Steckt ein direktes LAN-Kabel zwischen Mac (USB-C-LAN-Adapter) und PC, lau
 - Die Einstellung `teleport.path` kann `auto` (Standard), `cable` oder `wlan` sein. Bei `cable` gibt es keinen Rückfall, nur eine Warnung.
 
 **Steuerkanal (Beamer-Link, TCP 24820)**
+- **M2 (v1.6):** Zuerst Betrieb über **WLAN** (`teleport.path:auto` mit Kabel-Erkennung, aber ohne Pflicht-Make-before-break). Volles Make-before-break beim Kabelwechsel bleibt Ziel und wird in einem späteren Paket (C01b/E5) verbindlich, ohne M2 zu blockieren.
 - Der Link läuft über den besten Pfad. Beim Wechsel: neuen Link zur neuen Adresse aufbauen (normales `hello`/`welcome`, gleiche Kopplung), erst danach auf ihn umschalten und den alten schließen (make-before-break).
 - Laufende Teleports bleiben bestehen (§4.2, Ausnahme). Ihr `tid` gilt weiter. `tp_*`-Nachrichten gehen ab dem Umschalten über den neuen Link.
 - Steht nach 5 s kein Link, enden alle Teleports mit `tp_close` `reason:"error"`.
