@@ -1,4 +1,4 @@
-# Beamer-Teleport – Schnittstellen-Verträge (v1.4)
+# Beamer-Teleport – Schnittstellen-Verträge (v1.5)
 
 Verbindlich für alle Beteiligten (Claude Code und Cursor). Liegt im Fork unter
 `docs/teleport/SCHNITTSTELLEN.md`. Änderungen nur per PR mit dem Label `vertrag`, und beide Seiten
@@ -7,7 +7,7 @@ passen dann an. Unklarheiten nicht selbst auflösen, sondern im PR als Frage mel
 Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zeiten sind in µs
 (monotone Uhr des Senders).
 
-Änderungen: v1.4 – §3: Vorzeichen und Einheit von `scroll` wie Beamer, gehaltene Tasten nur ein `down` (Wiederholung macht der Sender), AltGr-Zeichen als `text`, System-Kürzel (Windows-Taste, Alt+Tab, Strg+Alt+Entf) werden nicht weitergeleitet; §1.2: `proxy.resize` mit optionalen `px_w`/`px_h`/`dpi` und Pixel-Regel (1 Stream-Pixel = 1 Bildschirm-Pixel). v1.3 – §1: optionale Zusatzfelder in `hello` und `stats` zugelassen (z. B. `low_power`, `encoder_slow`), Python-seitige Ereignisse wie `helper_restarted` abgegrenzt; §4.2: Einmal-Regel für `salt16`/`tid` und Testvektoren nur für Python. v1.2 – §4.1 Frame-Frist bei unvollständigen Frames: `2×RTT + 4×Jitter`, mindestens 60 ms (statt 30 ms), Maximum 250 ms unverändert. v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
+Änderungen: v1.5 – §1.1: `restore` gilt nur für den Fenster-Rückfall, im virtuellen Modus geht das Fenster immer zurück; virtueller Modus ist Standard, Fenster-Rückfall nur Notlösung (ohne Menüs/Popups); bekannte Punkte (Akzentmenü, gedrückte Taste nach Helfer-Absturz). v1.4 – §3: Vorzeichen und Einheit von `scroll` wie Beamer, gehaltene Tasten nur ein `down` (Wiederholung macht der Sender), AltGr-Zeichen als `text`, System-Kürzel (Windows-Taste, Alt+Tab, Strg+Alt+Entf) werden nicht weitergeleitet; §1.2: `proxy.resize` mit optionalen `px_w`/`px_h`/`dpi` und Pixel-Regel (1 Stream-Pixel = 1 Bildschirm-Pixel). v1.3 – §1: optionale Zusatzfelder in `hello` und `stats` zugelassen (z. B. `low_power`, `encoder_slow`), Python-seitige Ereignisse wie `helper_restarted` abgegrenzt; §4.2: Einmal-Regel für `salt16`/`tid` und Testvektoren nur für Python. v1.2 – §4.1 Frame-Frist bei unvollständigen Frames: `2×RTT + 4×Jitter`, mindestens 60 ms (statt 30 ms), Maximum 250 ms unverändert. v1.1 – §7 Pfadwahl / Kabel (Direktkabel Mac↔PC), dazu `send.bitrate`, `bt_set_max_kbps` und Roaming in §4/§5. C01a (mit Freigabe von Nick): Bitratenregel nach Restverlust statt Rohverlust, `feedback` mit optionalem Rohverlust-Feld, `ping`/`pong` in beide Richtungen, Pacing im Sender, `BtRole`-Parameter als `uint32_t`. C01c: FEC-Längenfeld als `len_xor` (Vertrag an die Implementierung angepasst).
 
 ## 0. Begriffe und Komponenten
 
@@ -43,7 +43,7 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 | `transport.close` | – | – | beide |
 | `windows.list` | – | `windows`: `[{wid,pid,app,title,x,y,w,h,display,scale}]` (x..h in Punkten bzw. logischen Pixeln) | Sender |
 | `send.start` | `tid`, `mode` (`window`/`display`), `wid` oder `display`, `codec` (`hevc`/`h264`), `max_fps`, `bitrate_kbps`, `keys` (siehe 4.2), `virtual_display` (bool) | `width`, `height` (Stream-Pixel), `scale` | Sender |
-| `send.stop` | `tid`, `restore` (bool: Fenster zurück auf echten Monitor) | – | Sender |
+| `send.stop` | `tid`, `restore` (bool: Fenster zurück auf echten Monitor; gilt nur im Fenster-Rückfall, siehe unten) | – | Sender |
 | `send.resize` | `tid`, `w`, `h` (Punkte) | `width`, `height` | Sender |
 | `send.activate` | `tid` | – | Sender |
 | `send.keyframe` | `tid` | – | Sender |
@@ -53,6 +53,10 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 | `recv.update` | `tid`, optional `title`, `w`, `h` | – | Empfänger |
 | `recv.close` | `tid` | – | Empfänger |
 | `shutdown` | – | – | beide |
+
+- Modi von `send.start` (v1.5): **Standard ist der virtuelle Modus** (`virtual_display:true`). Der Fenster-Rückfall (`virtual_display:false` bzw. wenn kein virtueller Monitor angelegt werden kann) ist nur eine Notlösung: Beim Einzelfenster-Capture fehlen Kontextmenüs, Popups und andere eigene Fenster der App im Strom. Python wählt den Rückfall nur, wenn der virtuelle Modus scheitert, und zeigt dem Nutzer einen Hinweis.
+- `restore` (v1.5) gilt nur für den Fenster-Rückfall. Im virtuellen Modus geht das Fenster bei `send.stop`, EOF, `shutdown` und Absturz-Handler **immer** an alte Position und Größe zurück, weil der virtuelle Monitor danach verschwindet; `restore:false` wird dort ignoriert.
+- Bekannte Punkte (v1.5): (a) Das Akzentmenü beim Gedrückthalten (Press-and-Hold von macOS) wird beim Senden nicht nachgebildet; Akzente kommen über tote Tasten bzw. `text`. (b) Stirbt der Sender-Helfer, während eine Taste oder ein Button gedrückt ist, kann sie im Zielsystem gedrückt bleiben (SIGKILL ist nicht abfangbar). Abhilfe: Nach `helper_restarted` lässt der neu gestartete Helfer bzw. Python alle Tasten und Buttons los (Folgepaket).
 
 ### 1.2 Ereignisse (Helfer → Python)
 
