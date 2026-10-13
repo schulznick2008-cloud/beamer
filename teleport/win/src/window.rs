@@ -637,6 +637,11 @@ fn on_key_inner(
     if vk == input::VK_PROCESSKEY || input::is_system_key(vk) {
         return None; // IME bzw. Windows-Taste: Windows ueberlassen
     }
+    // Windows-Taste mit anderen Tasten (Win+...) bleibt bei Windows (v1.4 §3): kein `down` weitergeben.
+    // Das `up` einer vorher gedrueckten Taste laeuft normal weiter.
+    if down && (key_down(input::VK_LWIN) || key_down(input::VK_RWIN)) {
+        return None;
+    }
     // Strg+Alt+Shift+F: Vollbild umschalten, nicht weitergeben.
     if vk == VK_F
         && key_down(input::VK_CONTROL)
