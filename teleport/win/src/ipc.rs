@@ -332,10 +332,7 @@ pub fn parse_line(line: &str) -> Result<Request, ParseError> {
                 tid: get_tid(o, id)?,
                 x,
                 y,
-                dragging: o
-                    .get("dragging")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                dragging: o.get("dragging").and_then(Value::as_bool).unwrap_or(false),
             })
         }
         "recv.close" => Cmd::RecvClose {
@@ -441,8 +438,9 @@ mod tests {
 
     #[test]
     fn recv_place_parses() {
-        let line = json!({"v":1,"id":2,"cmd":"recv.place","tid":9,"x":120.5,"y":80.0,"dragging":true})
-            .to_string();
+        let line =
+            json!({"v":1,"id":2,"cmd":"recv.place","tid":9,"x":120.5,"y":80.0,"dragging":true})
+                .to_string();
         let Cmd::RecvPlace(p) = parse_line(&line).unwrap().cmd else {
             panic!("expected RecvPlace")
         };

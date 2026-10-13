@@ -101,6 +101,10 @@ public final class TitleBarDragMonitor {
 /// AX/CGWindow-Erkennung (Geraet); in Tests durch Fake ersetzen.
 public final class AXTitleBarProbe: TitleBarHitTesting {
     private let timeout: Float = 0.05
+    private static let titleBarRole = "AXTitleBar" as CFString
+
+    @_silgen_name("_AXUIElementGetWindow")
+    private static func axGetWindow(_ element: AXUIElement, _ out: UnsafeMutablePointer<CGWindowID>) -> AXError
 
     public init() {}
 
@@ -120,7 +124,7 @@ public final class AXTitleBarProbe: TitleBarHitTesting {
 
     private func windowID(for element: AXUIElement) -> UInt32? {
         var wid: CGWindowID = 0
-        if _AXUIElementGetWindow(element, &wid) == .success {
+        if Self.axGetWindow(element, &wid) == .success {
             return wid
         }
         return nil
@@ -129,14 +133,19 @@ public final class AXTitleBarProbe: TitleBarHitTesting {
     private func isTitleBarRegion(element: AXUIElement, at point: CGPoint) -> Bool {
         var role: CFTypeRef?
         if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
-           let r = role as? String, r == kAXTitleBarRole as String {
+           let r = role as? String, r == Self.titleBarRole as String {
             return true
         }
-        var windowEl: AXUIElement?
-        if AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &windowEl) != .success {
-            windowEl = element
+        var windowRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &windowRef) != .success {
+            windowRef = element
         }
-        guard let win = windowEl else { return false }
+        let win: AXUIElement
+        if let w = windowRef as? AXUIElement {
+            win = w
+        } else {
+            win = element
+        }
         var posRef: CFTypeRef?
         var sizeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef) == .success,
