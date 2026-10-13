@@ -127,14 +127,28 @@ def _keys_for_run(key_session: TeleportKeySession, salt16: bytes, tid: int) -> D
     return key_session.allocate(salt16, tid).as_ipc_dict()
 
 
+def _area(w: Mapping[str, Any]) -> float:
+    return float(w.get("w", 0)) * float(w.get("h", 0))
+
+
 def _pick_window(windows: List[Mapping[str, Any]], app_hint: Optional[str]) -> Mapping[str, Any]:
+    """Fenster der App `app_hint` (genauer App-Name vor Teilstring, dann das groesste). Ohne passendes
+    Fenster wird abgebrochen statt auf ein fremdes Fenster auszuweichen. Nur ohne `app_hint` gilt das
+    groesste Fenster."""
     if not windows:
         raise TeleportIPCError("keine Fenster vom Helfer")
     if app_hint:
-        cands = [w for w in windows if app_hint.lower() in str(w.get("app", "")).lower()]
-        if cands:
-            return max(cands, key=lambda w: float(w.get("w", 0)) * float(w.get("h", 0)))
-    return max(windows, key=lambda w: float(w.get("w", 0)) * float(w.get("h", 0)))
+        hint = app_hint.lower()
+        exact = [w for w in windows if str(w.get("app", "")).lower() == hint]
+        cands = exact or [w for w in windows if hint in str(w.get("app", "")).lower()]
+        if not cands:
+            apps = sorted({str(w.get("app", "")) for w in windows})
+            raise TeleportIPCError(
+                f"kein sichtbares Fenster der App {app_hint!r} (Fenster offen und nicht minimiert?); "
+                f"vorhanden: {', '.join(apps)}"
+            )
+        return max(cands, key=_area)
+    return max(windows, key=_area)
 
 
 def run_pc(
