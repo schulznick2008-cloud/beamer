@@ -242,6 +242,32 @@ public protocol EventSink: AnyObject {
     func scroll(at p: CGPoint, wheelY: Int, wheelX: Int, unit: ScrollUnit, flags: UInt64)
     func key(code: UInt16, down: Bool, flags: UInt64)
     func text(_ chunk: String, down: Bool)
+    /// Wiederholtes `down` einer gehaltenen Taste (kCGKeyboardEventAutorepeat = 1). `chars` ist das Zeichen der Taste:
+    /// Cocoa-Textfelder fuegen bei einem Wiederholungs-`down` nur dann etwas ein, wenn das Ereignis den Text traegt.
+    /// Standard: ein gewoehnliches `down`.
+    func repeatKey(code: UInt16, flags: UInt64, chars: String?)
+}
+
+extension EventSink {
+    public func repeatKey(code: UInt16, flags: UInt64, chars: String?) { key(code: code, down: true, flags: flags) }
+}
+
+/// Zeitgeber fuer die Tastenwiederholung: ruft `fire` nach `delay`, danach alle `interval` Sekunden, bis der
+/// zurueckgegebene Abbruch aufgerufen wird. In Tests eine Fake-Uhr.
+public protocol RepeatTicker: AnyObject {
+    func start(delay: TimeInterval, interval: TimeInterval, _ fire: @escaping () -> Void) -> () -> Void
+}
+
+public final class DispatchRepeatTicker: RepeatTicker {
+    private let queue = DispatchQueue(label: "beamer.teleport.keyrepeat", qos: .userInteractive)
+    public init() {}
+    public func start(delay: TimeInterval, interval: TimeInterval, _ fire: @escaping () -> Void) -> () -> Void {
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + delay, repeating: max(0.005, interval), leeway: .milliseconds(1))
+        t.setEventHandler(handler: fire)
+        t.resume()
+        return { t.cancel() }
+    }
 }
 
 public enum MouseEventKind: Equatable {
@@ -258,10 +284,57 @@ public final class Injector {
     private var buttonsDown: [MouseButton] = []
     private var scroll = ScrollAccumulator()
     private var lastPoint: CGPoint?
+    private let ticker: RepeatTicker
+    private let repeatTiming: () -> (delay: TimeInterval, interval: TimeInterval)
+    /// Laufende Tastenwiederholung (§3, v1.4): nur die zuletzt gedrueckte Zeichentaste, wie macOS.
+    private var repeating: (name: String, generation: Int, cancel: () -> Void)?
+    private var repeatGeneration = 0
 
-    public init(sink: EventSink, layout: @escaping () -> KeyLayout = { USKeyLayout() }) {
+    public init(sink: EventSink, layout: @escaping () -> KeyLayout = { USKeyLayout() },
+                ticker: RepeatTicker = DispatchRepeatTicker(),
+                repeatTiming: @escaping () -> (delay: TimeInterval, interval: TimeInterval) = { (0.5, 0.083) }) {
         self.sink = sink
         self.layout = layout
+        self.ticker = ticker
+        self.repeatTiming = repeatTiming
+    }
+
+    private func stopRepeat() {
+        repeating?.cancel()
+        repeating = nil
+    }
+
+    /// Ein Wiederholungsschritt (unter `lock`): dieselbe Taste noch einmal, mit den aktuellen Modifiern.
+    private func fireRepeat(generation: Int, code: UInt16, text: String?, chars: String?) {
+        lock.lock(); defer { lock.unlock() }
+        guard repeating?.generation == generation else { return }
+        if let t = text {
+            sink.text(t, down: true)
+            sink.text(t, down: false)
+        } else {
+            sink.repeatKey(code: code, flags: Flags.forModifiers(planner.modsDown) | Flags.forKey(code), chars: chars)
+        }
+    }
+
+    /// Das Zeichen, das die Taste tippt (fuer das Wiederholungs-`down`); `nil` bei Steuertasten (Rueckschritt, Pfeile ...).
+    private func repeatChars(name: String, code: UInt16) -> String? {
+        if name.count == 1 { return name }
+        if name.lowercased() == "space" { return " " }
+        guard KeyTables.printableFallbacks[code] != nil else { return nil }
+        return layout().character(for: code)
+    }
+
+    private func startRepeat(name: String, code: UInt16, text: String?) {
+        stopRepeat()
+        let timing = repeatTiming()
+        guard timing.interval > 0, timing.delay >= 0 else { return }
+        repeatGeneration += 1
+        let gen = repeatGeneration
+        let chars = repeatChars(name: name, code: code)
+        let cancel = ticker.start(delay: timing.delay, interval: timing.interval) { [weak self] in
+            self?.fireRepeat(generation: gen, code: code, text: text, chars: chars)
+        }
+        repeating = (name, gen, cancel)
     }
 
     /// `true`, wenn das Ereignis eingespielt wurde, `false`, wenn es ausserhalb des Bildes lag (verworfen).
@@ -296,7 +369,13 @@ public final class Injector {
             sink.mouse(.moved, at: p, button: nil, clickState: 0, flags: Flags.forModifiers(planner.modsDown))
             sink.scroll(at: p, wheelY: wy, wheelX: wx, unit: unit, flags: Flags.forModifiers(planner.modsDown))
         case .key(let name, let down):
+            let isModifier = KeyTables.modifierFlagNames[name.lowercased()] != nil
+            // Ein zweites `down` derselben Taste waehrend der Wiederholung (aelterer Weg, Vertrag <= v1.3) wird verworfen:
+            // der Sender wiederholt selbst, sonst kaeme jedes Zeichen doppelt.
+            if down, !isModifier, repeating?.name == name { return true }
             guard let plan = planner.plan(name: name, down: down, layout: layout()) else { return false }
+            if !down, repeating?.name == name { stopRepeat() }
+            if down, !isModifier { startRepeat(name: name, code: plan.code, text: plan.text) }
             if let text = plan.text {
                 // Flags bewusst leer: der Text sagt, was getippt wird.
                 sink.text(text, down: down)
@@ -315,6 +394,7 @@ public final class Injector {
     /// Alles loslassen, was noch gehalten wird (Verbindungsabbruch, Beenden).
     public func releaseAll(at p: CGPoint?) {
         lock.lock(); defer { lock.unlock() }
+        stopRepeat()
         for name in planner.heldKeyNames + planner.modsDown.sorted() {
             if let plan = planner.plan(name: name, down: false, layout: layout()), plan.text == nil {
                 sink.key(code: plan.code, down: false, flags: 0)
@@ -330,6 +410,6 @@ public final class Injector {
 
     public var isHoldingSomething: Bool {
         lock.lock(); defer { lock.unlock() }
-        return !buttonsDown.isEmpty || !planner.modsDown.isEmpty || !planner.heldKeyNames.isEmpty
+        return !buttonsDown.isEmpty || !planner.modsDown.isEmpty || !planner.heldKeyNames.isEmpty || repeating != nil
     }
 }
