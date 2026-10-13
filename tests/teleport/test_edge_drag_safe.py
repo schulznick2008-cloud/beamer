@@ -72,3 +72,27 @@ def test_drag_state_routed_via_service_not_tap():
     svc.set_drag_state_handler(lambda ev: seen.append(ev))
     svc._on_helper_event({"ev": "windows.drag_state", "dragging": True, "title_bar": True, "wid": 7})
     assert seen == [{"ev": "windows.drag_state", "dragging": True, "title_bar": True, "wid": 7}]
+
+
+def test_helper_event_format_arms_tracks_cursor_and_disarms():
+    """Ereignis wie es der Mac-Helfer (C04d) schickt: dragging/title_bar/wid/x/y, am Ende dragging:false ohne wid."""
+    drag = EdgeDragController(lambda _i: True)
+    assert drag.is_armed() is False and drag.cursor() is None
+    drag.on_drag_state({"v": 1, "ev": "windows.drag_state", "dragging": True, "title_bar": True, "wid": 21745, "x": 600.0, "y": 214.0})
+    assert drag.is_armed() is True
+    assert drag.cursor() == (600.0, 214.0)
+    drag.on_drag_state({"v": 1, "ev": "windows.drag_state", "dragging": True, "title_bar": True, "wid": 21745, "x": 640.5, "y": 220.0})
+    assert drag.cursor() == (640.5, 220.0)
+    drag.on_drag_state({"v": 1, "ev": "windows.drag_state", "dragging": False, "title_bar": False, "x": 900.0, "y": 300.0})
+    assert drag.is_armed() is False
+    assert drag.cursor() is None
+
+
+def test_title_bar_false_never_arms_and_edge_cross_stays_kvm():
+    started = []
+    drag = EdgeDragController(lambda i: started.append(i) or True)
+    drag.on_drag_state({"dragging": True, "title_bar": False, "wid": 5, "x": 1.0, "y": 2.0})
+    assert drag.is_armed() is False
+    assert drag.queue_edge_cross("pc", "right", 10.0, 20.0, dragging=True) is False
+    time.sleep(0.05)
+    assert started == []

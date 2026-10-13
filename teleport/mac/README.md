@@ -139,3 +139,20 @@ Abnahme: `tools/teleport/mac_inject_demo.py [--virtual] [--dump-dir DIR]` (start
 `tools/teleport/input_probe.swift` mit Textfeld, Dropdown und Kontextmenue, den Selbsttest-Empfaenger, den Helfer und
 prueft Position, Klickzahl, Scrollen, Tippen und `send.resize` am Protokoll des Pruef-Fensters). Braucht die
 Bedienungshilfen- und die Bildschirmaufnahme-Freigabe fuer das startende Programm.
+
+## Titelleisten-Zug, Rueckkehr unter die Maus, Neustart (C04d)
+
+- **`windows.drag_state` (§2.1):** Der Helfer (`--ipc`) beobachtet die linke Maustaste passiv (eigener `listenOnly`-Tap
+  auf eigenem Thread, nie im Beamer-Event-Tap; selbst eingespielte Ereignisse mit `injectedMark` zaehlen nicht). Bei
+  jedem Druck fragt eine Hintergrund-Queue per AX (`AXUIElementCopyElementAtPosition`, Timeout 50 ms), ob der Cursor auf
+  einer Titelleiste liegt: Rolle `AXTitleBar` oder oberer Fensterrahmen (28 pt), nicht auf Knopf/Feld/Inhalt
+  (`TitleBarRules`). Ereignis `{"ev":"windows.drag_state","dragging":true,"title_bar":true,"wid":…,"x":…,"y":…}`
+  (globale Punkte), im Zug auf hoechstens 30/s gedrosselt, beim Loslassen `dragging:false` (ohne `wid`). Klick in den
+  Inhalt: kein Ereignis. Ein AX-Ergebnis, das nach dem Loslassen eintrifft, wird verworfen. Ohne Bedienungshilfen-Freigabe
+  steht ein Log auf stderr, es gibt keine Ereignisse.
+- **Rueckkehr:** `send.stop` mit `restore:true` legt das Fenster so, dass die Mitte der Titelleiste unter dem Mauszeiger
+  liegt (auf den sichtbaren Bildschirm geklemmt, `ReturnPlacement`); im virtuellen Modus samt Rueckkehr von dessen
+  Monitor, im Fenster-Rueckfall nur die Position (Groesse bleibt). `restore:false`: virtuell wie bisher an die alte Stelle,
+  im Rueckfall nichts. Der Mauszeiger kommt vom Helfer selbst (kein `x`/`y` in `send.stop`).
+- **Hängende Tasten (C04c):** Beim Start laesst der Helfer alles los, was das System als gedrueckt fuehrt (Tastencodes
+  0..127 ausser Caps Lock, Maustasten): ein `up` mit Flags 0, ohne Wiederholung (`StuckInput`).

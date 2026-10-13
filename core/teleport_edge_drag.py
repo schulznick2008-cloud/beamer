@@ -31,6 +31,7 @@ class EdgeDragController:
         self._dragging = False
         self._title_bar = False
         self._wid: Optional[int] = None
+        self._cursor: Optional[tuple] = None
         self._pending: "queue.SimpleQueue[Optional[tuple]]" = queue.SimpleQueue()
         self._worker = threading.Thread(target=self._run, name="teleport-edge-drag", daemon=True)
         self._worker.start()
@@ -44,6 +45,17 @@ class EdgeDragController:
             self._wid = int(wid) if wid is not None else None
             if not (self._dragging and self._title_bar and self._wid):
                 self._wid = None
+            # Cursor des Helfers (globale Punkte) zuletzt gemeldet; ohne x/y bleibt der alte Wert stehen.
+            x, y = ev.get("x"), ev.get("y")
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                self._cursor = (float(x), float(y))
+            if not self._dragging:
+                self._cursor = None
+
+    def cursor(self) -> Optional[tuple]:
+        """Letzte vom Helfer gemeldete Cursorposition (x, y) waehrend eines Titelleisten-Zugs, sonst ``None``."""
+        with self._lock:
+            return self._cursor
 
     def is_armed(self) -> bool:
         with self._lock:

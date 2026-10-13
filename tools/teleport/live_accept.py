@@ -92,7 +92,7 @@ class Live:
         return r, (time.time() - t0) * 1000
 
     def stop(self):
-        r = self.h.call("send.stop", tid=1, restore=True)
+        r = self.h.call("send.stop", tid=1, restore=False)
         time.sleep(0.8)
         now = [w for w in self.h.call("windows.list")["windows"] if w["wid"] == self.wid]
         try:
