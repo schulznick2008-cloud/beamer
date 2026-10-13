@@ -179,6 +179,8 @@ public enum KeyTables {
 
     /// Medientasten (NX-Tastencodes aus IOKit `ev_keymap.h`, `MEDIA_NX_KEYS`).
     public static let mediaNXKeys: [String: Int] = [
+        "brightness_down": 3,
+        "brightness_up": 2,
         "media_next": 17,
         "media_play_pause": 16,
         "media_prev": 18,
