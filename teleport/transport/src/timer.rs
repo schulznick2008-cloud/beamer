@@ -1,5 +1,5 @@
 //! Unter Windows laufen Socket-Timeouts und Sleeps standardmaessig in ~15,6-ms-Schritten. Die Fristen des
-//! Transports (NACK nach wenigen ms, Frames nach 30 ms verwerfen) brauchen 1 ms. `timeBeginPeriod(1)` aus
+//! Transports (NACK nach wenigen ms, Frames nach 60 ms oder mehr verwerfen) brauchen 1 ms. `timeBeginPeriod(1)` aus
 //! winmm.dll (Systembibliothek) stellt das fuer den Prozess ein, solange eine Session offen ist.
 //! Anderswo passiert nichts.
 
