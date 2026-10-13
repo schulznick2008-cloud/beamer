@@ -61,6 +61,7 @@ class PeerTeleportState:
     teleport_capable: bool = False
     key_session: Optional[TeleportKeySession] = None
     outbound: bool = False  # True: diese Seite hat den Link geöffnet (initiator)
+    peer_link_host: str = ""  # IP des gekoppelten Beamer-Links (UDP/Ziel-Fallback)
 
 
 @dataclass
@@ -150,12 +151,17 @@ class TeleportService:
         teleport_capable: bool,
         link_session: protocol.LinkSession,
         outbound: bool,
+        *,
+        peer_link_host: Optional[str] = None,
     ) -> None:
         material = link_session.teleport_handshake_material()
         key_session = None
         if material is not None:
             shared, key_id, pi, pr, si, sr = material
             key_session = TeleportKeySession.from_link(token, shared, key_id, pi, pr, si, sr)
+        link_host = (peer_link_host or "").strip()
+        if link_host:
+            self._path.note_link_peer(link_host)
         ref = link_ref(peer_id, outbound)
         with self._lock:
             self._links[ref] = PeerTeleportState(
@@ -165,6 +171,7 @@ class TeleportService:
                 teleport_capable=teleport_capable and key_session is not None,
                 key_session=key_session,
                 outbound=outbound,
+                peer_link_host=link_host,
             )
 
     def on_link_down(self, peer_id: str, outbound: bool) -> None:
@@ -387,7 +394,7 @@ class TeleportService:
         with self._lock:
             self._active[tid] = tele
         self._post(peer_id, accept_msg(tid, local_port), outbound)
-        peer_host = self._path_host_for_peer(peer_id)
+        peer_host = self._path_host_for_peer(peer_id, outbound)
         if peer_host and int(data.get("udp_port", 0)):
             helper.request("transport.peer", peer_host=peer_host, peer_port=int(data["udp_port"]))
 
@@ -422,7 +429,7 @@ class TeleportService:
         if not start.get("ok"):
             self._request_close(peer_id, tid, "error", outbound)
             return
-        peer_host = self._path_host_for_peer(peer_id)
+        peer_host = self._path_host_for_peer(peer_id, outbound)
         if peer_host and tele.peer_udp:
             helper.request("transport.peer", peer_host=peer_host, peer_port=tele.peer_udp)
 
@@ -555,11 +562,14 @@ class TeleportService:
                 except TeleportIPCError:
                     pass
 
-    def _path_host_for_peer(self, peer_id: str) -> str:
+    def _path_host_for_peer(self, peer_id: str, outbound: bool) -> str:
         decision = self._path.tick(force=True)
         if decision and decision.peer_host:
             self.apply_path_decision(decision)
             return decision.peer_host
+        st = self._peer_state(peer_id, outbound)
+        if st is not None and st.peer_link_host:
+            return st.peer_link_host
         return ""
 
 
