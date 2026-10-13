@@ -50,3 +50,26 @@ def test_pc_run_uses_fresh_salt_each_time(tmp_path):
         salts.append(session["salt16_hex"])
     assert stale not in salts
     assert salts[0] != salts[1]
+
+
+def test_pick_window_aborts_instead_of_falling_back():
+    import pytest
+
+    from core.teleport_ipc import TeleportIPCError
+    from tools.teleport import m1_demo as m
+
+    wins = [
+        {"wid": 1, "app": "Google Chrome", "w": 1600, "h": 1000},
+        {"wid": 2, "app": "TextEdit", "w": 600, "h": 400},
+        {"wid": 3, "app": "TextEdit", "w": 800, "h": 500},
+        {"wid": 4, "app": "Finanzen Helper", "w": 900, "h": 900},
+        {"wid": 5, "app": "Finanzen", "w": 400, "h": 300},
+    ]
+    assert m._pick_window(wins, "TextEdit")["wid"] == 3
+    assert m._pick_window(wins, "textedit")["wid"] == 3
+    # Genauer App-Name schlaegt den Teilstring.
+    assert m._pick_window(wins, "Finanzen")["wid"] == 5
+    with pytest.raises(TeleportIPCError, match="TextEdit"):
+        m._pick_window([w for w in wins if w["app"] != "TextEdit"], "TextEdit")
+    # Ohne App-Angabe: groesstes Fenster.
+    assert m._pick_window(wins, None)["wid"] == 1
