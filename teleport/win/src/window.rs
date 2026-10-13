@@ -85,6 +85,9 @@ pub struct Shared {
     windowed: Mutex<Option<Windowed>>,
     /// Zuletzt gemeldeter Fokus (WM_ACTIVATE kommt auch ohne Wechsel, gemeldet wird nur der Wechsel).
     focused: AtomicBool,
+    /// Kanten-Drag: Fenster folgt der Maus (recv.place mit dragging:true).
+    drag_follow: AtomicBool,
+    drag_emit: Mutex<Instant>,
 }
 
 impl Shared {
@@ -117,6 +120,19 @@ impl Shared {
         ));
     }
 
+    fn emit_proxy_drag(&self, x: f64, y: f64, dragging: bool) {
+        let now = Instant::now();
+        let mut last = self.drag_emit.lock().unwrap();
+        if dragging && now.duration_since(*last) < Duration::from_millis(33) {
+            return;
+        }
+        *last = now;
+        self.out.send(&ipc::event(
+            "proxy.drag",
+            json!({"tid": self.tid, "x": x, "y": y, "dragging": dragging}),
+        ));
+    }
+
     /// Client-Pixel -> Stream-Pixel; vor dem ersten Bild 1:1.
     fn to_stream(&self, x: i32, y: i32) -> (f64, f64) {
         match self.stream() {
@@ -132,6 +148,21 @@ pub fn init_process_dpi() {
         // Schlaegt fehl, wenn das Manifest schon etwas setzt; dann gilt das.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+}
+
+/// Hoehe des nicht-Client-Bereichs oben (Rahmen + Titelleiste) in physischen Pixeln.
+pub fn caption_band_px(dpi: u32) -> i32 {
+    let scale = dpi as i32 / 96;
+    unsafe {
+        let frame = GetSystemMetrics(SM_CYFRAME) * scale;
+        let cap = GetSystemMetrics(SM_CYCAPTION) * scale;
+        (frame * 2 + cap).max(28 * scale)
+    }
+}
+
+/// Client-Y unterhalb der Titelleiste? (fuer Tests und WM_NCHITTEST).
+pub fn client_y_is_title_bar(client_y: i32, dpi: u32) -> bool {
+    client_y >= 0 && client_y < caption_band_px(dpi)
 }
 
 fn register_class() {
@@ -321,6 +352,8 @@ pub fn create(
             programmatic: AtomicBool::new(true),
             windowed: Mutex::new(None),
             focused: AtomicBool::new(false),
+            drag_follow: AtomicBool::new(false),
+            drag_emit: Mutex::new(Instant::now() - Duration::from_secs(1)),
         });
         let raw = Arc::into_raw(shared.clone());
         let hinst = GetModuleHandleW(None)?;
@@ -423,6 +456,42 @@ impl ProxyWindow {
 
     pub fn set_fullscreen(&self, on: bool) {
         set_fullscreen(self.hwnd, on, None);
+    }
+
+    /// Titelleiste unter (x,y) in Bildschirm-Punkten; bei dragging Maus folgen.
+    pub fn place_at(&self, x_pt: f64, y_pt: f64, dragging: bool) {
+        self.shared.programmatic.store(true, Ordering::Release);
+        unsafe {
+            let dpi = GetDpiForWindow(self.hwnd).max(96);
+            let band = caption_band_px(dpi);
+            let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            let work = work_area(mon);
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+            let ow = rect.right - rect.left;
+            let oh = rect.bottom - rect.top;
+            let mut x = (x_pt.round() as i32) - ow / 2;
+            let mut y = (y_pt.round() as i32) - band / 2;
+            x = x.clamp(work.left, work.right - ow);
+            y = y.clamp(work.top, work.bottom - oh);
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            if dragging {
+                let _ = SetCapture(self.hwnd);
+            } else {
+                let _ = ReleaseCapture();
+            }
+        }
+        self.shared.drag_follow.store(dragging, Ordering::Release);
+        self.shared.programmatic.store(false, Ordering::Release);
+        self.shared.emit_proxy_drag(x_pt, y_pt, dragging);
     }
 
     pub fn destroy(&self) {
@@ -807,9 +876,28 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 LRESULT(0)
             }
+            WM_NCHITTEST => {
+                if shared_of(hwnd).is_some() {
+                    let dpi = GetDpiForWindow(hwnd).max(96);
+                    let mut pt = POINT {
+                        x: (lp.0 as i32 & 0xffff) as i16 as i32,
+                        y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
+                    };
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                    if client_y_is_title_bar(pt.y, dpi) {
+                        return LRESULT(HTCAPTION as isize);
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_MOUSEMOVE => {
                 if let Some(s) = shared_of(hwnd) {
                     let (x, y) = lparam_xy(lp);
+                    if s.drag_follow.load(Ordering::Acquire) {
+                        let mut pt = POINT::default();
+                        let _ = GetCursorPos(&mut pt);
+                        s.emit_proxy_drag(pt.x as f64, pt.y as f64, true);
+                    }
                     let pos = s.to_stream(x, y);
                     let v = s.input.lock().unwrap().moved(pos);
                     s.send_input(v);
@@ -835,6 +923,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                             (b, msg == WM_XBUTTONDOWN)
                         }
                     };
+                    if !down && b == Button::Left && s.drag_follow.load(Ordering::Acquire) {
+                        s.drag_follow.store(false, Ordering::Release);
+                        let _ = ReleaseCapture();
+                        let mut pt = POINT::default();
+                        let _ = GetCursorPos(&mut pt);
+                        s.emit_proxy_drag(pt.x as f64, pt.y as f64, false);
+                    }
                     on_button(hwnd, s, b, down, lp);
                 }
                 if msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP {
@@ -1004,5 +1099,12 @@ mod tests {
         assert_eq!(fit_into((800, 600), (1920, 1080)), (800, 600));
         assert_eq!(fit_into((3840, 2160), (1920, 1080)), (1920, 1080));
         assert_eq!(fit_into((2000, 1000), (1000, 1000)), (1000, 500));
+    }
+
+    #[test]
+    fn title_bar_hit_band() {
+        assert!(client_y_is_title_bar(0, 96));
+        assert!(client_y_is_title_bar(20, 96));
+        assert!(!client_y_is_title_bar(80, 96));
     }
 }

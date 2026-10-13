@@ -107,6 +107,14 @@ pub struct RecvUpdate {
     pub h: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecvPlace {
+    pub tid: u32,
+    pub x: f64,
+    pub y: f64,
+    pub dragging: bool,
+}
+
 #[derive(Debug)]
 pub enum Cmd {
     Hello,
@@ -122,6 +130,7 @@ pub enum Cmd {
     TransportClose,
     RecvOpen(Box<RecvOpen>),
     RecvUpdate(RecvUpdate),
+    RecvPlace(RecvPlace),
     RecvClose {
         tid: u32,
     },
@@ -308,6 +317,27 @@ pub fn parse_line(line: &str) -> Result<Request, ParseError> {
             w: get_dim(o, "w", id)?,
             h: get_dim(o, "h", id)?,
         }),
+        "recv.place" => {
+            let x = o
+                .get("x")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| bad(id, "x fehlt"))?;
+            let y = o
+                .get("y")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| bad(id, "y fehlt"))?;
+            Cmd::RecvPlace(RecvPlace {
+                tid: get_tid(o, id)?,
+                x,
+                y,
+                dragging: o
+                    .get("dragging")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        }
         "recv.close" => Cmd::RecvClose {
             tid: get_tid(o, id)?,
         },
@@ -407,6 +437,19 @@ mod tests {
         assert_eq!(a["ok"], true);
         assert_eq!(a["platform"], "win");
         assert_eq!(a["caps"], json!(["recv"]));
+    }
+
+    #[test]
+    fn recv_place_parses() {
+        let line = json!({"v":1,"id":2,"cmd":"recv.place","tid":9,"x":120.5,"y":80.0,"dragging":true})
+            .to_string();
+        let Cmd::RecvPlace(p) = parse_line(&line).unwrap().cmd else {
+            panic!("expected RecvPlace")
+        };
+        assert_eq!(p.tid, 9);
+        assert_eq!(p.x, 120.5);
+        assert_eq!(p.y, 80.0);
+        assert!(p.dragging);
     }
 
     #[test]

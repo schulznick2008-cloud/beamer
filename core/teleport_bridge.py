@@ -97,6 +97,27 @@ def enqueue_teleport_hotkey(controller) -> None:
         q.put(True)
 
 
+def _attach_win_proxy_drag(service: TeleportService) -> None:
+    import os
+
+    from core.teleport_proxy_drag import ProxyDragController
+
+    margin = float(os.environ.get("BEAMER_TELEPORT_RETURN_MARGIN", "12"))
+
+    def edge_at(x: float, _y: float) -> bool:
+        return x <= margin
+
+    def on_return(peer_id: str, tid: int) -> None:
+        with service._lock:
+            tele = service._active.get(tid)
+        if tele is None or tele.role != "receiver":
+            return
+        service._request_close(peer_id, tid, "return", tele.link_outbound)
+
+    ctrl = ProxyDragController(on_return, edge_at=edge_at, logger=service.logger)
+    service.set_proxy_drag_handler(ctrl.on_proxy_drag)
+
+
 def _attach_mac_edge_drag(controller, service: TeleportService) -> None:
     from core.teleport_edge_drag import EdgeDragController
 
@@ -203,6 +224,7 @@ def attach_win_sender(sender, identity_fn: Callable[[], dict], server=None) -> T
         logger=logging.getLogger("Beamer"),
     )
     sender.teleport = service
+    _attach_win_proxy_drag(service)
 
     orig_msg = sender.on_message
 

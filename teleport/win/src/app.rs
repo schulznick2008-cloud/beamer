@@ -230,6 +230,13 @@ impl App {
                 Ok(json!({}))
             }
             Cmd::RecvOpen(o) => self.recv_open(*o),
+            Cmd::RecvPlace(p) => match self.recvs.get_mut(&p.tid) {
+                None => Err(("not_found", format!("tid {} unbekannt", p.tid))),
+                Some(r) => {
+                    r.win.place_at(p.x, p.y, p.dragging);
+                    Ok(json!({}))
+                }
+            },
             Cmd::RecvUpdate(u) => match self.recvs.get_mut(&u.tid) {
                 None => Err(("not_found", format!("tid {} unbekannt", u.tid))),
                 Some(r) => {

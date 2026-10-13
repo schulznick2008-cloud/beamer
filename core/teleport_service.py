@@ -103,6 +103,7 @@ class TeleportService:
         self.logger = logger or log
         self._pick_front_window = pick_front_window
         self._drag_state_handler: Optional[Callable[[Mapping[str, Any]], None]] = None
+        self._proxy_drag_handler: Optional[Callable[[str, int, Mapping[str, Any]], None]] = None
         self._lock = threading.RLock()
         self._links: Dict[LinkRef, PeerTeleportState] = {}
         self._seen_offers: Dict[LinkRef, Set[Tuple[bytes, int]]] = {}
@@ -124,6 +125,11 @@ class TeleportService:
 
     def set_drag_state_handler(self, handler: Optional[Callable[[Mapping[str, Any]], None]]) -> None:
         self._drag_state_handler = handler
+
+    def set_proxy_drag_handler(
+        self, handler: Optional[Callable[[str, int, Mapping[str, Any]], None]]
+    ) -> None:
+        self._proxy_drag_handler = handler
 
     def _ensure_helper(self) -> TeleportHelper:
         if self._helper is None:
@@ -377,6 +383,20 @@ class TeleportService:
         if not recv.get("ok"):
             self._post(peer_id, reject_msg(tid, "error"), outbound)
             return
+        place_x = data.get("place_x")
+        place_y = data.get("place_y")
+        drag_offer = bool(data.get("drag"))
+        if drag_offer and place_x is not None and place_y is not None:
+            try:
+                helper.request(
+                    "recv.place",
+                    tid=tid,
+                    x=float(place_x),
+                    y=float(place_y),
+                    dragging=True,
+                )
+            except TeleportIPCError:
+                self.logger.warning("recv.place fehlgeschlagen (tid=%s)", tid)
         tele = ActiveTeleport(
             tid=tid,
             peer_id=peer_id,
@@ -387,9 +407,9 @@ class TeleportService:
             local_udp=local_port,
             peer_udp=int(data.get("udp_port", 0)),
             stream_keys_sent=True,
-            place_x=data.get("place_x"),
-            place_y=data.get("place_y"),
-            drag_pending=bool(data.get("drag")),
+            place_x=place_x,
+            place_y=place_y,
+            drag_pending=drag_offer,
         )
         with self._lock:
             self._active[tid] = tele
@@ -516,6 +536,15 @@ class TeleportService:
                 self.logger.exception("windows.drag_state Handler fehlgeschlagen")
             return
         tid = ev.get("tid")
+        if name == "proxy.drag" and isinstance(tid, int) and self._proxy_drag_handler is not None:
+            try:
+                with self._lock:
+                    tele = self._active.get(tid)
+                if tele is not None and tele.role == "receiver":
+                    self._proxy_drag_handler(tele.peer_id, tid, dict(ev))
+            except Exception:
+                self.logger.exception("proxy.drag Handler fehlgeschlagen")
+            return
         if not isinstance(tid, int):
             return
         if name == "proxy.input":

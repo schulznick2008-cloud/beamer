@@ -56,7 +56,7 @@ Der PC zeigt ein Proxy-Fenster. Liegt der Fokus dort, gehen Tastatur und Maus ü
 
 Wie beim normalen Beamer-Übergang: Fenster an der **Titelleiste** halten und über die **Übergangskante** zum PC ziehen – Maus wechselt per KVM, das Fenster folgt an der Cursor-Position.
 
-**Stand E5:** Dieser Weg ist in Beamer **noch ausgeschaltet**, bis der Mac-Helfer **`windows.drag_state`** (Titelleiste, `wid`) per IPC meldet (**C04d**). Bis dahin verhält sich das Ziehen über die Kante **genau wie Beamer 1.5.2** (nur KVM, kein Teleport). Rückweg vom Proxy-Fenster an die Kante zum Mac: **C05b**.
+**Stand:** Aktiv nur mit echtem **`windows.drag_state`** vom Mac-Helfer (Titelleiste + `wid`). Ohne dieses Event bleibt Ziehen über die Kante **wie Beamer 1.5.2** (nur KVM). Rückweg: Proxy an der Titelleiste zur Mac-Kante → **`tp_close`/`return`** (PC-Helfer **`proxy.drag`**).
 
 Kopierbefehle unverändert – Beamer-App auf beiden Seiten starten, Link verbunden, dann Hotkey auf dem Mac.
 

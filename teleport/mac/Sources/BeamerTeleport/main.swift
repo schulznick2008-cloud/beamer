@@ -43,6 +43,8 @@ case "--ipc":
     guard args.count >= 2, args[1] == "stdio" else { usage() }
     let writer = LineWriter()
     let engine = SenderEngine { writer.write(JSONLine.encode($0)) }
+    let dragMonitor = TitleBarDragMonitor(emit: { writer.write(JSONLine.encode($0)) }, probe: AXTitleBarProbe())
+    dragMonitor.start()
     // SIGTERM/SIGINT/SIGHUP: Fenster zurueckschieben, virtuelle Monitore entfernen, dann beenden.
     var signalSources: [DispatchSourceSignal] = []
     for sig in [SIGTERM, SIGINT, SIGHUP] {

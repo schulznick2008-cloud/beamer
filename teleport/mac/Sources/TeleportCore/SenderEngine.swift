@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 
@@ -57,6 +58,7 @@ public final class SenderEngine: TeleportBackend {
 
     public init(emit: @escaping (JSON) -> Void) {
         self.emit = emit
+        injector.releaseAll(at: nil)
         if let test = TestSources.fromEnvironment() { makeSource = test }
     }
 
@@ -376,11 +378,19 @@ public final class SenderEngine: TeleportBackend {
 
     /// Raeumt die Fenster- und Monitor-Reste eines Stroms auf: Fenster zurueck an die alte Stelle, virtuellen
     /// Monitor entfernen, Tasten loslassen, Schlaf wieder erlauben.
-    private func teardownControl(_ tid: UInt32) {
+    private func teardownControl(_ tid: UInt32, restoreAtPointer: Bool = false) {
         lock.lock()
         let c = controls.removeValue(forKey: tid)
         lock.unlock()
         guard let c = c else { return }
+        if restoreAtPointer, let wid = c.windowID, let pid = c.pid {
+            let mouse = NSEvent.mouseLocation
+            let mainH = NSScreen.main?.frame.height ?? mouse.y
+            let cgY = mainH - mouse.y
+            let size = c.restoreFrame?.size ?? CGSize(width: 800, height: 600)
+            let origin = CGPoint(x: mouse.x - size.width / 2, y: cgY - 14)
+            _ = try? windowController.setFrame(windowID: wid, pid: pid, origin: origin, size: size)
+        }
         if let vd = c.virtual {
             if let wid = c.windowID { CrashRestore.unregister(windowID: wid) }
             ScreenCaptureSource.clearScaleHint(forDisplay: vd.displayID)
@@ -400,20 +410,6 @@ public final class SenderEngine: TeleportBackend {
         }
         injector.releaseAll(at: nil)
         sleepGuard.release()
-    }
-
-    /// Nimmt den Strom aus der Verwaltung und raeumt auf. Wartet hoechstens `stopTimeout` darauf; haengt die Quelle,
-    /// laeuft das Aufraeumen im Hintergrund weiter, der Aufrufer (IPC-Thread) kommt trotzdem rechtzeitig zurueck.
-    private func dropPipeline(_ tid: UInt32, ended wasEnded: Bool = false) {
-        lock.lock()
-        if wasEnded { ended.insert(tid) }
-        let pipe = pipelines.removeValue(forKey: tid)
-        let t = transport
-        lock.unlock()
-        t?.removeStream(id: tid)
-        guard let p = pipe else { return }
-        _ = try? runBounded(timeout: stopTimeout, "Strom beenden") { p.stop() }
-        teardownControl(tid)
     }
 
     private func dropPipelineAsync(_ tid: UInt32) {
@@ -437,7 +433,23 @@ public final class SenderEngine: TeleportBackend {
             if wasEnded { return } // schon per send.gone beendet
             throw IPCError(.notFound, "tid \(tid) unbekannt")
         }
-        dropPipeline(tid)
+        dropPipeline(tid, ended: wasEnded, restoreAtPointer: restore)
+    }
+
+    /// Nimmt den Strom aus der Verwaltung und raeumt auf. Wartet hoechstens `stopTimeout` darauf.
+    private func dropPipeline(_ tid: UInt32, ended wasEnded: Bool = false, restoreAtPointer: Bool = false) {
+        lock.lock()
+        if wasEnded { ended.insert(tid) }
+        let pipe = pipelines.removeValue(forKey: tid)
+        let t = transport
+        lock.unlock()
+        t?.removeStream(id: tid)
+        guard let p = pipe else {
+            teardownControl(tid, restoreAtPointer: restoreAtPointer)
+            return
+        }
+        _ = try? runBounded(timeout: stopTimeout, "Strom beenden") { p.stop() }
+        teardownControl(tid, restoreAtPointer: restoreAtPointer)
     }
 
     public func sendKeyframe(tid: UInt32) throws {
