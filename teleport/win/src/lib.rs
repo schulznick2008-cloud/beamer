@@ -7,6 +7,7 @@
 pub mod app;
 pub mod clock;
 pub mod decode;
+pub mod drag;
 pub mod firewall;
 pub mod gpu;
 pub mod identity;

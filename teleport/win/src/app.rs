@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -121,6 +122,9 @@ impl App {
         }
         let q = self.queue.clone();
         let tid = self.main_thread;
+        // stdin-Ende auch als Merker: Thread-Nachrichten gehen in modalen Schleifen (Fenster ziehen) verloren.
+        let eof = Arc::new(AtomicBool::new(false));
+        let eof2 = eof.clone();
         std::thread::Builder::new()
             .name("stdin".into())
             .spawn(move || {
@@ -135,6 +139,7 @@ impl App {
                         let _ = PostThreadMessageW(tid, WM_APP_CMD, WPARAM(0), LPARAM(0));
                     }
                 }
+                eof2.store(true, Ordering::Release);
                 unsafe {
                     let _ = PostThreadMessageW(tid, WM_APP_EOF, WPARAM(0), LPARAM(0));
                 }
@@ -151,6 +156,11 @@ impl App {
                 match msg.message {
                     WM_APP_CMD => {
                         if self.drain_commands() {
+                            break;
+                        }
+                        // Ein WM_APP_EOF, das waehrend einer modalen Schleife verloren ging.
+                        if eof.load(Ordering::Acquire) {
+                            eprintln!("beamer-teleport: stdin geschlossen, raeume auf");
                             break;
                         }
                         continue;
@@ -243,6 +253,18 @@ impl App {
                         r.open.h = u.h.unwrap_or(r.open.h);
                         r.win.resize_points(r.open.w, r.open.h);
                     }
+                    Ok(json!({}))
+                }
+            },
+            Cmd::RecvPlace {
+                tid,
+                x,
+                y,
+                dragging,
+            } => match self.recvs.get(&tid) {
+                None => Err(("not_found", format!("tid {tid} unbekannt"))),
+                Some(r) => {
+                    r.win.place(x, y, dragging);
                     Ok(json!({}))
                 }
             },
