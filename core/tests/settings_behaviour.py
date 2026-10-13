@@ -4,8 +4,10 @@ import ast
 import copy
 import importlib
 import logging
+import platform as system_platform
 from pathlib import Path
 import sys
+import tempfile
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ from core.tests.app_methods import load_methods
 
 ROOT = Path(__file__).resolve().parents[2]
 IDS = [protocol.id_text(bytes([value]) * 16) for value in (1, 2, 3)]
+SETTINGS_ROOT = tempfile.TemporaryDirectory()
 VALUES = dict(glow_style="beam", glow_colour="ocean", effect_length="long",
               effect_size="large", shortcut_arrival=False, shortcut_arrival_style="locator")
 
@@ -32,12 +35,13 @@ def mac_adapter():
 
 
 def fixture(platform, ident):
-    namespace = dict(settings_sync=settings_sync, protocol=protocol, peerlist=peerlist, time=time,
+    namespace = dict(settings_sync=settings_sync, protocol=protocol, peerlist=peerlist, time=time, copy=copy,
                      Optional=Optional, replace=replace, LOGGER=logging.getLogger("settings-behaviour"),
                      core_ways=ways, ways=ways)
     if platform == "mac":
         config, to_raw = mac_adapter()
-        namespace.update(config_to_raw=to_raw, KEY_NAME_TO_CODE={"cmd_r", "f13"}, SettingsError=ValueError)
+        namespace.update(config_to_raw=to_raw, KEY_NAME_TO_CODE={"cmd_r", "f13"}, SettingsError=ValueError,
+                         desktop_mac=SimpleNamespace(display_map=lambda: {}))
         names = ("same_state", "_apply_followed_design", "_receive_design", "apply_same", "_set_design_follow", "_set_same",
                  "_show_trigger_conflict", "_trigger_chosen")
         cls = load_methods("mac_app/kvm_bridge_app.py", "ControlWindow", names, namespace)
@@ -45,7 +49,8 @@ def fixture(platform, ident):
         cfg = config.parse_config(dict(host="", port=24800, auth_token="", design_set_at=1000, design_by=ident))
         app.controller = SimpleNamespace(cfg=cfg)
         app.controller.apply_settings = lambda value: setattr(app.controller, "cfg", value)
-        app.settings_store = SimpleNamespace(save=lambda raw: config.parse_config(copy.deepcopy(raw)))
+        app.settings_store = SimpleNamespace(save=lambda raw, **kwargs: config.parse_config(copy.deepcopy(raw)))
+        app._receive_layout = lambda data, peer: False
         app.own_id = lambda: ident
         app.previews = None
         app._load_shared = lambda raw: None
@@ -68,6 +73,7 @@ def fixture(platform, ident):
         sys.path.insert(0, str(ROOT / "win_app"))
         config = importlib.import_module("app_config")
         namespace.update(app_config=config, ConfigError=config.ConfigError, TRIGGER_KEYS={"cmd_r", "f13"})
+        namespace["platform"] = system_platform
         names = ("_same_state", "_apply_followed_design", "_on_settings", "_design_follow_chosen", "_set_same",
                  "_show_trigger_conflict", "_record_trigger")
         namespace.update(TRIGGER_KEYS=config.TRIGGER_KEYS, TRIGGER_VKS=config.TRIGGER_VKS,
@@ -103,6 +109,10 @@ def fixture(platform, ident):
         app.controller.book = SimpleNamespace(peers=lambda: app.peers)
     else:
         app.book = SimpleNamespace(peers=lambda: app.peers)
+        app._peer_caps = lambda: {}
+        app.config_path = Path(tempfile.mkdtemp(dir=SETTINGS_ROOT.name)) / "settings.json"
+        config.write_settings(app.config_path, {"schema": config.SCHEMA, "machine_id": ident,
+                                                "peers": copy.deepcopy(app.peers), "zones": []})
     app._design_states = {}
     app._followed_version = None
     app._design_path = [ident]
@@ -137,7 +147,8 @@ def reflect_shortcut_visibility(app, platform):
         raise UnrelatedUI
     def visibility(view, visible):
         view.visible = visible
-    motion = SimpleNamespace(set_hidden=lambda view, hidden: visibility(view, not hidden), set_shown=visibility)
+    motion = SimpleNamespace(set_hidden=lambda view, hidden: visibility(view, not hidden),
+                             set_shown=lambda view, visible, **_options: visibility(view, visible))
     if platform == "mac":
         pages = importlib.import_module("pages")
         namespace = dict(pages=SimpleNamespace(crossing_rows=pages.crossing_rows, part_names=stop), motion=motion)
@@ -145,7 +156,9 @@ def reflect_shortcut_visibility(app, platform):
         app.method_boxes = {name: SimpleNamespace(value=name in app.cfg().crossing["methods"])
                             for name in ("shortcut", "edge", "corner", "part", "notch")}
         app.edge_row = app.parts_row = app.corner_row = SimpleNamespace()
-        app.dragging_box = app.resistance_module = SimpleNamespace(view=SimpleNamespace())
+        app.corner_select = SimpleNamespace(set_enabled=lambda enabled: None)
+        app.resistance_module = SimpleNamespace(view=SimpleNamespace())
+        app.dragging_box = SimpleNamespace(view=SimpleNamespace(), set_enabled=lambda enabled: None)
         app.shortcut_module = SimpleNamespace(view=SimpleNamespace(visible=False))
         app.key_recorder.cancel = lambda: None
         app.edge_select = SimpleNamespace(value="right")
@@ -153,25 +166,82 @@ def reflect_shortcut_visibility(app, platform):
         view = app.shortcut_module.view
     else:
         pages = importlib.import_module("pages_win")
-        namespace = dict(pages_win=pages, ways=ways, motion=motion, TRIGGER_KEYS=SimpleNamespace(get=stop))
+        namespace = dict(pages_win=pages, ways=ways, motion=motion, peerlist=peerlist,
+                         widgets=SimpleNamespace(set_role=lambda *args: None),
+                         platform=system_platform,
+                         OWN_PLATFORM="windows",
+                         TRIGGER_KEYS=SimpleNamespace(get=stop))
         cls = load_methods("win_app/kvm_bridge_win.py", "WindowsApplication", ["_reflect_ways"], namespace)
-        app._crossing_settings = lambda: {"peers": [], "zones": []}
+        app._crossing_settings = lambda: {"machine_id": app._config.machine_id, "peers": [], "zones": []}
         app._crossing_machines = lambda: []
         app._chosen_machine = lambda: None
         app._rebuild_machine_choice = lambda values: None
         app._ways_in = lambda: set()
-        ui = SimpleNamespace(
-            set_value=lambda *args: None,
-            set_names=lambda *args: None,
-            setText=lambda *args: None,
-            view=SimpleNamespace(setToolTip=lambda text: None),
-        )
+
+        class UI:
+            def __init__(self):
+                self.visible = True
+                self.view = self
+                self._buttons = {"next": self, "ticked": self}
+
+            def set_value(self, *args): pass
+            def set_names(self, *args): pass
+            def setText(self, *args): pass
+            def setVisible(self, visible): self.visible = visible
+            def setToolTip(self, *args): pass
+            def setAccessibleName(self, *args): pass
+            def setAccessibleDescription(self, *args): pass
+            def setText(self, *args): pass
+            def setChecked(self, *args): pass
+            def isChecked(self): return False
+            def blockSignals(self, *args): pass
+            def set_edge(self, *args): pass
+            def text(self): return ""
+            def toolTip(self): return ""
+            def accessibleName(self): return ""
+            def accessibleDescription(self): return ""
+            def isEnabled(self): return True
+            def setEnabled(self, *args): pass
+            def isVisible(self): return self.visible
+            def isHidden(self): return not self.visible
+            def hide(self): pass
+            def deleteLater(self): pass
+
+            def __getattr__(self, name):
+                # Any other widget call the refresh makes is not what these tests measure.
+                return lambda *args, **kwargs: None
+
+        ui = UI()
+        app._peer_entries = []
+        app._design_peer_caps = lambda: {}
+        app._live = lambda _peer: False
+        app._gone = lambda _peer: False
+        app._shown = lambda value: value
+        app.atlas_note = UI()
+        app.atlas_canvas = SimpleNamespace(set_tiles=lambda *args, **kwargs: None,
+                                           set_left_out=lambda *args: None,
+                                           shelf_ids=[], cycle={})
+        app.left_out_layout = SimpleNamespace(count=lambda: 0, takeAt=lambda _index: None)
+        app.left_out_shelf = app.left_out_heading = app.left_out_note = UI()
+        app.selected_machine_name = app.dormant_note = app.selected_machine_status = UI()
+        app.selected_machine_header = app.ways_heading = app.ways_summary = UI()
+        app.canvas_rename = app.canvas_leave_out = UI()
+        app.blocked_note = app.missing_note = app.no_way_back_note = UI()
+        app.shortcut_target_choice = app.shortcut_target_note = UI()
+        app.resistance_strip = UI()
+        app._reflect_jump_key = stop
         for name in ("machine_choice", "edge_choice", "edge_heading", "edge_note", "edge_unlearned", "corner_choice", "parts_note"):
             setattr(app, name, ui)
         app.machine_row = app.resistance_module = SimpleNamespace()
         app.ways_module = SimpleNamespace(eyebrow=SimpleNamespace(setText=lambda text: None))
-        app.shortcut_module = SimpleNamespace(visible=False)
-        app.way_boxes = app.part_buttons = app.crossing_rows = {}
+        app.shortcut_module = UI()
+        app.way_boxes = {name: UI() for name in ("edge", "corner", "parts", "shortcut")}
+        app.edge_way_detail = UI()
+        app.part_buttons = {}
+        app.third_boxes = {name: UI() for name in ("start", "middle", "end")}
+        app.crossing_rows = {name: UI() for name in ("edge", "corner", "parts", "thirds", "shortcut", "dragging", "resistance")}
+        app._crossing_text = lambda widget, text: widget.setText(text)
+        app._left_out_rows = {}
         method = lambda: cls._reflect_ways(app)
         view = app.shortcut_module
     try:
@@ -198,6 +268,7 @@ def status_fixture(platform, caps, cached=False, following=False, offline=()):
                 self.items = []
                 for value, title in choices:
                     cell = SimpleNamespace(enabled=True, tooltip="", setAlphaValue_=lambda alpha: None)
+                    cell.title = lambda title=title: title
                     cell.setToolTip_ = lambda text, cell=cell: setattr(cell, "tooltip", text)
                     cell.setEnabled_ = lambda enabled, cell=cell: setattr(cell, "enabled", enabled)
                     self.items.append((value, cell))
@@ -261,7 +332,8 @@ class SettingsBehaviourTests(TestCase):
         self.app.select(IDS[0])
 
     def assert_design(self, app, values=VALUES):
-        self.assertEqual({key: app.values()[key] for key in settings_sync.DESIGN_KEYS}, values)
+        expected = settings_sync._with_continuous(values)
+        self.assertEqual({key: app.values()[key] for key in settings_sync.DESIGN_KEYS}, expected)
 
     def test_selecting_older_leader_adopts_all_six_values_and_announces_local_version(self):
         self.cache_and_select()
@@ -284,7 +356,7 @@ class SettingsBehaviourTests(TestCase):
         # paired machines were offline and their missing Design set the note to "not available".
         app = status_fixture(self.platform, {IDS[0]: {"settings", "design_sync"}}, cached=True, offline=(IDS[2],))
         self.assertEqual(app.status_titles, ["None", "Leader"])
-        self.assertEqual(app.status_tooltip, "")
+        self.assertEqual(app.status_tooltip, "Leader" if self.platform == "mac" else "")
         self.assertTrue(app.status_note.startswith("None: this "), app.status_note)
 
     def test_no_connected_machine_lists_none_with_one_quiet_line(self):
@@ -303,7 +375,8 @@ class SettingsBehaviourTests(TestCase):
     def test_shared_trigger_clash_preserves_local_jump_and_trigger_and_reports_conflict(self):
         self.app.peers.append({"id": IDS[0], "jump_key": "ctrl+f13"})
         before = self.app.cfg().trigger_key
-        data = settings_sync.message_data(True, 20, {"trigger_key": "f13", "resistance_px": 75}, by=IDS[0])
+        data = settings_sync.message_data(True, 20, {"trigger_key": "f13", "resistance_px": 75}, by=IDS[0],
+                                          groups=settings_sync.ALL_GROUPS)
         self.app.peers[0]["jump_key"] = "cmd+f13"
         self.app.receive(IDS[0], data)
         self.assertEqual(self.app.cfg().trigger_key, before)
@@ -326,7 +399,7 @@ class SettingsBehaviourTests(TestCase):
         self.app.peers.append({"id": IDS[0], "jump_key": "ctrl+f13"})
         before = self.app.cfg().trigger_key
         self.app.receive(IDS[0], settings_sync.message_data(
-            True, 20, {"trigger_key": "f13", "shortcut": False}, by=IDS[0]))
+            True, 20, {"trigger_key": "f13", "shortcut": False}, by=IDS[0], groups=settings_sync.ALL_GROUPS))
         self.assertEqual(self.app.cfg().trigger_key, before)
         self.assertIn("clashes", self.app.conflict_note.text)
         self.assertTrue(reflect_shortcut_visibility(self.app, self.platform))
@@ -346,6 +419,7 @@ class SettingsBehaviourTests(TestCase):
     def test_same_off_here_resumes_the_already_adopted_cached_version(self):
         self.cache_and_select()
         self.app.cfg().same_on_both = True
+        self.app.cfg().same_groups = list(settings_sync.ALL_GROUPS)
         self._set_values(dict(VALUES, effect_length="short"))
         self.app._set_same(False)
         self.assert_design(self.app)
@@ -353,6 +427,7 @@ class SettingsBehaviourTests(TestCase):
     def test_same_off_received_resumes_the_already_adopted_cached_version(self):
         self.cache_and_select()
         self.app.cfg().same_on_both = True
+        self.app.cfg().same_groups = list(settings_sync.ALL_GROUPS)
         self._set_values(dict(VALUES, effect_length="short"))
         data = settings_sync.message_data(False, self.app.cfg().same_set_at + 1, by=IDS[2])
         self.app.receive(IDS[2], data)

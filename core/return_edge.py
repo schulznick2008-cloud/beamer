@@ -5,7 +5,7 @@ rectangles, the pointer position, each incoming movement delta and a clock, and 
 answers with what to do — inject the delta, hold the pointer at the edge, or
 cross. The model mirrors the Mac's so the two boundaries feel like one:
 outward travel at the edge accumulates as pressure, inward travel subtracts,
-time decays it to nothing over DECAY_SECONDS, and at `resistance_px` of net
+time decays it at DECAY_PX_PER_SECOND, and at `resistance_px` of net
 outward travel the edge gives.
 """
 
@@ -17,10 +17,17 @@ EDGES = ("left", "right", "top", "bottom")
 OPPOSITE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 DEFAULT_RESISTANCE_PX = 120
 DECAY_SECONDS = 0.4
+DECAY_PX_PER_SECOND = DEFAULT_RESISTANCE_PX / DECAY_SECONDS
+ARRIVAL_GRACE_PX = 4
+ARRIVAL_GRACE_SECONDS = 0.3
 # How near a corner counts as being in it. The Mac's own engine uses the same
 # 8 pixels, and the two boundaries are meant to feel like one.
 CORNER_PX = 8
 CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right")
+# An arrival lands at least this far from either end of its edge: at the very end it sat in another
+# machine's corner box or on the edge beside it, and the hand still moving sent input on to that
+# machine (rc14, 10-10-2026: a corner crossing landed the Mac on its left edge and went to the PC there).
+LANDING_CLEAR_PX = CORNER_PX + 2
 # The thirds of an edge "Part of the edge" may use, top to bottom or left to right. Both machines'
 # engines read them through in_parts, so a third means the same stretch on each.
 PARTS = ("start", "middle", "end")
@@ -72,6 +79,8 @@ class Outcome:
     position: Optional[Tuple[int, int]] = None
     edge: Optional[str] = None
     offset: Optional[float] = None
+    display: Optional[str] = None
+    side: Optional[str] = None
 
 
 def _clamp(value, low, high):
@@ -128,23 +137,66 @@ def landing_monitor(monitors: List[Rect], edge: str, along: float) -> Rect:
     return min(monitors, key=lambda r: (distance(r), outer(r)))
 
 
-def arrival_position(monitors: List[Rect], edge: str, offset: float) -> Tuple[int, int]:
+def arrival_position(monitors: List[Rect], edge: str, offset: float, display=None, side=None,
+                     display_map=None) -> Tuple[int, int]:
     """Where a pointer arriving at `edge`, `offset` of the way along it, lands. The fraction is
     applied against the whole bounding box, then placed on the monitor `landing_monitor` picks, so
-    no arrangement lands it in a gap or on the wrong one of two monitors sharing the edge."""
+    no arrangement lands it in a gap or on the wrong one of two monitors sharing the edge. A valid
+    `display` and `side` pair selects that display's edge, including a seam."""
+    if isinstance(display, str) and side in EDGES and isinstance(display_map, dict):
+        target = display_map.get(display)
+        if isinstance(target, Rect):
+            offset = _clamp(float(offset), 0.0, 1.0)
+            along = round((target.y if side in ("left", "right") else target.x)
+                          + offset * ((target.height if side in ("left", "right") else target.width) - 1))
+            if side == "left":
+                return target.x, _clear(along, target.y, target.bottom)
+            if side == "right":
+                return target.right, _clear(along, target.y, target.bottom)
+            if side == "top":
+                return _clear(along, target.x, target.right), target.y
+            return _clear(along, target.x, target.right), target.bottom
     bounds = union(monitors)
     offset = _clamp(float(offset), 0.0, 1.0)
     if edge in ("left", "right"):
         along = int(round(bounds.y + offset * bounds.height))
         owner = landing_monitor(monitors, edge, along)
         x = owner.x if edge == "left" else owner.right
-        y = _clamp(along, owner.y, owner.bottom)
+        y = _clear(along, owner.y, owner.bottom)
+        if _covered((x + (-1 if edge == "left" else 1), y), monitors):
+            # Moved in along a staggered neighbour's seam: the wall is the exposed end itself.
+            y = _clamp(along, owner.y, owner.bottom)
     else:
         along = int(round(bounds.x + offset * bounds.width))
         owner = landing_monitor(monitors, edge, along)
         y = owner.y if edge == "top" else owner.bottom
-        x = _clamp(along, owner.x, owner.right)
+        x = _clear(along, owner.x, owner.right)
+        if _covered((x, y + (-1 if edge == "top" else 1)), monitors):
+            x = _clamp(along, owner.x, owner.right)
     return x, y
+
+
+def _covered(point, monitors) -> bool:
+    return any(_contains(monitor, point) for monitor in monitors)
+
+
+def _clear(along, low, high):
+    """`along` within [low, high], kept LANDING_CLEAR_PX from both ends where the edge is long enough."""
+    if high - low > 2 * LANDING_CLEAR_PX:
+        return _clamp(along, low + LANDING_CLEAR_PX, high - LANDING_CLEAR_PX)
+    return _clamp(along, low, high)
+
+
+def keep_grace(previous, models) -> None:
+    """[(peer, model)] rebuilt from `previous` (a settings change, a peer starting to accept) keep the
+    arrival grace of the zone each replaces: a re-arm just after a landing must not end it."""
+    def key(peer, model):
+        return peer, type(model), model.edge, getattr(model, "corner", None), model.display
+    held = {key(peer, model): model for peer, model in previous}
+    for peer, model in models:
+        old = held.get(key(peer, model))
+        if old is not None:
+            model._arrival_at, model._arrival_inward = old._arrival_at, old._arrival_inward
 
 
 class ReturnEdge:
@@ -153,14 +205,21 @@ class ReturnEdge:
     disarmed once a crossing has been sent, so a burst of deltas still in
     flight after breakthrough cannot send a second one."""
 
-    def __init__(self, edge: str, resistance_px: int = DEFAULT_RESISTANCE_PX, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, edge: str, resistance_px: int = DEFAULT_RESISTANCE_PX,
+                 clock: Callable[[], float] = time.monotonic, display: str = None,
+                 target_display: str = None, target_side: str = None) -> None:
         if edge not in EDGES:
             raise ValueError(f"unknown edge {edge!r}")
         self.edge = edge
+        self.display = display
+        self.target_display = target_display
+        self.target_side = target_side
         self.resistance_px = max(0, int(resistance_px))
         self._clock = clock
         self._travel = 0.0
         self._last_at = clock()
+        self._arrival_at = None
+        self._arrival_inward = 0.0
         self.armed = True
 
     @property
@@ -169,9 +228,22 @@ class ReturnEdge:
             return 1.0 if self._travel > 0 else 0.0
         return _clamp(self._travel / self.resistance_px, 0.0, 1.0)
 
+    def pressure_at(self, now: float) -> float:
+        """Current pressure fraction at `now`, without changing the input model."""
+        if self.resistance_px == 0:
+            return self.pressure
+        elapsed = max(0.0, now - self._last_at)
+        return _clamp((self._travel - self._decay(elapsed)) / self.resistance_px, 0.0, 1.0)
+
     def reset(self) -> None:
         self._travel = 0.0
         self._last_at = self._clock()
+        self._arrival_at = None
+        self._arrival_inward = 0.0
+
+    def start_grace(self) -> None:
+        self._arrival_at = self._clock()
+        self._arrival_inward = 0.0
 
     def _outward(self, dx: float, dy: float) -> float:
         if self.edge == "left":
@@ -182,45 +254,75 @@ class ReturnEdge:
             return -dy
         return dy
 
-    def _at_edge(self, monitors: List[Rect], pointer: Tuple[int, int]) -> bool:
+    def _at_edge(self, monitors: List[Rect], pointer: Tuple[int, int], display_map=None) -> bool:
         """On a monitor, with no monitor one pixel beyond it: the pointer is
         against a wall. Testing the bounding box instead made the edge of a
         shorter monitor in a staggered arrangement unreachable — for example,
         pushing down on a monitor whose bottom stops above its neighbour's
         could never reach the edge."""
         x, y = pointer
+        target = display_map.get(self.display) if self.display and isinstance(display_map, dict) else None
+        if isinstance(target, Rect):
+            along = target.y <= y <= target.bottom if self.edge in ("left", "right") else target.x <= x <= target.right
+            near = {
+                "left": x <= target.x + 1.5,
+                "right": x >= target.right - 1.5,
+                "top": y <= target.y + 1.5,
+                "bottom": y >= target.bottom - 1.5,
+            }[self.edge]
+            return along and near
         step_x, step_y = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}[self.edge]
         beyond = (x + step_x, y + step_y)
         return any(_contains(m, pointer) for m in monitors) and not any(_contains(m, beyond) for m in monitors)
 
-    def feed(self, monitors: List[Rect], pointer: Tuple[int, int], dx: float, dy: float) -> Outcome:
+    def feed(self, monitors: List[Rect], pointer: Tuple[int, int], dx: float, dy: float, display_map=None) -> Outcome:
         bounds = union(monitors)
+        edge_bounds = display_map.get(self.display, bounds) if self.display and isinstance(display_map, dict) else bounds
+        if not isinstance(edge_bounds, Rect):
+            edge_bounds = bounds
+
+        def held_position():
+            x, y = pointer
+            if self.edge in ("left", "right"):
+                return (edge_bounds.x if self.edge == "left" else edge_bounds.right, _clamp(int(y + dy), edge_bounds.y, edge_bounds.bottom))
+            return (_clamp(int(x + dx), edge_bounds.x, edge_bounds.right),
+                    edge_bounds.y if self.edge == "top" else edge_bounds.bottom)
+
         now = self._clock()
         elapsed = max(0.0, now - self._last_at)
         self._last_at = now
         # Decay runs against the wall clock between deltas, pushing or not. A
         # brisk push outruns it; a slow lean on the edge to reach a menu never
         # accumulates, which is the whole point of the resistance.
-        self._travel = max(0.0, self._travel - self.resistance_px * elapsed / DECAY_SECONDS)
+        self._travel = max(0.0, self._travel - self._decay(elapsed))
         if not self.armed:
             return Outcome(PASS, self.pressure)
         outward = self._outward(dx, dy)
-        if outward <= 0 or not self._at_edge(monitors, pointer):
+        if self._arrival_at is not None and outward < 0:
+            self._arrival_inward += -outward
+        in_grace = (self._arrival_at is not None
+                    and self._arrival_inward < ARRIVAL_GRACE_PX
+                    and now - self._arrival_at < ARRIVAL_GRACE_SECONDS)
+        if outward <= 0 or not self._at_edge(monitors, pointer, display_map):
             if outward < 0:
                 self._travel = max(0.0, self._travel + outward)
             return Outcome(PASS, self.pressure)
+        if in_grace:
+            return Outcome(HOLD, self.pressure, position=held_position())
         self._travel += outward
         if self._travel >= self.resistance_px:
             self.armed = False
-            offset = edge_offset(bounds, self.edge, pointer)
+            offset = edge_offset(edge_bounds, self.edge, pointer)
             self._travel = 0.0
-            return Outcome(CROSS, 1.0, edge=OPPOSITE[self.edge], offset=offset)
-        x, y = pointer
-        if self.edge in ("left", "right"):
-            position = (x, _clamp(int(y + dy), bounds.y, bounds.bottom))
-        else:
-            position = (_clamp(int(x + dx), bounds.x, bounds.right), y)
-        return Outcome(HOLD, self.pressure, position=position)
+            # A display and its side go together (WIRE.md section 5), as the Mac's engine sends them.
+            return Outcome(CROSS, 1.0, edge=OPPOSITE[self.edge], offset=offset,
+                           display=self.target_display or None,
+                           side=(self.target_side or OPPOSITE[self.edge]) if self.target_display else None)
+        return Outcome(HOLD, self.pressure, position=held_position())
+
+    @staticmethod
+    def _decay(elapsed: float) -> float:
+        return DECAY_PX_PER_SECOND * max(0.0, elapsed)
 
 
 class PartEdge(ReturnEdge):
@@ -228,12 +330,18 @@ class PartEdge(ReturnEdge):
     a menu or a dock at one end can sit against it without the pointer ever crossing there. The
     thirds are measured along the display the pointer is on, by `display_fraction`."""
 
-    def __init__(self, edge: str, parts, resistance_px: int = DEFAULT_RESISTANCE_PX, clock=time.monotonic) -> None:
-        super().__init__(edge, resistance_px, clock)
+    def __init__(self, edge: str, parts, resistance_px: int = DEFAULT_RESISTANCE_PX, clock=time.monotonic,
+                 display: str = None, target_display: str = None, target_side: str = None) -> None:
+        super().__init__(edge, resistance_px, clock, display=display, target_display=target_display,
+                         target_side=target_side)
         self.parts = frozenset(part for part in parts if part in PARTS)
 
-    def _at_edge(self, monitors: List[Rect], pointer: Tuple[int, int]) -> bool:
-        return super()._at_edge(monitors, pointer) and in_parts(display_fraction(monitors, self.edge, pointer), self.parts)
+    def _at_edge(self, monitors: List[Rect], pointer: Tuple[int, int], display_map=None) -> bool:
+        if not super()._at_edge(monitors, pointer, display_map):
+            return False
+        target = display_map.get(self.display) if self.display and isinstance(display_map, dict) else None
+        fraction = edge_offset(target, self.edge, pointer) if isinstance(target, Rect) else display_fraction(monitors, self.edge, pointer)
+        return in_parts(fraction, self.parts)
 
 
 class SpanEdge(ReturnEdge):
@@ -246,10 +354,10 @@ class SpanEdge(ReturnEdge):
         super().__init__(edge, resistance_px, clock)
         self.span = span
 
-    def _at_edge(self, monitors: List[Rect], pointer: Tuple[int, int]) -> bool:
+    def _at_edge(self, monitors: List[Rect], pointer: Tuple[int, int], display_map=None) -> bool:
         span = self.span()
         along = pointer[0] if self.edge in ("top", "bottom") else pointer[1]
-        return span is not None and super()._at_edge(monitors, pointer) and span[0] <= along <= span[1]
+        return span is not None and super()._at_edge(monitors, pointer, display_map) and span[0] <= along <= span[1]
 
 
 class CornerPush(ReturnEdge):
@@ -263,10 +371,13 @@ class CornerPush(ReturnEdge):
     crossing arrives where an edge crossing would, at the end of that edge the
     corner sits at."""
 
-    def __init__(self, corner: str, edge: str, resistance_px: int = DEFAULT_RESISTANCE_PX, clock=time.monotonic) -> None:
+    def __init__(self, corner: str, edge: str, resistance_px: int = DEFAULT_RESISTANCE_PX,
+                 clock=time.monotonic, display: str = None, target_display: str = None,
+                 target_side: str = None) -> None:
         if corner not in CORNERS:
             raise ValueError(f"unknown corner {corner!r}")
-        super().__init__(edge, resistance_px, clock)
+        super().__init__(edge, resistance_px, clock, display=display, target_display=target_display,
+                         target_side=target_side)
         self.corner = corner
         self.vertical, self.horizontal = corner.split("_")
 
@@ -278,13 +389,15 @@ class CornerPush(ReturnEdge):
         inward = (min(0.0, out_x) ** 2 + min(0.0, out_y) ** 2) ** 0.5
         return -inward
 
-    def _at_edge(self, monitors: List[Rect], pointer: Tuple[int, int]) -> bool:
+    def _at_edge(self, monitors: List[Rect], pointer: Tuple[int, int], display_map=None) -> bool:
         """In the corner's own box, and against at least one of its two walls.
         The box is measured on the monitor the pointer is on, for the same
         reason the edge test is: on a staggered arrangement the bounding box
         has corners no display reaches."""
         x, y = pointer
-        home = next((m for m in monitors if _contains(m, pointer)), None)
+        home = display_map.get(self.display) if self.display and isinstance(display_map, dict) else None
+        if not isinstance(home, Rect):
+            home = next((m for m in monitors if _contains(m, pointer)), None)
         if home is None:
             return False
         near_x = x <= home.x + CORNER_PX if self.horizontal == "left" else x >= home.right - CORNER_PX

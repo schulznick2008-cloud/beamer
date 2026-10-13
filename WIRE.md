@@ -97,6 +97,8 @@ Beside the machine's other settings, which keep the names 1.4.x gave them, it ho
 | `shortcut` | whether the switch shortcut is one of this machine's ways across |
 | `peers` | a list of peer entries, below, at most 32 |
 | `zones` | this machine's zones, section 8 |
+| `layout` | this machine's remembered tiles, keyed by machine id; each tile has integer `x`, `y`, `w` and `h` canvas units |
+| `layout_set_at`, `layout_by` | the last shared tile picture's independent stamp |
 | `migrated_token_sha256` | lower-case hex SHA-256 of the UTF-8 of the last 1.4.x `auth_token` migrated, or `""` |
 
 A peer entry:
@@ -105,6 +107,7 @@ A peer entry:
 |---|---|---|
 | `id` | `b64` or `""` | the peer's machine id; `""` only for the entry migrated from 1.4.x |
 | `name` | string | the peer's name, from pairing, then from every `hello` or `welcome` |
+| `label` | string, optional | this machine's local display name for the peer; trimmed, at most 64 code points; empty clears it |
 | `platform` | string | the peer's platform, from pairing, then from every `hello` or `welcome` |
 | `token` | string | the shared token from pairing, never reused for another peer |
 | `host` | string | the IPv4 address to open a link to the peer at; `""` for a phone |
@@ -121,6 +124,11 @@ A peer entry:
 | `from_1_4` | boolean | this entry was migrated from a 1.4.x pairing, and never links |
 | `way_back` | boolean, optional | what the peer last said in `arrangement`'s `way_back` (section 8): whether one of its zones leads here; absent until it says |
 | `way_back_by` | `b64`, optional | what the peer last said in `arrangement`'s `way_back_by` (section 8): the machine whose zone holds the side it has for this one; absent when it named none |
+| `shortcut_cycle` | boolean, local only | whether this machine is included when `shortcut_goes_to` is `ticked`; absent means ticked |
+| `left_out` | boolean, local | whether this peer is left out of this machine's layout; never sent |
+| `left_out_ways` | list of strings, local | the zone kinds to restore when this peer is put back; never sent |
+| `dormant` | boolean, optional, local | whether conclusive link evidence says this peer no longer has the pairing; absent means false; never sent |
+| `dormant_reason` | string, optional, local | `wrong_id` or `forgotten`, the evidence that set `dormant`; absent when `dormant` is false; never sent |
 
 Rules:
 
@@ -473,6 +481,9 @@ Capabilities say what a machine does with a message it receives:
 | `text` | it types `text` |
 | `settings` | it receives Same on all machines (`settings`) |
 | `design_sync` | with `settings`, it sends and receives direct Design states (`settings.data.design_sync`) and can be followed |
+| `layout` | with `settings`, it sends and receives the shared tile picture (`settings.data.layout`) |
+| `displays` | with `layout`, it sends and receives each machine's logical display rectangles and display-targeted edges |
+| `ping_rtt` | it sends and answers response-time probes on `ping` in both directions |
 
 A sender does not send a message its peer's capabilities do not cover. A receiver that gets one
 anyway drops it, and still acknowledges it when it carries a `seq`.
@@ -505,7 +516,7 @@ Initiator to responder:
 | `type` | `data` | Carries `seq` |
 |---|---|---|
 | `hello` | section 2 | no |
-| `ping` | `{}` | no |
+| `ping` | `{}`, or `probe` or `echo` (one positive integer identifier, at most 2^31 - 1) | no |
 | `focus` | section 5 | no |
 | `keydown`, `keyup` | `key`, optional `us` (section 7) | yes |
 | `mousemove` | `dx`, `dy` | yes |
@@ -572,11 +583,20 @@ Either way:
 - **Liveness.** An initiator sends `ping` when it has sent nothing for a second; a responder's
   `ack` heartbeat does the same the other way (section 9). A side that receives no byte at all for
   2.5 seconds (a responder) or 2 seconds (an initiator) ends the link. Any byte counts, so a large
-  clipboard frame arriving slowly keeps the link alive while it comes.
-- **`paired`** lists the ids of every peer the sender has, less the receiver's. A machine sends
-  it only to peers it may send input to (`send` true), since those are the ones whose Crossing
-  page needs it: after the handshake and again whenever its list changes. The receiver stores it
-  in `paired_with` (section 5, the Crossing page).
+  clipboard frame arriving slowly keeps the link alive while it comes. An initiator also ends a
+  link when its oldest unacknowledged input is older than 1.5 seconds, even if heartbeat `ack`s
+  continue to arrive; phone ports must keep this input-acknowledgement rule in parity.
+- **Response time.** Only when both identities announce `ping_rtt`, each end sends a `ping` with a
+  fresh `probe` about once a second, including during input, and answers a `probe` with one `ping`
+  carrying its `echo`. A ping has at most one of these fields; an echo is never echoed. Empty pings
+  remain valid and compatible with older peers. The sender starts its local monotonic timer when
+  the writer begins sending the probe and accepts only the matching echo on that link. The most
+  recent round trip is available for three seconds; no peer clock is used. This measurement does
+  not change the input `ack` samples or watchdog.
+- **`paired`** lists the ids of every desktop peer the sender has in use and not dormant, less the
+  receiver's. A machine sends it only to peers it may send input to (`send` true), since those are
+  the ones whose Crossing page needs it: after the handshake and again whenever its list changes.
+  The receiver stores it in `paired_with` (section 5, the Crossing page).
 - **Announcements.** After the handshake each end sends `paired` when the rule above allows,
   `arrangement` when this pair has a side, and `settings` when the other's capabilities list
   `settings`, except for a zero-port phone: phones never take part in shared settings or Match design.
@@ -670,6 +690,7 @@ and both stay at home, and the next try works.
 | `route` | integer, 1 to 2^53 - 1 |
 | `target` | `b64`: where input is going. The responder's own id means here; any other id means the responder is being let go |
 | `edge`, `offset` | where to land the pointer: `left`, `right`, `top` or `bottom`, and how far along that edge of the responder, any number, which the receiver clamps to 0.0 to 1.0 (never malformed for its range) |
+| `display`, `side` | optional pair naming the responder's display key and the side to land on; an unknown display falls back to `edge` and `offset` |
 | `resistance_px` | integer 0 to 1000: how far the owner's hand must push through a zone on the responder |
 | `reach` | list of `b64`, at most 32, no repeats: the peers the owner can send input to now, less the owner and the responder |
 | `stay` | `true`: re-arm in place; land nothing, play nothing |
@@ -687,6 +708,8 @@ A take without `resistance_px` uses 120, and a phone, which has no hand at an ed
 out. A take or re-arm without `reach` has an empty one. A `reach` that names the owner or the
 responder has those ignored. `edge` without `offset`, `offset` without `edge`, or `stay` with
 anything but `true`, is malformed; on a re-arm `edge` and `offset` do not belong and are ignored.
+`display` and `side` must appear together; `display` is 1 to 64 ASCII letters, digits, `_`, `.`, `:`
+or `-`, and `side` is one of the four edge names. Older peers ignore both optional members.
 
 `accept`, responder to the initiator whose taking `focus` it accepted: `route`.
 
@@ -711,6 +734,7 @@ unknown key (Encodings).
 | `route` | the last `route` the responder accepted from this owner |
 | `next` | `b64`: where input should go. The owner's own id means home |
 | `edge`, `offset` | where to arrive on `next`, both or neither, as in `focus` (`offset` clamped, never malformed for its range) |
+| `display`, `side` | optional pair naming `next`'s display key and the side to arrive at; an unknown display falls back to `edge` and `offset` |
 
 ### The route
 
@@ -1078,8 +1102,9 @@ A key travels as `key`, a name, in `keydown` and `keyup`:
   | Modifiers | `shift`, `shift_r`, `ctrl`, `ctrl_r`, `alt`, `alt_r`, `cmd`, `cmd_r`, `caps_lock` |
   | Editing and movement | `backspace`, `tab`, `enter`, `esc`, `space`, `delete`, `insert`, `home`, `end`, `page_up`, `page_down`, `left`, `right`, `up`, `down` |
   | Function | `f1` to `f24` |
-  | Windows keys | `menu`, `print_screen`, `pause`, `num_lock`, `scroll_lock`, `browser_back`, `browser_forward` |
-  | Media (`media_keys`) | `volume_mute`, `volume_down`, `volume_up`, `media_next`, `media_prev`, `media_stop`, `media_play_pause` |
+  | Windows keys | `menu`, `print_screen`, `pause`, `num_lock`, `scroll_lock`, `browser_back`, `browser_forward`, `browser_refresh`, `browser_stop`, `browser_search`, `browser_favourites`, `browser_home`, `mail`, `media_select`, `launch_app1`, `launch_app2` |
+  | Media (`media_keys`) | `volume_mute`, `volume_down`, `volume_up`, `media_next`, `media_prev`, `media_stop`, `media_play_pause`, `brightness_up`, `brightness_down`, `mic_mute` |
+  | System actions | `search`, `spotlight`, `dictation` |
 
   The numpad's Enter is `enter`.
 - **`keyup`** carries the same `key` and `us` as the `keydown` it releases, even if Shift changed
@@ -1175,7 +1200,14 @@ only for the entry migrated from 1.4.x, which never links. A zone never names a 
   in use, unless another zone in use covers that stretch, when it stays `off` like any other clash.
   Only a machine whose link reports that it no longer has this pairing (section 2, initiator step
   3) keeps its zones `off` for good, and the app says so in its window, not only in its log. Any
-  edit of the zone by the user clears `aside`. A zone's stretch is its peer's `side` for an `edge` zone, the
+  edit of the zone by the user clears `aside`. An edge, part or corner zone that the Crossing page turns off
+  also carries `"page_off": true`, scoped or unscoped; layout compilation keeps the contact off until the
+  page turns that way back on, including when display metadata is absent. The mark leaves with a contact
+  the tile has left. Thirds picked on the page are kept as `"page_parts"` on the peer's unscoped
+  `part` zone, and each contact layout compilation writes keeps the thirds it touches as
+  `"contact_parts"`; a contact crosses only by the picked thirds it touches, all three being the whole
+  edge. Both are local marks: no new message, capability or protocol version.
+  A zone's stretch is its peer's `side` for an `edge` zone, the
   chosen thirds of it for a `part` zone, and the corner for a `corner` zone; the `notch` is a
   stretch of its own, which only another `notch` zone covers: it fires on a dwell and 1.4.x let
   it stand beside the edge, but a Mac has one notch, so it leads to one machine. 1.4.x let the
@@ -1283,9 +1315,13 @@ every peer.
 {"type": "settings", "data": {
   "on": true, "set_at": 1790000000, "by": "<b64>",
   "crossing": {"resistance_px": 120, "block_while_dragging": true, "shortcut": true,
-               "trigger_key": "alt_r", "trigger_style": "double_tap", "double_tap_ms": 300},
+               "trigger_key": "alt_r", "shortcut_goes_to": "last", "trigger_style": "double_tap", "double_tap_ms": 300},
   "design": {"glow_style": "glow", "glow_colour": "colourful", "effect_length": "normal",
-             "shortcut_arrival": true, "shortcut_arrival_style": "match"}}}
+             "effect_size": "medium", "effect_pace": 1.0, "effect_size_fraction": 0.045,
+             "shortcut_arrival": true, "shortcut_arrival_style": "match"},
+  "groups": ["crossing", "design", "shortcut", "names"],
+  "stamps": {"trigger_style": [1789990000, "<b64>"], "glow_colour": [1790000000, "<b64>"]},
+  "names": {"<id>": {"label": "Studio", "set_at": 1790000000, "by": "<b64>"}}}}
 ```
 
 - `on` is a boolean, `set_at` an integer of unix seconds, `by` the `b64` id of the machine that
@@ -1296,11 +1332,32 @@ every peer.
   so a malformed outer field drops the optional Design state with the rest of the message.
   `crossing` and `design` are objects, present only when `on` is
   true; one that is absent or is not an object brings no values, and the message stands.
+- `groups` is an optional array of `"crossing"`, `"design"`, `"shortcut"` and `"names"`.
+  Its order is Crossing, Design, Shortcut, Names. A local group-picker change sets `on` true
+  exactly when at least one group is selected. A legacy 1.5.0–1.5.1 state may change `on` while
+  preserving this machine's group selection; that on/off state is forwarded unchanged. Crossing carries resistance and drag protection; Design carries
+  design values; Shortcut carries the switch, trigger and destination; Names carries `names`.
+  Values for unselected groups are ignored. Without `groups`, a 1.5.0–1.5.1 state keeps its old
+  on/off behaviour and applies values only to groups selected locally. It never changes a local
+  group selection; with none selected, its `on` true selects every group, as turning it on locally
+  does. Older peers ignore `groups` and continue applying their known Crossing and
+  Design keys. `layout` is independent of groups and always travels to peers advertising `layout`.
+- `names` is an optional object, present only when `on` is true and Names is selected when `groups`
+  is present. Each key is a machine id and each
+  value is `{label, set_at, by}`: `label` is a trimmed string of at most 64 code points, including
+  the empty string; `set_at` is an integer of unix seconds and `by` is the `b64` id of the machine
+  that changed it. An invalid entry is ignored without dropping other names or settings. Each id's
+  entry is accepted independently when its stamp is newer than the one held for that id: a higher
+  `set_at`, or the same `set_at` and the larger `by` as bytes. The clock bounds above apply to each
+  entry. A receiver writes a name for its own id to its local `name`; another known id updates that
+  peer's optional `label`. Unknown ids are ignored. With `on` false, `names` is ignored. Older peers
+  ignore this optional member.
 - **Each value stands alone.** Unlike every other message, a value in `crossing` or `design`
   outside the table below, or one this receiver cannot hold (an effect it does not have), is
   left out and the rest still applied, and the message is not malformed for it; an unknown key
-  is ignored. Whether a message is newer, and whether it is sent on, is decided by `set_at` and
-  `by` alone: one with values left out still wins, takes its stamp, and is sent on as it came.
+  is ignored. Whether a message's state is newer is decided by `set_at` and `by` alone, and each
+  value's by its own stamp: one with values left out still wins, takes its stamps, and is sent on
+  as it came.
 - The values:
 
   | Key | Allowed |
@@ -1308,26 +1365,69 @@ every peer.
   | `resistance_px` | integer 0 to 500 |
   | `block_while_dragging`, `shortcut`, `shortcut_arrival` | boolean |
   | `trigger_key` | a key name from section 7 that is not a character, a media key, `browser_back`, `browser_forward`, `backspace`, `tab`, `enter`, `esc`, `space` or `print_screen` |
+  | `shortcut_goes_to` | `"last"`, `"next"` or `"ticked"`; absent means `"last"` |
   | `trigger_style` | `"double_tap"` or `"hold"` |
   | `double_tap_ms` | integer 50 to 2000 |
   | `glow_style` | `"glow"`, `"beam"`, or an effect id from `effects.py` |
   | `glow_colour` | `"signal"`, `"colourful"`, `"ocean"`, `"sunset"`, `"mono"`, or a colour pack id from `effects.py` |
   | `effect_length` | `"short"`, `"normal"` or `"long"` |
+  | `effect_size` | `"small"`, `"medium"` or `"large"` |
+  | `effect_pace` | number 0.25 to 2.5; when valid it takes precedence over `effect_length` |
+  | `effect_size_fraction` | number 0.02 to 0.08; when valid it takes precedence over `effect_size` |
   | `shortcut_arrival_style` | `"match"`, `"locator"`, or an effect id from `effects.py` |
 
-- Shared: the crossing's feel (resistance, the drag guard, the shortcut and its key) and the
+  The optional numeric fields are also sent in `design_sync.values`. If absent or invalid, a new
+  peer converts the legacy preset to its corresponding slider stop: Short 0.5, Normal 1.0, Long
+  2.0; Small 0.03, Medium 0.045, Large 0.06. The legacy preset fields always contain the nearest
+  preset for the numeric value, so 1.5.0–1.5.2 peers ignore the new keys and keep a usable setting.
+
+- Shared: the crossing's feel (resistance, the drag guard, the shortcut, its key and where it goes) and the
   Design page. Never shared: zones, `side`, the direction switches, the Mac's notch look and
   haptics, and appearance. Version 5's `methods`, `edge_parts` and `corner` are zones now and
   leave the message, and with them goes 1.5.0's mirroring of the corner.
+- `shortcut_goes_to` is optional. Beamer 1.5.0 to 1.5.2 ignore it and keep Last machine.
 - **Newer wins**: a higher `set_at`, or the same `set_at` and the larger `by` as bytes. This
   replaces the Mac winning a tie, since there may be no Mac. A `set_at` more than a day ahead of
-  the receiver's clock, or above 2^53 - 2, is ignored.
+  the receiver's clock, or above 2^53 - 2, is ignored. The outer stamp decides `on` and `groups`.
+- **Each value has its own stamp** (1.5.2). `stamps` is an optional object, present only when
+  `on` is true, with one `[set_at, by]` per value sent, stamped when a person changed that value
+  on that machine, whether Same was on or off. A receiver takes a value only when its stamp is
+  newer than the one it holds for that key, by the rule above, and keeps that stamp with it. So
+  an edit carries only what was changed, and a value the sender missed or never set cannot
+  overwrite a real choice elsewhere. Before 1.5.2 the whole state travelled under the outer stamp:
+  rc14 (10-10-2026) showed one machine's edit rewriting seven of another's values. A value held
+  without a stamp of its own counts as stamped with the state it came in. That is every value of
+  a peer that sends no `stamps`, so a 1.5.0 or 1.5.1 peer behaves as it did against its own kind.
+  A fresh machine's values hold `[0, ""]`, so it adopts the group's and never sends its defaults
+  over anyone's. A stamp for a key not sent is ignored; one may be later than the outer `set_at`, since a value
+  changed while its group was off is stamped then, and is bounded by the same day-ahead rule. The
+  receiver seeds its own unstamped values once, from its outer stamp, and stores them; later
+  changes to the outer stamp (on, off, the groups) never restamp a value.
+- **Answering.** A receiver that holds a newer value than one in the message sends its own state
+  to its peers, or the sender, having taken nothing from its own message, would never learn it.
+  A receiver that holds no newer value sends nothing back, so the exchange stops. A peer from
+  before 1.5.2 takes only a whole state newer than its own, so it ignores an answer whose outer
+  stamp equals the state it just sent; it learns the newer value at the next change made on a
+  1.5.2 machine with Same on. A value kept back over a trigger clash is not taken, so a message
+  carrying only that is not sent on.
 - **From and to whom.** A machine takes `settings` only from a peer whose capabilities list
   `settings`, and sends its state to every such peer after each handshake and on every change. One
-  that takes a newer state sends it on, unchanged, to every other such peer it has a link to. An
-  older or equal one is not sent on, so it stops. Turning it off travels the same way.
+  that takes a newer state, or any newer value, sends the message on, unchanged, to every other
+  such peer it has a link to. One that takes nothing does not send it on, so it stops. Turning it
+  off travels the same way.
 - A change made here is stamped with the current time, and never lower than the stamp held plus
   one, so a change on a machine whose clock is behind still wins.
+- Each settings file keeps its group selection and one local `same_before_sync` snapshot. Before
+  an accepted incoming update changes local shared values or the selection, save the previous
+  selection and affected values. The snapshot expires after 30 days, is replaced by the next
+  accepted change, and is never sent. Name entries follow the accepted group policy even when an
+  older outer stamp carries newer per-entry names. Updates that change only stamps do not replace
+  the snapshot. Revert restores saved values, clears the snapshot, stamps the restoration as a new
+  local change and announces it under the current group selection, keeping sync on. A
+  selection-only update records `selection_only` in the local snapshot: Revert restores the
+  previous selection while keeping the current values. Restored names and direct Design
+  advertisements receive fresh stamps too. Group selection and snapshots are never key-mapping
+  policy; each system keeps its own mapping.
 
 **Follow a machine's design.** Each machine's Design page has **Match design with**: None, or one
 paired machine advertising both `settings` and `design_sync`. The selection is local; there is no
@@ -1344,13 +1444,15 @@ even while Same on all machines is off. The state is:
 {"type":"settings","data":{"on":false,"set_at":1790000000,"by":"<b64>",
   "design_sync":{"set_at":1790000001,"by":"<b64>","values":{
     "glow_style":"glow","glow_colour":"colourful","effect_length":"normal",
-    "effect_size":"medium","shortcut_arrival":true,"shortcut_arrival_style":"match"}}}}
+    "effect_size":"medium","effect_pace":1.0,"effect_size_fraction":0.045,
+    "shortcut_arrival":true,"shortcut_arrival_style":"match"}}}}
 ```
 
 `design_sync` is a complete independently stamped Design state. Its `set_at` and `by` use the
 newer-wins ordering and clock bounds above. Values are validated individually; unsupported keys or
 values are ignored. Missing `effect_size` means `"medium"`; its wire type is string and allowed
-values are `"small"`, `"medium"` and `"large"`. Same on all machines has precedence: the follow
+values are `"small"`, `"medium"` and `"large"`. `effect_pace` and `effect_size_fraction` are
+optional numbers with the bounds and preset fallback described above. Same on all machines has precedence: the follow
 selection stays set but does not apply while Same is on. A newer state from the selected machine
 applies to this machine's Design only when its stamp is newer than this machine's own Design stamp.
 The follower keeps the leader's `set_at` and `by`, so an announcement carries the same stamp through
@@ -1366,6 +1468,38 @@ Same on all machines resumes following from the selected machine's latest receiv
 or unpairing the selected machine resets the selection to None. An offline followed machine leaves
 the last look in place; the next link-up sends its current state and catches the follower up.
 Older peers ignore the optional field. A peer that does not send it cannot be followed.
+
+**Shared tile picture.** The optional `layout` member is independent of `on` and carries the
+complete machine-id-to-tile map. Its `set_at` and `by` use the newer-wins ordering and clock bounds
+above; a receiver keeps the newest valid state, compiles its own zones from the picture, and sends
+the state on unchanged to other linked peers advertising both `settings` and `layout`. Zones and
+sides remain local, and `arrangement` continues to settle sides with peers that do not advertise
+`layout`.
+
+```json
+{"type":"settings","data":{"on":false,"set_at":1790000000,"by":"<b64>",
+  "layout":{"set_at":1790000001,"by":"<b64>","tiles":{
+    "<machine id>":{"x":0,"y":0,"w":160,"h":100,
+      "displays":{"0":{"x":-1280,"y":0,"w":1280,"h":800},
+                  "1":{"x":0,"y":0,"w":1920,"h":1080}}}}}}}
+```
+
+`tiles` has at most 33 entries, keyed by machine id. Each tile has integer `x`, `y`, `w` and `h`
+canvas units, with positive `w` and `h`. A tile may also carry `name`, the machine's advertised
+name (up to 64 characters). A map may show this machine, any desktop peer it holds, and a third-party
+machine only when an in-use, non-dormant, not-left-out desktop peer lists that id in `paired_with`
+and the third-party tile has a valid name. A phone, dormant, left-out or not-in-use peer cannot
+admit a third-party tile. Unnamed third-party tiles and ids outside these rules are dropped.
+A tile may also carry `displays`, a map of 1 to 16 display
+keys to `{x, y, w, h}` logical rectangles in that machine's own display arrangement; `x` and `y`
+may be negative, and widths and heights are positive. The display rectangles are fitted into the
+machine's canvas tile while preserving their arrangement. A tile may also carry `display_offsets`, a
+map from display key to integer `{x, y}` translations in canvas units. A present offset marks that
+display as split from its group; the reported logical rectangle remains unchanged. Omitted offsets
+keep the display grouped, and dragging the machine moves the group together. A receiver ignores
+malformed `layout` as a whole. Peers without `displays` receive the same machine tiles without the
+nested display map or its offsets.
+Beamer 1.5.0 to 1.5.2 ignore this unknown optional member and keep their existing Crossing page.
 
 ## Versions
 
@@ -1405,6 +1539,10 @@ one against the code and against the primitives written out by hand.
 - New messages: `accept`, `accepts`, `refuse`, `paired`, `text`.
 - `settings` gains the optional `design_sync` member for per-machine Design matches; older betas
   ignore it, while 1.5 keeps it separate from the existing `on` switch.
+- `settings` gains the optional independently stamped `layout` member for the shared tile picture;
+  peers without the `layout` capability do not receive it.
+- `focus` and `switch` may carry the optional `display` and `side` pair for landing on a named
+  display edge; peers without the `displays` capability receive neither field.
 
 ## Changes from the first design
 

@@ -232,10 +232,34 @@ def recv_frame(sock: socket.socket, limit: int = MAX_FRAME_BYTES, deadline: floa
             pass  # closed meanwhile by another thread: what the read raised is the news
 
 
-def ping_msg() -> dict:
+def ping_msg(probe=None, echo=None) -> dict:
     """Sent by the sender while idle so a dead connection is detected quickly.
-    Carries no `seq` and must never be recorded as a processed input event."""
-    return {"type": MSG_PING, "data": {}}
+    Carries no `seq` and must never be recorded as a processed input event. Probe fields are
+    optional so older peers retain the original empty ping."""
+    data = {}
+    if probe is not None:
+        data["probe"] = probe
+    if echo is not None:
+        data["echo"] = echo
+    return {"type": MSG_PING, "data": data}
+
+
+def read_ping(message):
+    """Validated optional ping metadata, or None for a different or malformed message."""
+    parsed = read_message(message)
+    if parsed is None or parsed[0] != MSG_PING:
+        return None
+    data = parsed[1]
+    if "probe" in data and "echo" in data:
+        return None
+    result = {}
+    for field in ("probe", "echo"):
+        if field in data:
+            value = data[field]
+            if not _int(value, 1, 2**31 - 1):
+                return None
+            result[field] = value
+    return result
 
 
 def scroll_msg(dy, dx=0.0, mode: str = "line") -> dict:
@@ -409,6 +433,7 @@ TEXT_MAX_BYTES = 4096
 
 _PLATFORM_SHAPE = re.compile(r"[a-z0-9_]{1,16}")
 _HW_SHAPE = re.compile(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}")
+_DISPLAY_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 _PRINTABLE_ASCII = re.compile(r"[\x20-\x7e]+")
 # A lone surrogate can only reach a parsed string through a \u escape: UTF-8 cannot carry one.
 _SURROGATE_ESCAPE = re.compile(r"\\u[dD][89a-fA-F]")
@@ -464,6 +489,15 @@ def read_id(text):
     zero."""
     ident = _from_b64(text, MACHINE_ID_SIZE)
     return None if ident is None or ident == bytes(MACHINE_ID_SIZE) else ident
+
+
+def peer_id_text(ident):
+    """The wire text for a peer id held as bytes by Windows or text by macOS."""
+    if isinstance(ident, str):
+        if read_id(ident) is None:
+            raise ValueError("peer id is not canonical wire text")
+        return ident
+    return id_text(ident)
 
 
 def is_paired_token(token) -> bool:
@@ -917,7 +951,8 @@ def wrong_id_v6() -> dict:
     return {"type": MSG_WELCOME, "data": {"version": LINK_VERSION, "error": ERROR_WRONG_ID}}
 
 
-def focus_v6(route: int, target: bytes, edge: str = None, offset: float = None, resistance_px: int = None, reach=None, stay: bool = False) -> dict:
+def focus_v6(route: int, target: bytes, edge: str = None, offset: float = None, resistance_px: int = None,
+             reach=None, stay: bool = False, display: str = None, side: str = None) -> dict:
     """A `focus`. Leave everything but `route` and `target` out to let go; pass `reach` (and
     `resistance_px`) to take, with `edge` and `offset` for a zone, or with `stay` to re-arm."""
     data = {"route": route, "target": id_text(target)}
@@ -926,6 +961,11 @@ def focus_v6(route: int, target: bytes, edge: str = None, offset: float = None, 
     if edge is not None:
         data["edge"] = edge
         data["offset"] = offset
+    if (display is None) != (side is None):
+        raise ValueError("display and side go together")
+    if display is not None:
+        data["display"] = display
+        data["side"] = side
     if resistance_px is not None:
         data["resistance_px"] = resistance_px
     if reach is not None:
@@ -952,7 +992,7 @@ def read_focus(message, own_id: bytes):
         return None
     here = target == bytes(own_id)
     focus = {"route": route, "target": target, "here": here, "malformed": False, "edge": None, "offset": None,
-             "resistance_px": DEFAULT_RESISTANCE_PX, "reach": [], "stay": False}
+             "display": None, "side": None, "resistance_px": DEFAULT_RESISTANCE_PX, "reach": [], "stay": False}
     if not here:
         return None if getattr(message, "malformed", False) else focus
     malformed = getattr(message, "malformed", False)
@@ -962,6 +1002,12 @@ def read_focus(message, own_id: bytes):
     if not focus["stay"] and ("edge" in data or "offset" in data):
         if _one_of(data.get("edge"), EDGES) and _number(data.get("offset"), -math.inf, math.inf):
             focus["edge"], focus["offset"] = data["edge"], _clamp_offset(data["offset"])
+        else:
+            malformed = True
+    if "display" in data or "side" in data:
+        display, side = data.get("display"), data.get("side")
+        if isinstance(display, str) and display.isascii() and _DISPLAY_KEY.fullmatch(display) and side in EDGES:
+            focus["display"], focus["side"] = display, side
         else:
             malformed = True
     if "resistance_px" in data:
@@ -1028,13 +1074,19 @@ def read_accepts(message):
     return {"accepts": parsed[1]["accepts"]}
 
 
-def switch_v6(route: int, next_id: bytes, edge: str = None, offset: float = None) -> dict:
+def switch_v6(route: int, next_id: bytes, edge: str = None, offset: float = None,
+              display: str = None, side: str = None) -> dict:
     data = {"route": route, "next": id_text(next_id)}
     if (edge is None) != (offset is None):
         raise ValueError("edge and offset go together")
     if edge is not None:
         data["edge"] = edge
         data["offset"] = offset
+    if (display is None) != (side is None):
+        raise ValueError("display and side go together")
+    if display is not None:
+        data["display"] = display
+        data["side"] = side
     return {"type": MSG_SWITCH, "data": data}
 
 
@@ -1051,7 +1103,14 @@ def read_switch(message):
         if not _one_of(data.get("edge"), EDGES) or not _number(data.get("offset"), -math.inf, math.inf):
             return None
         edge, offset = data["edge"], _clamp_offset(data["offset"])
-    return {"route": route, "next": next_id, "edge": edge, "offset": offset}
+    display = side = None
+    if "display" in data or "side" in data:
+        display, side = data.get("display"), data.get("side")
+        if (not isinstance(display, str) or not display.isascii() or not _DISPLAY_KEY.fullmatch(display)
+                or side not in EDGES):
+            return None
+    return {"route": route, "next": next_id, "edge": edge, "offset": offset,
+            "display": display, "side": side}
 
 
 def ack_v6(seq: int, held_us: int, locked: bool = False) -> dict:

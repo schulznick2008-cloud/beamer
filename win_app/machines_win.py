@@ -4,12 +4,15 @@ them and gives each the one function it calls back."""
 
 from __future__ import annotations
 
+import math
+import sys
 from typing import Callable, Optional
 
-from PySide6.QtCore import QPointF, QRectF, QRegularExpression, QSize, Qt
+from PySide6.QtCore import QPointF, QRectF, QRegularExpression, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetricsF, QPainter, QPen, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QBoxLayout,
     QHBoxLayout,
     QLabel,
@@ -57,13 +60,15 @@ class _PairCodeCells:
 
     def _cell_rectangles(self) -> list[QRectF]:
         metrics = QFontMetricsF(self.font())
-        width = max(34.0, metrics.horizontalAdvance("0") + CODE_CELL_PAD_X * 2)
-        height = min(max(40.0, metrics.height() + CODE_CELL_PAD_Y * 2), float(self.height()))
+        # Whole pixels: glyphs land on the pixel grid, so a fractional cell pitch walked each digit
+        # further off its cell's centre, up to a pixel and a half by the sixth (09-10-2026).
+        width = float(math.ceil(max(34.0, metrics.horizontalAdvance("0") + CODE_CELL_PAD_X * 2)))
+        height = min(float(math.ceil(max(40.0, metrics.height() + CODE_CELL_PAD_Y * 2))), float(self.height()))
         advances = [width + CODE_CELL_GAP] * 6
         advances[2] += CODE_GROUP_GAP
         group_width = sum(advances) - CODE_CELL_GAP
-        x = (self.width() - group_width) / 2
-        y = (self.height() - height) / 2
+        x = float(round((self.width() - group_width) / 2))
+        y = float(round((self.height() - height) / 2))
         cells = []
         for index in range(6):
             cells.append(QRectF(x, y, width, height))
@@ -73,16 +78,36 @@ class _PairCodeCells:
     def digit_cells(self) -> list[QRectF]:
         return [cell.adjusted(1, 1, -1, -1) for cell in self._cell_rectangles()]
 
+    def caret_rect(self, position: int) -> QRectF:
+        metrics = QFontMetricsF(self.font())
+        digits = "".join(character for character in self.text() if character.isdigit())[:CODE_DIGITS]
+        cells = self._cell_rectangles()
+        position = min(len(digits), max(0, position))
+        # In the cell the next digit lands in, the one painted with the signal border; only a full code
+        # puts it after the sixth digit. rc14 put it after the last digit, a cell behind (10-10-2026).
+        if position < CODE_DIGITS:
+            index = position
+            glyph = digits[index] if index < len(digits) else "0"
+            cursor_x = cells[index].center().x() - metrics.horizontalAdvance(glyph) / 2
+        else:
+            index = CODE_DIGITS - 1
+            cursor_x = cells[index].center().x() + metrics.horizontalAdvance(digits[index]) / 2
+        cell = cells[index]
+        return QRectF(cursor_x, cell.top() + 8, 1, max(0, cell.height() - 16))
+
     def _paint_digits(self, painter: QPainter, text: str, selected: tuple[int, int] = (0, 0), focused: bool = False) -> None:
         metrics = QFontMetricsF(self.font())
         digits = "".join(character for character in text if character.isdigit())[:6]
         cells = self._cell_rectangles()
         inner = self.digit_cells()
         start, length = selected
+        # The cell the caret is in: where the next digit goes, with the cursor moved back too.
+        current = min(5, len(digits), self.cursorPosition()) if focused else None
         for index, (cell, ink_box) in enumerate(zip(cells, inner)):
             painter.setBrush(QColor(theme.colour("ground")))
-            painter.setPen(QPen(QColor(theme.colour("signal" if focused and index == min(5, len(digits)) else "edge")), 1))
-            painter.drawRoundedRect(cell, 4, 4)
+            painter.setPen(QPen(QColor(theme.colour("signal" if index == current else "edge")), 1))
+            # Half a pixel in, so the 1 px border sits on whole pixels, inside the widget.
+            painter.drawRoundedRect(cell.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
             if start <= index < start + length:
                 painter.fillRect(ink_box, QColor(theme.colour("signal_dim")))
             if index >= len(digits):
@@ -90,17 +115,13 @@ class _PairCodeCells:
             character = digits[index]
             bounds = metrics.tightBoundingRect(character)
             centre = ink_box.center()
-            baseline = QPointF(centre.x() - bounds.center().x(), centre.y() - bounds.center().y())
+            baseline = QPointF(round(centre.x() - bounds.center().x()), round(centre.y() - bounds.center().y()))
             painter.setPen(QColor(theme.colour("ink")))
             painter.drawText(baseline, character)
         if focused and length == 0:
-            index = min(5, max(0, self.cursorPosition()))
-            cell = cells[index]
-            cursor_x = cell.left() + (cell.width() + metrics.horizontalAdvance("0")) / 2
-            if index < len(digits):
-                cursor_x = cell.center().x() - metrics.horizontalAdvance(digits[index]) / 2
+            caret = self.caret_rect(self.cursorPosition())
             painter.setPen(QPen(QColor(theme.colour("signal")), 1))
-            painter.drawLine(QPointF(cursor_x, cell.top() + 8), QPointF(cursor_x, cell.bottom() - 8))
+            painter.drawLine(caret.topLeft(), caret.bottomLeft())
 
 
 class PairCodeEdit(QLineEdit, _PairCodeCells):
@@ -114,6 +135,20 @@ class PairCodeEdit(QLineEdit, _PairCodeCells):
         self._mouse_anchor = 0
         self._mouse_selecting = False
         self._double_clicked = False
+
+    def inputMethodQuery(self, query, argument=None):
+        if query == Qt.InputMethodQuery.ImCursorRectangle:
+            return self.caret_rect(self.cursorPosition()).toRect()
+        if query == Qt.InputMethodQuery.ImAnchorRectangle:
+            position = self.cursorPosition()
+            if self.hasSelectedText():
+                start = self.selectionStart()
+                end = start + len(self.selectedText())
+                position = end if position == start else start
+            return self.caret_rect(position).toRect()
+        if argument is None:
+            return super().inputMethodQuery(query)
+        return super().inputMethodQuery(query, argument)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -177,6 +212,22 @@ class PairCodeEdit(QLineEdit, _PairCodeCells):
             self.setCursorPosition(position)
         else:
             self.setSelection(self._mouse_anchor, position - self._mouse_anchor)
+
+
+class RenameEdit(QLineEdit):
+    saved = Signal(str)
+    cancelled = Signal()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancelled.emit()
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.saved.emit(self.text())
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class PairCodeLabel(QLabel, _PairCodeCells):
@@ -280,12 +331,19 @@ class PairCodeLabel(QLabel, _PairCodeCells):
 class PeerRow(QWidget):
     """One paired machine: its name and state, use switch, direction disclosure and Remove."""
 
-    def __init__(self, token: str, on_send: Callable, on_allow: Callable, on_in_use: Callable, on_remove: Callable) -> None:
+    def __init__(self, token: str, on_send: Callable, on_allow: Callable, on_in_use: Callable,
+                 on_left_out: Callable, on_remove: Callable, on_rename: Optional[Callable] = None,
+                 on_cycle: Optional[Callable] = None, on_repair: Optional[Callable] = None) -> None:
         super().__init__()
         self.setProperty("vernier", "plain")
         self.token = token
+        self._left_out = False
         self._phone = False
         self._on_remove = on_remove
+        self._on_rename = on_rename or (lambda *_: None)
+        self._on_repair = on_repair or (lambda *_: None)
+        self._entry = {}
+        self._same_on = False
         column = QVBoxLayout(self)
         column.setContentsMargins(0, 0, 0, 8)
         column.setSpacing(6)
@@ -304,17 +362,42 @@ class PeerRow(QWidget):
         name_layout.addWidget(self.led, 0, Qt.AlignmentFlag.AlignVCenter)
         self.name = widgets.label("", "tile-name", wrap=True)
         name_layout.addWidget(self.name, 1)
+        self.rename_button = _button("Rename", "small")
+        self.rename_button.setMinimumWidth(self.rename_button.sizeHint().width())
+        self.rename_button.clicked.connect(self._begin_rename)
+        name_layout.addWidget(self.rename_button)
         head.addWidget(name_line, 1)
+        self.rename_edit = RenameEdit()
+        self.rename_edit.saved.connect(self._save_rename)
+        self.rename_edit.cancelled.connect(self._cancel_rename)
+        self.rename_edit.setVisible(False)
+        self.rename_note = widgets.label("", "note-quiet", wrap=True)
+        self.rename_note.setVisible(False)
         self.word = widgets.label("", "readout")
         head.addWidget(self.word)
         column.addLayout(head)
+        column.addWidget(self.rename_edit)
+        column.addWidget(self.rename_note)
         self.where = widgets.label("", "note-quiet", wrap=True)
         column.addWidget(self.where)
         self.detail = widgets.label("", "note", wrap=True)
         column.addWidget(self.detail)
+        self.repair_button = _button("Re-pair", "small")
+        self.repair_button.clicked.connect(lambda: self._on_repair(self.token))
+        column.addWidget(self.repair_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.left_out_note = widgets.label("Left out of the layout. The shortcut and the menu still reach it.",
+                                           "note-quiet", wrap=True)
+        self.left_out_note.setVisible(False)
+        column.addWidget(self.left_out_note)
+        self.shortcut_cycle = QCheckBox("In the shortcut's cycle")
+        self.shortcut_cycle.setVisible(False)
+        self.shortcut_cycle.toggled.connect(lambda enabled: (on_cycle or (lambda *_: None))(self._entry.get("id"), enabled))
+        column.addWidget(self.shortcut_cycle)
         self.in_use = widgets.Switch("In use")
         self.in_use.toggled.connect(lambda on: on_in_use(self.token, on))
         self.in_use.setToolTip("Off on this PC: no input or settings link to this machine. Pairing, directions, ways and jump key are kept. Turn it back on here to reconnect.")
+        self.left_out = _button("Leave out", "small")
+        self.left_out.clicked.connect(lambda: on_left_out(self.token, not self._left_out))
         self.send = widgets.Switch("This PC drives it")
         self.send.setToolTip("Input moves only when this PC enables this switch and the other machine enables It drives this PC.")
         self.allow = widgets.Switch("It drives this PC")
@@ -346,6 +429,7 @@ class PeerRow(QWidget):
         controls.addStretch(1)
         controls.addWidget(self.in_use)
         controls.addWidget(self.directions)
+        controls.addWidget(self.left_out)
         controls.addWidget(self.remove_button, 0, Qt.AlignmentFlag.AlignBottom)
         self.controls = controls
         column.addLayout(controls)
@@ -379,19 +463,62 @@ class PeerRow(QWidget):
         self.head.setDirection(direction)
         self.head.setAlignment(self.word, Qt.AlignmentFlag.AlignRight if wide else Qt.AlignmentFlag.AlignLeft)
         self.controls.setDirection(direction)
-        for control in (self.in_use, self.directions, self.remove_button):
+        for control in (self.in_use, self.directions, self.left_out, self.remove_button):
             self.controls.setAlignment(control, Qt.AlignmentFlag.AlignRight if wide else Qt.AlignmentFlag.AlignLeft)
 
     def _ask(self, asking: bool) -> None:
         self.confirm.setVisible(asking)
         self.remove_button.setVisible(not asking)
         self.in_use.setVisible(not asking)
+        self.left_out.setVisible(not asking and not self._phone)
         self.directions.setVisible(not asking and not self._phone)
         self.direction_group.setVisible(not asking and not self._phone and self.directions.isChecked())
 
-    def refresh(self, entry: dict, label: str, state, where: str) -> None:
-        self._phone = entry.get("port") == 0
+    def _begin_rename(self) -> None:
+        self.rename_edit.setText(self._entry.get("label", "") or self._entry.get("name", ""))
+        self.name.setVisible(False)
+        self.rename_button.setVisible(False)
+        self.rename_edit.setVisible(True)
+        self.rename_note.setText("Only on this computer" if self._same_on is False and sys.platform.startswith("linux")
+                                 else "Only on this PC")
+        self.rename_note.setVisible(not self._same_on)
+        self.rename_edit.setFocus()
+        self.rename_edit.selectAll()
+
+    def _save_rename(self, text: str) -> None:
+        self._on_rename(self.token, text)
+        self._cancel_rename()
+
+    def _cancel_rename(self) -> None:
+        self.rename_edit.clearFocus()
+        self.rename_edit.setVisible(False)
+        self.rename_note.setVisible(False)
+        self.name.setVisible(True)
+        self.rename_button.setVisible(True)
+
+    def refresh(self, entry: dict, label: str, state, where: str, same_on: bool = False,
+                *, cycle_mode: str) -> None:
         asking = self.confirm.isVisibleTo(self)
+        seen = (repr(entry), label, state, where, same_on, cycle_mode, asking, self.directions.isChecked())
+        if seen == getattr(self, "_refresh_seen", None):
+            return
+        self._refresh_seen = seen
+        self._phone = entry.get("port") == 0
+        self._entry = entry
+        self._same_on = same_on
+        self._left_out = entry.get("left_out") is True
+        dormant = peerlist.dormant_reason(entry) is not None
+        self.shortcut_cycle.setVisible(not self._phone and cycle_mode == "ticked")
+        self.shortcut_cycle.setEnabled(entry.get("in_use", True) is True and not dormant)
+        self.shortcut_cycle.blockSignals(True)
+        self.shortcut_cycle.setChecked(entry.get("shortcut_cycle", True))
+        self.shortcut_cycle.blockSignals(False)
+        self.repair_button.setVisible(dormant)
+        self.repair_button.setAccessibleName(f"Re-pair {label}")
+        self.left_out.setVisible(not self._phone and not asking)
+        self.left_out.setText("Put back" if self._left_out else "Leave out")
+        self.left_out.setAccessibleName(f"{'Put back' if self._left_out else 'Leave out'} {label}")
+        self.left_out_note.setVisible(self._left_out)
         self.directions.setVisible(not self._phone and not asking)
         self.direction_group.setVisible(not self._phone and not asking and self.directions.isChecked())
         self.led.set_tone(state.tone)
@@ -417,9 +544,13 @@ class PeerRow(QWidget):
 class MachinesModule(widgets.Module):
     """The paired machines, one row each, and the button that opens the pairing sheet."""
 
-    def __init__(self, on_send: Callable, on_allow: Callable, on_in_use: Callable, on_remove: Callable, on_pair: Callable) -> None:
+    def __init__(self, on_send: Callable, on_allow: Callable, on_in_use: Callable, on_left_out: Callable,
+                 on_remove: Callable, on_pair: Callable, on_rename: Optional[Callable] = None,
+                 on_cycle: Optional[Callable] = None, on_repair: Optional[Callable] = None) -> None:
         super().__init__("Machines")
-        self._callbacks = (on_send, on_allow, on_in_use, on_remove)
+        self._callbacks = (on_send, on_allow, on_in_use, on_left_out, on_remove,
+                           on_rename or (lambda *_: None), on_cycle,
+                           on_repair or (lambda *_: None))
         self.rows: dict = {}
         self.rows_layout = QVBoxLayout()
         self.rows_layout.setContentsMargins(0, 0, 0, 0)
@@ -431,7 +562,7 @@ class MachinesModule(widgets.Module):
         self.empty = widgets.label(EMPTY, "note", wrap=True)
         self.body.addWidget(self.empty)
 
-    def set_peers(self, items: list) -> None:
+    def set_peers(self, items: list, same_on: bool = False, *, cycle_mode: str) -> None:
         """`items`: (entry, label, state, where) for each paired machine, in the order to show them."""
         tokens = [entry["token"] for entry, *_ in items]
         for token in [held for held in self.rows if held not in tokens]:
@@ -447,7 +578,7 @@ class MachinesModule(widgets.Module):
             elif self.rows_layout.indexOf(row) != index:
                 self.rows_layout.removeWidget(row)
                 self.rows_layout.insertWidget(index, row)
-            row.refresh(entry, label, state, where)
+            row.refresh(entry, label, state, where, same_on, cycle_mode=cycle_mode)
             row.divider.setVisible(index > 0)
         self.empty.setVisible(not items)
 
@@ -679,6 +810,14 @@ class PairingSheet(widgets.Module):
         return None
 
     def _pick(self, address: str) -> None:
+        button = next((candidate for candidate in self.group.buttons()
+                       if candidate.property("address") == address), None)
+        self.group.setExclusive(False)
+        for candidate in self.group.buttons():
+            candidate.setChecked(False)
+        self.group.setExclusive(True)
+        if button is not None:
+            button.setChecked(True)
         self.address.clear()
         self._on_pick(next((item for item in self._machines if item["address"] == address), None))
         self._refresh_pair_button()

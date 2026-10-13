@@ -87,6 +87,10 @@ def monitors() -> List[Rect]:
         return [Rect(0, 0, geometry.width, geometry.height)]
 
 
+def display_map() -> dict:
+    return {str(index): rect for index, rect in enumerate(monitors())}
+
+
 def cursor_position() -> Tuple[int, int]:
     with _session() as conn:
         pointer = conn.root.query_pointer()

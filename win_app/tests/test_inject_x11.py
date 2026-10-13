@@ -69,6 +69,10 @@ class NamedKeyTest(unittest.TestCase):
         self.assertEqual(plan("f24"), [(PRESS, 202)])
         self.assertEqual(plan("media_play_pause"), [(PRESS, 172)])
 
+    def test_search_intents_open_the_gnome_activities_key(self):
+        self.assertEqual(plan("spotlight"), [(PRESS, 133)])
+        self.assertEqual(plan("spotlight", down=False), [(RELEASE, 133)])
+
     def test_the_server_repeats_a_held_named_key(self):
         state = KeyState()
         self.assertEqual(plan("backspace", state=state), [(PRESS, 22)])

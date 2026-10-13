@@ -12,6 +12,7 @@ threads, so nothing here hops to the main thread from those.
 """
 
 import re
+import socket
 import threading
 
 import AppKit
@@ -37,6 +38,17 @@ def seconds(count):
     return f"Expires in {count} s"
 
 
+class _RenameDelegate(AppKit.NSObject):
+    def control_textView_doCommandBySelector_(self, control, _text_view, selector):
+        if selector == "insertNewline:":
+            self.panel._save_rename(self.token, control.stringValue())
+            return True
+        if selector == "cancelOperation:":
+            self.panel._cancel_rename(self.token)
+            return True
+        return False
+
+
 class MachinesPanel:
     def __init__(self, controller, settings_store, logger, owner):
         self.controller = controller
@@ -53,6 +65,8 @@ class MachinesPanel:
         self.wide = True
         self._targets = []
         self._rows_key = None
+        self._rename_views = {}
+        self._cycle_controls = {}
         self.directions_open = set()
         self._heard_key = None
         self._heard = []
@@ -81,6 +95,32 @@ class MachinesPanel:
         self.list_note = widgets.note("Beamer connects to each machine on its own whenever both are running.", reading=False)
         line.addArrangedSubview_(self.list_note.view)
         module.add(line)
+        return module
+
+    def own_name_module(self):
+        module = widgets.Module()
+        module.add(widgets.eyebrow("This Mac"))
+        line = widgets.stack(vertical=False, spacing=9)
+        own_name = self.settings_store.current().get("name", "")
+        name = widgets.Label(own_name or socket.gethostname().split(".")[0] or "Mac",
+                             theme.TYPE["body"], 600)
+        widgets.squeeze(name.view)
+        line.addArrangedSubview_(name.view)
+        rename = self._chip("Rename", lambda: self._begin_rename(None), "Rename this Mac")
+        line.addArrangedSubview_(rename)
+        module.add(line)
+        box, edit = widgets.field(mono=False)
+        edit.setAccessibilityLabel_("Name for this Mac")
+        edit.setStringValue_(own_name)
+        box.setHidden_(True)
+        note = widgets.note("Only on this Mac", reading=False)
+        note.view.setHidden_(True)
+        delegate = _RenameDelegate.alloc().init()
+        delegate.panel, delegate.token = self, None
+        edit.setDelegate_(delegate)
+        module.add(box)
+        module.add(note.view)
+        self._own_rename_views = (name.view, rename, box, edit, note, delegate)
         return module
 
     def _sheet(self):
@@ -213,9 +253,13 @@ class MachinesPanel:
         # and a rebuild takes keyboard and VoiceOver focus off whatever it was on.
         key = (hide, self.removing, self.wide, tuple(
             (r.token, r.label, r.platform, r.address, r.state.key, r.state.word, r.state.tone, r.state.led,
-             r.in_use, r.drives, r.driven)
+             r.state.detail if r.state.key == "dormant" else "",
+             r.in_use, r.left_out, r.drives, r.driven)
             for r in rows))
         key += (tuple(sorted(self.directions_open)),)
+        mode = getattr(getattr(self.owner, "shortcut_goes_to", None), "value", "last")
+        key += (mode, tuple((entry.get("token"), entry.get("shortcut_cycle") is not False)
+                            for entry in self.controller.book.peers()))
         if key != self._rows_key:
             self._rows_key = key
             self._build_rows(rows)
@@ -231,6 +275,7 @@ class MachinesPanel:
             self._cancel_code()
 
     def _build_rows(self, rows):
+        self._cycle_controls = {}
         focus = self._focus_after or self._focused_control()
         self._focus_after = None
         for view in list(self.list.arrangedSubviews()):
@@ -272,22 +317,53 @@ class MachinesPanel:
         head.addArrangedSubview_(led.view)
         name = widgets.Label(label, theme.TYPE["body"], 600, wrap=True)
         head.addArrangedSubview_(widgets.hug(widgets.squeeze(name.view), AppKit.NSLayoutPriorityDefaultLow))
-        tag = widgets.Label(self._shown(state.word), theme.TYPE["eyebrow"], 700, state.tone, tracking=theme.TRACKING["eyebrow"], upper=True)
+        rename = self._chip("Rename", lambda t=row.token: self._begin_rename(t), f"Rename {label}")
+        head.addArrangedSubview_(rename)
+        tag = widgets.Label(self._shown(state.word), theme.TYPE["eyebrow"], 700, state.tone,
+                            tracking=theme.TRACKING["eyebrow"], upper=state.key != "dormant")
         if self.wide:
             head.addArrangedSubview_(tag.view)
         widgets.add(body, head)
         if not self.wide:
             widgets.add(body, tag.view)
         remove = self._removal(row)
+        repair = (self._chip("Re-pair", lambda t=row.token: self.re_pair(t), f"Re-pair {label}")
+                  if state.key == "dormant" else None)
         where = row.platform if row.phone else "  ".join((row.platform, self._shown(row.address)))
         widgets.add(body, widgets.Label(where, theme.TYPE["small"], ink="ink_3", wrap=True).view)
+        if row.left_out:
+            widgets.add(body, widgets.note("Left out of the layout. The shortcut and the menu still reach it.").view)
         widgets.add(body, widgets.note(self._shown(state.detail)).view)
+        entry = next((item for item in self.controller.book.peers() if item.get("token") == row.token), {})
+        if not row.phone and getattr(getattr(self.owner, "shortcut_goes_to", None), "value", "last") == "ticked":
+            cycle = widgets.Switch("In the shortcut's cycle",
+                                   on_change=lambda on, peer=entry.get("id"): self.owner._set_shortcut_cycle(peer, on))
+            cycle.value = entry.get("shortcut_cycle") is not False
+            cycle.set_enabled(row.in_use)
+            cycle.view.focus_id = (row.token, "shortcut_cycle")
+            self._cycle_controls[row.token] = cycle
+            widgets.add(body, cycle.view)
+        edit_box, edit = widgets.field(mono=False)
+        edit.setAccessibilityLabel_(f"Name for {label}")
+        edit.setStringValue_(entry.get("label", "") or entry.get("name", ""))
+        edit_box.setHidden_(True)
+        delegate = _RenameDelegate.alloc().init()
+        delegate.panel, delegate.token = self, row.token
+        edit.setDelegate_(delegate)
+        note = widgets.note("Only on this Mac", reading=False)
+        note.view.setHidden_(True)
+        self._rename_views[row.token] = (name.view, rename, edit_box, edit, note, delegate)
+        widgets.add(body, edit_box)
+        widgets.add(body, note.view)
         in_use = widgets.Switch("In use", on_change=lambda on, t=row.token: self._direction(t, in_use=on))
         in_use.value = row.in_use
         in_use.view.setToolTip_(f"Off: no input or settings link to {label}. Pairing, directions, ways and jump key are kept. Turn it back on here to reconnect.")
         if row.phone:
             in_use.view.setToolTip_(f"Off: {label} cannot connect or drive this Mac. Turn it back on here to reconnect.")
         in_use.view.focus_id = (row.token, "in_use")
+        left_out = self._chip("Put back" if row.left_out else "Leave out",
+                              lambda out=not row.left_out, t=row.token: self._left_out(t, out),
+                              f"{'Put back' if row.left_out else 'Leave out'} {label}", (row.token, "left_out"))
         drives = widgets.Switch("This Mac drives it", on_change=lambda on, t=row.token: self._direction(t, send=on))
         drives.value = row.drives
         drives.view.setToolTip_(f"Input moves only when this Mac enables this switch and {label} enables It drives this Mac.")
@@ -300,10 +376,41 @@ class MachinesPanel:
         disclosure = self._chip("Hide directions" if opened else "Directions", lambda t=row.token: self._toggle_directions(t),
                                 f"{'Hide' if opened else 'Show'} directions for {label}",
                                 (row.token, "directions"))
-        widgets.add(body, self._controls(row, in_use, disclosure, drives, driven, remove))
+        widgets.add(body, self._controls(row, in_use, left_out, disclosure, drives, driven, remove, repair))
         frame.addSubview_(body)
         widgets.pin(body, frame, (10, 12, 10, 12))
         return frame
+
+    def _begin_rename(self, token):
+        views = self._own_rename_views if token is None else self._rename_views.get(token)
+        if views is None:
+            return
+        name, button, box, edit, note, _delegate = views
+        if token is None:
+            edit.setStringValue_(self.settings_store.current().get("name", ""))
+        else:
+            entry = next((peer for peer in self.controller.book.peers() if peer.get("token") == token), {})
+            edit.setStringValue_(entry.get("label", "") or entry.get("name", ""))
+        name.setHidden_(True)
+        button.setHidden_(True)
+        box.setHidden_(False)
+        note.view.setHidden_(self.controller.cfg.same_on_both and "names" in self.controller.cfg.same_groups)
+        self.owner.window.makeFirstResponder_(edit)
+        edit.selectText_(None)
+
+    def _save_rename(self, token, text):
+        self.owner._rename_own(text) if token is None else self.owner._rename_peer(token, text)
+        self._cancel_rename(token)
+
+    def _cancel_rename(self, token):
+        views = self._own_rename_views if token is None else self._rename_views.get(token)
+        if views is None:
+            return
+        name, button, box, _edit, note, _delegate = views
+        name.setHidden_(False)
+        button.setHidden_(False)
+        box.setHidden_(True)
+        note.view.setHidden_(True)
 
     def _chip(self, text, callback, label, focus_id=None):
         chip = widgets.pressable(callback, "well", "edge", theme.RADIUS["field"])
@@ -314,7 +421,7 @@ class MachinesPanel:
         widgets.pin(word.view, chip, (6, 12, 6, 12))
         return chip
 
-    def _controls(self, row, in_use, disclosure, drives, driven, remove):
+    def _controls(self, row, in_use, left_out, disclosure, drives, driven, remove, repair=None):
         """The machine switch leads; its two direction switches stay under their disclosure."""
         if self.removing == row.token:
             column = widgets.stack(spacing=6)
@@ -326,7 +433,11 @@ class MachinesPanel:
             line.setAlignment_(AppKit.NSLayoutAttributeTrailing)
         if self.wide:
             line.addArrangedSubview_(widgets.hug(widgets.box(), AppKit.NSLayoutPriorityDefaultLow))
+        if repair is not None:
+            line.addArrangedSubview_(repair)
         widgets.add(line, in_use.view, full_width=not self.wide)
+        if not row.phone:
+            line.addArrangedSubview_(left_out)
         if not row.phone:
             line.addArrangedSubview_(disclosure)
         line.addArrangedSubview_(remove)
@@ -379,7 +490,7 @@ class MachinesPanel:
             self.refresh()
             return
         if removed is not None:
-            self.logger.info("removed %s", removed.get("name") or "a machine")
+            self.logger.info("removed %s", peerlist.label_for([removed], token=token) or "a machine")
         self.owner.peers_changed()
         after = core_ways.way_back_state(self.settings_store.current())
         changed_peers = [peer for peer, state in after.items() if before.get(peer) != state]
@@ -392,6 +503,12 @@ class MachinesPanel:
             handler(token, **change)
         self.refresh()
 
+    def _left_out(self, token, enabled):
+        handler = self.owner.left_out_handler
+        if handler is not None:
+            handler(token, enabled)
+        self.refresh()
+
     # The sheet
 
     def _toggle_sheet(self):
@@ -399,6 +516,21 @@ class MachinesPanel:
         if not self.open:
             self._leave_sheet()
         self.refresh()
+
+    def re_pair(self, token):
+        entry = next((item for item in self.controller.book.peers() if item.get("token") == token), None)
+        if entry is None:
+            return
+        self.open = True
+        self.chosen = None
+        for field in (self.find_field, self.find_secret):
+            field.setStringValue_("")
+        address = entry.get("host") or ""
+        field = self.find_secret if self.controller.cfg.hide_addresses else self.find_field
+        field.setStringValue_(address)
+        self._heard_key = None
+        self.refresh()
+        self.code_boxes.focus(self.owner.window)
 
     def _leave_sheet(self):
         self.code_boxes.clear()
@@ -662,7 +794,7 @@ class MachinesPanel:
             self._say(self._shown(peerlist.pairing_error_text(result, name)), "fault")
             return
         # The name the exchange proved, not the one a beacon claimed.
-        proved = result.get("name") or name
+        proved = peerlist.label_for(self.controller.book.peers(), token=result.get("token")) or name
         self.code_boxes.clear()
         for box_field in (self.find_field, self.find_secret):
             box_field.setStringValue_("")

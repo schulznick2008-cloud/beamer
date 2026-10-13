@@ -163,6 +163,9 @@ class Rig:
                                "auth_token": PAIRED_TOKEN, "pc_name": "PC"})
         settings = self.store.current()
         settings["peers"][0].update(id=protocol.id_text(PC_ID), from_1_4=False)
+        for zone in settings["zones"]:
+            if zone.get("peer") == "":
+                zone["peer"] = protocol.id_text(PC_ID)
         if side is not None:
             settings["peers"][0].update(side=side[0], side_set_at=side[1], side_by=self.mac_id_text)
         self.store.save_settings(settings)

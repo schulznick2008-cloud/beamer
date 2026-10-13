@@ -9,6 +9,7 @@ Windows is unchanged."""
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -99,7 +100,7 @@ def child(mode: str, config: Path) -> None:
         assert platform_parts.WAYLAND is True
         assert "only brings input back" in window.wayland_shortcut_note.text()
         assert not window.wayland_shortcut_note.isHidden()
-        assert window.hold_switch.isHidden() and window.crossing_rows["dragging"].isHidden()
+        assert window.hold_switch.isHidden() and window.pointer_module.isHidden()
         assert "full-screen" in window.wayland_crossing_note.text() and not window.wayland_crossing_note.isHidden()
         window._on_pressure("right", 0.7, False)
         window._on_arrival("edge", "left", 10.0, 10.0)
@@ -113,11 +114,19 @@ def child(mode: str, config: Path) -> None:
         original = kvm_bridge_win.WindowsApplication.start
 
         def start_then_quit(self):
+            if mode == "main":
+                assert self.isVisible() and self._startup_painted
+            else:
+                # --hidden still shows the window when there is no tray to find it in.
+                assert self.isVisible() == (not self.tray_available) and not self._startup_painted
+            assert not QApplication.startingUp()
             original(self)
             QTimer.singleShot(200, QApplication.quit)
 
         kvm_bridge_win.WindowsApplication.start = start_then_quit
-        sys.argv = ["beamer", "--config", str(config), "--hidden"]
+        sys.argv = ["beamer", "--config", str(config)]
+        if mode == "main-hidden":
+            sys.argv.append("--hidden")
         try:
             kvm_bridge_win.main()
         except SystemExit as exit_:
@@ -190,13 +199,20 @@ class LinuxStartTest(unittest.TestCase):
             }))
             env = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_CONFIG_HOME=directory, XDG_SESSION_TYPE="wayland")
             env.pop("LOCALAPPDATA", None)
-            for mode in ("window", "main"):
+            for mode in ("window", "main", "main-hidden"):
                 done = subprocess.run(
                     [sys.executable, str(Path(__file__).resolve()), mode, str(config)],
                     env=env, capture_output=True, text=True, timeout=120,
                 )
                 self.assertEqual(done.returncode, 0, mode + done.stdout + done.stderr)
                 self.assertIn("ok", done.stdout)
+                if mode == "main":
+                    log = Path(directory) / "Beamer" / "Beamer.log"
+                    measurement = re.search(
+                        r"Window painted (\d+\.\d{3}) seconds after process start", log.read_text()
+                    )
+                    self.assertIsNotNone(measurement)
+                    print(f"Offscreen source first paint: {measurement.group(1)} seconds")
 
     @unittest.skipIf(sys.platform == "win32", "a faked platform breaks the Windows stdlib")
     def test_on_x11_the_x11_parts_start_and_the_receiver_listens(self):

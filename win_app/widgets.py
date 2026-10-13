@@ -3,7 +3,11 @@ LED, the 60-segment countdown and the switch."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, QRect, QRectF, QSignalBlocker, QSize, Qt
+import math
+
+from shiboken6 import isValid
+
+from PySide6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, QSignalBlocker, QSize, Qt
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -78,6 +82,9 @@ class _KeyboardNavigation(QObject):
 
     def eventFilter(self, watched, event) -> bool:
         kind = event.type()
+        if kind not in (QEvent.Type.KeyPress, QEvent.Type.MouseButtonPress,
+                        QEvent.Type.MouseButtonDblClick, QEvent.Type.FocusIn):
+            return False
         if kind == QEvent.Type.KeyPress and is_navigation_key(event.key(), event.modifiers()):
             self.set(True)
         elif kind in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
@@ -314,15 +321,97 @@ class Eyebrow(QLabel):
 class Module(QFrame):
     """One `panel` cell in the rack, eyebrow first."""
 
-    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+    def __init__(self, title: str, parent: QWidget | None = None, *, heading=False) -> None:
         super().__init__(parent)
         self.setProperty("vernier", "module")
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(16, 16, 16, 16)
         self.body.setSpacing(12)
-        self.eyebrow = Eyebrow(title)
+        self.eyebrow = label(title, "body", wrap=True) if heading else Eyebrow(title)
+        if heading:
+            self.eyebrow.setFont(theme.font(tokens.TYPE["body"], 600))
         self.body.addWidget(self.eyebrow)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+
+
+class WayTile(QAbstractButton):
+    """A checkable way with its destination detail inside the same keyboard target."""
+
+    def __init__(self, title: str, detail: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setText(title)
+        self.setAccessibleName(title)
+        self.setCheckable(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setProperty("vernier", "plain")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        column = QVBoxLayout(self)
+        column.setContentsMargins(34, 8, 12, 8)
+        column.setSpacing(2)
+        self.title = label(title, "body", wrap=True)
+        self.title.setFont(theme.font(tokens.TYPE["body"], 600))
+        self.detail = label(detail, "small", wrap=True)
+        for item in (self.title, self.detail):
+            item.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            column.addWidget(item)
+        self.set_detail(detail)
+        self.toggled.connect(self.update)
+
+    def set_detail(self, text: str) -> None:
+        if self.detail.text() != text:
+            self.detail.setText(text)
+        if self.accessibleDescription() != text:
+            self.setAccessibleDescription(text)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(100, 52)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            painter.setOpacity(0.45)
+        painter.fillRect(self.rect(), QColor(theme.colour("ground")))
+        painter.setPen(QColor(theme.colour("signal" if focus_ring_visible(self) else "rule")))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        box = QRectF(12, 11, 14, 14)
+        painter.setPen(QColor(theme.colour("signal" if self.isChecked() else "edge")))
+        painter.setBrush(QColor(theme.colour("signal" if self.isChecked() else "well")))
+        painter.drawRoundedRect(box, 3, 3)
+        if self.isChecked():
+            painter.setPen(QPen(QColor(theme.colour("ground")), 2))
+            painter.drawLine(QPointF(15, 18), QPointF(18, 21))
+            painter.drawLine(QPointF(18, 21), QPointF(24, 14))
+
+
+class Figure(QLabel):
+    """A ruler value with a large numeral and a small unit on the same baseline."""
+
+    def __init__(self, text: str, parent=None) -> None:
+        super().__init__(text, parent)
+        self.setProperty("vernier", "plain")
+        self.setMinimumWidth(0)
+        self.setFixedHeight(64)
+
+    def sizeHint(self) -> QSize:
+        number, _, unit = self.text().partition(" ")
+        width = QFontMetrics(theme.mono_font(tokens.TYPE["numeral"])).horizontalAdvance(number)
+        width += 6 + QFontMetrics(theme.font(tokens.TYPE["small"])).horizontalAdvance(unit)
+        return QSize(width, 64)
+
+    def paintEvent(self, _event) -> None:
+        number, _, unit = self.text().partition(" ")
+        painter = QPainter(self)
+        font = theme.mono_font(tokens.TYPE["numeral"])
+        painter.setFont(font)
+        painter.setPen(QColor(theme.colour("ink")))
+        metrics = QFontMetrics(font)
+        baseline = metrics.ascent()
+        painter.drawText(0, baseline, number)
+        painter.setFont(theme.font(tokens.TYPE["small"]))
+        painter.setPen(QColor(theme.colour("ink_3")))
+        painter.drawText(metrics.horizontalAdvance(number) + 6, baseline, unit)
 
 
 class ActionButton(QPushButton):
@@ -374,12 +463,43 @@ class ActionButton(QPushButton):
         painter.drawControl(QStyle.ControlElement.CE_PushButton, option)
         content = self.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, self)
         if self.property("vernier") == "choice" and self.isChecked() and self.isEnabled():
-            painter.setPen(QColor(tokens.PALETTE["ground"]))
+            painter.setPen(QColor(theme.colour("ground")))
         elif self.property("vernier") in ("primary", "live") and self.isEnabled():
             painter.setPen(QColor(theme.colour("ground")))
         else:
             painter.setPen(option.palette.color(QPalette.ColorRole.ButtonText))
         painter.drawText(content, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.text())
+
+
+class ElidingActionButton(ActionButton):
+    """An ActionButton whose label names something of any length (a machine): one line, elided to
+    the width it has, the whole label in its tooltip."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.full_text = text
+
+    def set_full_text(self, text):
+        self.full_text = text
+        self._elide()
+
+    def _elide(self):
+        room = max(1, self.width() - self._chrome() - 2)
+        shown = QFontMetrics(self.font()).elidedText(self.full_text, Qt.TextElideMode.ElideRight, room)
+        if shown != self.text():
+            self.setText(shown)
+        self.setToolTip(self.full_text if shown != self.full_text else "")
+
+    def sizeHint(self):
+        width = min(self.maximumWidth(), max(64, self.fontMetrics().horizontalAdvance(self.full_text) + self._chrome() + 2))
+        return QSize(width, max(30, self.fontMetrics().height() + 12))
+
+    def heightForWidth(self, width):
+        return max(30, self.fontMetrics().height() + 12)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
 
 
 class FormRow(QWidget):
@@ -651,6 +771,9 @@ class Choice:
 
 
 class _TileOutline(QWidget):
+    CHECK_ROOM = 22
+    BADGE_SIZE = 16
+
     def __init__(self, tile):
         super().__init__(tile)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -666,12 +789,25 @@ class _TileOutline(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         if selected:
-            painter.setPen(QPen(QColor(theme.colour("signal")), 2))
+            signal = QColor(theme.colour("signal"))
+            painter.setPen(QPen(signal, 2))
             painter.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1),
                                     tokens.RADIUS["button"], tokens.RADIUS["button"])
-            x = self.width() - 20
-            painter.drawLine(x, 12, x + 3, 15)
-            painter.drawLine(x + 3, 15, x + 9, 8)
+            name = getattr(tile, "name_label", None)
+            if name is not None:
+                box = name.geometry()
+                metrics = name.fontMetrics()
+                text_top = box.y() + (box.height() - metrics.height()) / 2.0
+                middle = text_top + metrics.ascent() - metrics.xHeight() / 2.0
+                left = box.x()
+                badge = QRectF(left, middle - self.BADGE_SIZE / 2, self.BADGE_SIZE, self.BADGE_SIZE)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(signal)
+                painter.drawEllipse(badge)
+                painter.setPen(QPen(QColor(theme.colour("ground")), 2, Qt.PenStyle.SolidLine,
+                                    Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                painter.drawPolyline([QPointF(left + 3.5, middle), QPointF(left + 6.5, middle + 3),
+                                      QPointF(left + 12.5, middle - 4)])
         if focused:
             painter.setPen(QPen(QColor(theme.colour("ink")), 2))
             painter.drawRoundedRect(QRectF(self.rect()).adjusted(5, 5, -5, -5), 2, 2)
@@ -759,6 +895,7 @@ class ChoiceTiles:
                 row.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self._tiles: dict = {}
         self._titles: dict = {}
+        self._details: dict = {}
         for value, title, detail, preview in items:
             tile = _Tile(lambda v=value: self._chosen(v))
             if vertical:
@@ -768,6 +905,7 @@ class ChoiceTiles:
             if tile_width is not None:
                 tile.setFixedWidth(tile_width)
             self._titles[value] = title
+            self._details[value] = label(detail, "small", wrap=True)
             tile.setAccessibleName(title)
             tile.setAccessibleDescription(detail)
             column = QVBoxLayout(tile)
@@ -777,8 +915,10 @@ class ChoiceTiles:
             column.addWidget(preview)
             if not vertical:
                 column.addSpacing(4)
-            column.addWidget(label(title, "tile-name", wrap=tile_width is not None))
-            column.addWidget(label(detail, "small", wrap=True))
+            tile.name_label = label(title, "tile-name", wrap=tile_width is not None)
+            column.addWidget(tile.name_label)
+            tile.detail_label = self._details[value]
+            column.addWidget(tile.detail_label)
             if vertical:
                 column.setSpacing(6)
                 column.insertSpacing(1, 4)
@@ -789,6 +929,7 @@ class ChoiceTiles:
             else:
                 row.addWidget(tile, 0 if vertical or tile_width is not None else 1)
             self._tiles[value] = tile
+            tile.outline.raise_()
         self.set_value(current)
 
     def set_value(self, value) -> None:
@@ -797,6 +938,7 @@ class ChoiceTiles:
             with QSignalBlocker(tile):
                 tile.setChecked(candidate == value)
             set_role(tile, "tile-on" if candidate == value else "tile")
+            tile.name_label.setIndent(_TileOutline.CHECK_ROOM if candidate == value else 0)
             tile.outline.update()
             title = self._titles[candidate]
             tile.setAccessibleName(f"{title}, selected" if candidate == value else title)
@@ -804,10 +946,21 @@ class ChoiceTiles:
     def tile(self, value):
         return self._tiles.get(value)
 
+    def set_detail(self, value, detail: str) -> None:
+        if value in self._details and self._details[value].text() != detail:
+            self._details[value].setText(detail)
+            self._tiles[value].setAccessibleDescription(detail)
+
     def set_enabled(self, enabled: bool) -> None:
-        fade = QGraphicsOpacityEffect(self.view)
-        fade.setOpacity(1.0 if enabled else 0.45)
-        self.view.setGraphicsEffect(None if enabled else fade)
+        # The effect is built only when it will be installed: one parented to the view and never
+        # installed is never freed, and this runs on every refresh tick.
+        if enabled:
+            self.view.setGraphicsEffect(None)
+        elif not (isinstance(self.view.graphicsEffect(), QGraphicsOpacityEffect)
+                  and self.view.graphicsEffect().opacity() == 0.45):
+            fade = QGraphicsOpacityEffect(self.view)
+            fade.setOpacity(0.45)
+            self.view.setGraphicsEffect(fade)
         for tile in self._tiles.values():
             tile.setEnabled(enabled)
 
@@ -841,7 +994,9 @@ class _FamilyChoices(QWidget):
                    else (5 if outer >= 600 else 3 if outer >= 400 else 2))
         gap = 12 if self.kind == "style" else 8
         cell_width = max(1, (width - gap * (columns - 1) + columns - 1) // columns)
-        if len(self.cells) == 1:
+        # A lone style tile keeps the track its family's neighbours have: shrunk to 152 px it was the
+        # one tile on the page drawn at another size (the Aperture switch, alone in Light).
+        if len(self.cells) == 1 and self.kind != "style":
             columns, cell_width = 1, min(width, 152)
         if self.kind == "style":
             height = max(round(cell_width * 116 / 152), round((cell_width - 16) / 2) + 64)
@@ -869,7 +1024,7 @@ class _FamilyChoices(QWidget):
             room = self.width() - gap * (columns - 1)
             left = round(track * room / columns) + track * gap
             right = round((track + 1) * room / columns) + track * gap
-            if len(self.cells) == 1:
+            if len(self.cells) == 1 and self.kind != "style":
                 left, right = 0, width
             cell.setGeometry(left, (index // columns) * (height + gap), right - left, height)
             if self.kind == "style":
@@ -992,6 +1147,10 @@ class TileGroups:
 
     def tile(self, value):
         return next((tile for tiles in self.groups.values() if (tile := tiles.tile(value)) is not None), None)
+
+    def set_detail(self, value, detail: str) -> None:
+        for tiles in self.groups.values():
+            tiles.set_detail(value, detail)
 
     def set_value(self, value) -> None:
         self.value = value
@@ -1169,9 +1328,11 @@ class InputRecorder(ActionButton):
         QApplication.instance().installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:
+        kind = event.type()
+        if kind not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease, QEvent.Type.MouseButtonPress):
+            return False
         if not self.armed:
             return False
-        kind = event.type()
         if kind == QEvent.Type.KeyPress:
             vk = self.hook_vk(event.nativeVirtualKey(), event.nativeScanCode())
             if not vk:
@@ -1240,9 +1401,12 @@ class JumpKeyRecorder(ActionButton):
         self.value = value or ""
         shown = " ".join(self._names.get(part, part.upper() if len(part) == 1 else part.replace("_", " ").title())
                          for part in self.value.split("+")) if self.value else "Choose a key combination"
-        self.setAccessibleName(f"Jump straight here key, {shown}")
+        name = f"Jump straight here key, {shown}"
+        if self.accessibleName() != name:
+            self.setAccessibleName(name)
         if not self.armed:
-            self.key.setText(shown)
+            if self.key.text() != shown:
+                self.key.setText(shown)
             set_role(self.key, "keycap" if self.value else "body")
 
     def cancel(self) -> None:
@@ -1271,9 +1435,12 @@ class JumpKeyRecorder(ActionButton):
             self.on_arm(True)
 
     def eventFilter(self, watched, event) -> bool:
+        kind = event.type()
+        if kind not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease, QEvent.Type.MouseButtonPress):
+            return False
         if not self.armed:
             return False
-        if event.type() == QEvent.Type.KeyPress:
+        if kind == QEvent.Type.KeyPress:
             modifiers = event.modifiers()
             held = []
             for flag, name in ((Qt.KeyboardModifier.ControlModifier, "cmd"),
@@ -1299,9 +1466,9 @@ class JumpKeyRecorder(ActionButton):
                 self.set_value(chord)
                 self.on_record(chord)
             return True
-        if event.type() == QEvent.Type.KeyRelease:
+        if kind == QEvent.Type.KeyRelease:
             return True
-        if event.type() == QEvent.Type.MouseButtonPress:
+        if kind == QEvent.Type.MouseButtonPress:
             inside = isinstance(watched, QWidget) and (watched is self or self.isAncestorOf(watched))
             self.cancel()
             return inside
@@ -1415,8 +1582,17 @@ class Sidebar(QWidget):
         self._on_select = on_select
         self._selected = ""
         keyboard_navigation()
-        QApplication.instance().installEventFilter(self)
-        QApplication.instance().focusChanged.connect(self._focus_changed)
+        app = QApplication.instance()
+        app.installEventFilter(self)
+        focus_connection = app.focusChanged.connect(self._focus_changed)
+
+        def detach(destroyed):
+            if isValid(app):
+                # The destroyed signal supplies a valid QObject; the Sidebar wrapper is already invalid.
+                app.removeEventFilter(destroyed)
+                QObject.disconnect(focus_connection)
+
+        self.destroyed.connect(detach)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -1429,8 +1605,23 @@ class Sidebar(QWidget):
         self.link_led = Led()
         self._link_layout.addWidget(self.link_led, 0, Qt.AlignmentFlag.AlignVCenter)
         self.link_word = label("", "sidebar-link")
-        self._link_layout.addWidget(self.link_word, 1)
+        self.link_peer = label("", "note")
+        self._link_details = QWidget()
+        details_layout = QVBoxLayout(self._link_details)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(1)
+        details_layout.addWidget(self.link_word)
+        details_layout.addWidget(self.link_peer)
+        self._link_layout.addWidget(self._link_details, 1)
+        self.response_time = label("", "note")
+        self.response_time.setAccessibleName("Response time: no fresh measurement")
+        self.response_time.hide()
         outer.addWidget(link)
+        response_row = QHBoxLayout()
+        response_row.setContentsMargins(24, 0, 8, 6)
+        response_row.addWidget(self.response_time)
+        self._response_row = response_row
+        outer.addLayout(response_row)
         outer.addWidget(rule(vertical=False))
 
         list_layout = QVBoxLayout()
@@ -1483,25 +1674,36 @@ class Sidebar(QWidget):
         self._update_rings()
 
     def _update_rings(self):
+        if not isValid(self):
+            return
         for key, button in self._buttons.items():
+            if not isValid(button):
+                continue
             button._keyboard_ring = self.keyboard_mode and key == self._selected
             button.update()
-        for tile in self.window().findChildren(_Tile):
-            tile.outline.update()
+        focused = QApplication.focusWidget()
+        tiles = (getattr(self, "_ring_focus", None), focused)
+        self._ring_focus = focused
+        for tile in tiles:
+            if tile is not None and isValid(tile) and isinstance(tile, _Tile):
+                tile.outline.update()
 
     def _focus_changed(self, old, new):
+        if not isValid(self):
+            return
         if new in self._buttons.values():
             selected = self._buttons.get(self._selected)
             if not self.keyboard_mode:
                 new.clearFocus()
-            elif selected is not None and new is not selected:
+            elif selected is not None and isValid(selected) and new is not selected:
                 selected.setFocus(Qt.FocusReason.TabFocusReason)
         self._update_rings()
 
     def _pointer_select(self, key):
         self.keyboard_mode = False
         self._on_select(key)
-        self.select(key)
+        if self._selected != key:
+            self.select(key)
 
     def navigate(self, key, direction):
         keys = list(self._buttons)
@@ -1509,16 +1711,21 @@ class Sidebar(QWidget):
         target = keys[(keys.index(key) + direction) % len(keys)]
         self._on_select(target)
         self._buttons[target].setFocus(Qt.FocusReason.ShortcutFocusReason)
-        self.select(target)
+        if self._selected != target:
+            self.select(target)
 
     def eventFilter(self, watched, event):
-        if isinstance(watched, QWidget) and watched.window() is self.window():
-            if event.type() == QEvent.Type.MouseButtonPress:
+        kind = event.type()
+        if kind not in (QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress):
+            return False
+        if isValid(self) and isinstance(watched, QWidget) and watched.window() is self.window():
+            if kind == QEvent.Type.MouseButtonPress:
                 self.keyboard_mode = False
                 for button in self._buttons.values():
-                    button.clearFocus()
+                    if isValid(button):
+                        button.clearFocus()
                 self._update_rings()
-            elif event.type() == QEvent.Type.KeyPress and is_navigation_key(event.key(), event.modifiers()):
+            elif kind == QEvent.Type.KeyPress and is_navigation_key(event.key(), event.modifiers()):
                 self.keyboard_mode = True
                 self._update_rings()
         return False
@@ -1526,7 +1733,11 @@ class Sidebar(QWidget):
     def set_window_width(self, width):
         rail = width < 640
         self.setFixedWidth(56 if rail else 144 if width < 800 else 176)
-        self.link_word.setVisible(not rail)
+        self._link_details.setVisible(not rail)
+        self.link_peer.setVisible(bool(getattr(self, "_response_peer", "")) and not rail)
+        self._rail = rail
+        self._response_row.setContentsMargins(0 if rail else 24, 0, 0 if rail else 8, 3 if rail else 6)
+        self._update_response_time()
         self._link_layout.setContentsMargins(24 if rail else 16, 4 if rail else 16,
                                             24 if rail else 16, 4 if rail else 16)
         self._list_layout.setContentsMargins(6 if rail else 8, 3 if rail else 8,
@@ -1547,11 +1758,44 @@ class Sidebar(QWidget):
                 self.foot.setIcon(QIcon())
             theme.repolish(self.foot)
 
-    def set_link(self, tone: str, word: str) -> None:
+    def set_link(self, tone: str, word: str, peer: str = "", response_time_ms=None, connected=False) -> None:
+        seen = (tone, word, peer, response_time_ms, connected, getattr(self, "_rail", False))
+        if seen == getattr(self, "_link_seen", None):
+            return
+        self._link_seen = seen
         self.link_led.set_tone(tone)
         if self.link_word.text() != word:
             self.link_word.setText(word)
+        self.link_peer.setText(peer)
+        self.link_peer.setAccessibleName(peer)
+        self.link_peer.setVisible(bool(peer) and not getattr(self, "_rail", False))
         self.link_led.setToolTip(word)
+        self._response_peer = peer
+        self._response_time_ms = response_time_ms
+        self._response_connected = connected
+        self._update_response_time()
+
+    def _update_response_time(self) -> None:
+        connected = getattr(self, "_response_connected", False)
+        value = getattr(self, "_response_time_ms", None)
+        self.response_time.setVisible(connected)
+        if not connected:
+            self.response_time.setText("")
+            self.response_time.setAccessibleName("Response time: disconnected")
+            self.response_time.setToolTip("")
+            return
+        target = f" to {self._response_peer}" if getattr(self, "_response_peer", "") else ""
+        detail = f"Response time{target}: {value} ms" if value is not None else f"Response time{target}: no fresh measurement"
+        rail = getattr(self, "_rail", False)
+        if rail:
+            visible = f"{value} ms" if value is not None else "—"
+        elif value is None:
+            visible = "Response: —"
+        else:
+            visible = f"Response: {value} ms"
+        self.response_time.setText(visible)
+        self.response_time.setAccessibleName(detail)
+        self.response_time.setToolTip(detail)
 
     def set_dots(self, marks: dict) -> None:
         for key, button in self._buttons.items():
@@ -1564,13 +1808,76 @@ class Ruler(QSlider):
 
     STEP = 10
 
-    def __init__(self, name: str, maximum: int, minimum: int = 0, parent: QWidget | None = None) -> None:
+    def __init__(self, name: str, maximum: int, minimum: int = 0, parent: QWidget | None = None,
+                 step: int = STEP, page_step: int | None = None, ticks=(), scale="linear") -> None:
         super().__init__(Qt.Orientation.Horizontal, parent)
+        self.ticks = ticks
+        self.scale = scale
         self.setRange(minimum, maximum)
-        self.setSingleStep(self.STEP)
-        self.setPageStep(self.STEP * 5)
+        self.setSingleStep(step)
+        self.setPageStep(page_step if page_step is not None else step * 5)
         self.setAccessibleName(name)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if ticks:
+            self.setMinimumHeight(54)
+
+    def _fraction(self, value):
+        transform = math.sqrt if self.scale == "sqrt" else float
+        low, high = transform(self.minimum()), transform(self.maximum())
+        return (transform(value) - low) / (high - low)
+
+    def _point_value(self, x):
+        fraction = max(0, min(1, (x - 6) / max(1, self.width() - 12)))
+        if self.scale == "sqrt":
+            value = (math.sqrt(self.minimum()) + fraction * (math.sqrt(self.maximum()) - math.sqrt(self.minimum()))) ** 2
+        else:
+            value = self.minimum() + fraction * (self.maximum() - self.minimum())
+        return round(value / self.singleStep()) * self.singleStep()
+
+    def mousePressEvent(self, event) -> None:
+        if self.ticks and event.button() == Qt.MouseButton.LeftButton:
+            self.setValue(self._point_value(event.position().x()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.ticks and event.buttons() & Qt.MouseButton.LeftButton:
+            self.setValue(self._point_value(event.position().x()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        if not self.ticks:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor(theme.colour("edge")))
+        painter.drawLine(6, 30, self.width() - 6, 30)
+        painter.setFont(theme.mono_font(tokens.TYPE["small"]))
+        for division in range(21):
+            x = round(6 + division * (self.width() - 12) / 20)
+            painter.drawLine(x, 24, x, 30)
+        previous_right = -4
+        metrics = painter.fontMetrics()
+        last_width = metrics.horizontalAdvance(str(self.ticks[-1]))
+        for value in self.ticks:
+            x = round(6 + self._fraction(value) * (self.width() - 12))
+            painter.drawLine(x, 22, x, 30)
+            text = str(value)
+            width = metrics.horizontalAdvance(text)
+            left = max(0, min(self.width() - width, x - width // 2))
+            if value != self.ticks[-1] and (left < previous_right + 4 or left + width + 4 > self.width() - last_width):
+                continue
+            painter.drawText(QRect(left, 33, width, 20), Qt.AlignmentFlag.AlignCenter, text)
+            previous_right = left + width
+        x = round(6 + self._fraction(self.value()) * (self.width() - 12))
+        painter.setPen(QColor(theme.colour("ink_2")))
+        painter.drawLine(6, 30, x, 30)
+        painter.setPen(QPen(QColor(theme.colour("signal" if focus_ring_visible(self) else "ink")), 3))
+        painter.drawLine(x, 2, x, 31)
 
     def keyPressEvent(self, event) -> None:
         steps = {Qt.Key.Key_Left: -1, Qt.Key.Key_Down: -1, Qt.Key.Key_Right: 1, Qt.Key.Key_Up: 1}

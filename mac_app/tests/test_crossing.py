@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from crossing import DECAY_S, CrossingEngine
+from crossing import DECAY_S, CrossingEngine, Ways
 
 BOUNDS = (0, 0, 1728, 1117)
 RIGHT_X = 1727.0
@@ -88,6 +88,39 @@ class ResistanceTests(unittest.TestCase):
         step = machine.feed(RIGHT_X, 500.0, 0, 0, BOUNDS, 1.03 + DECAY_S * 2)
         self.assertEqual(machine.pressure, 0.0)
         self.assertFalse(step.hold)
+
+    def test_decay_removes_the_same_pointer_travel_at_120_and_500(self):
+        for resistance in (120, 500):
+            machine = engine(resistance_px=resistance)
+            machine.feed(RIGHT_X, 500.0, 100, 0, BOUNDS, 1.0)
+            fraction = machine.pressure_at(1.2)
+            with self.subTest(resistance=resistance):
+                self.assertAlmostEqual(fraction * resistance, 40.0)
+
+    def test_sustained_push_examples_use_a_fixed_decay_rate(self):
+        for resistance, speed, expected_time, expected_travel in (
+                (120, 500, 0.6, 300), (500, 500, 2.5, 1250), (500, 1000, 0.71, 714)):
+            machine = engine(resistance_px=resistance)
+            step = None
+            interval = 0.01
+            for index in range(400):
+                step = machine.feed(RIGHT_X, 500.0, speed * interval, 0, BOUNDS,
+                                    1.0 + index * interval)
+                if step.crossed:
+                    break
+            with self.subTest(resistance=resistance, speed=speed):
+                self.assertTrue(step.crossed)
+                self.assertAlmostEqual(index * interval, expected_time, delta=0.025)
+                self.assertAlmostEqual((index + 1) * speed * interval, expected_travel, delta=15)
+
+
+    def test_track_endpoints_and_fill_head_share_the_same_coordinate_scale(self):
+        from core.resistance_strip import resistance_x
+
+        self.assertEqual(resistance_x(720, 0), 18.0)
+        self.assertEqual(resistance_x(720, 500), 702.0)
+        self.assertEqual(resistance_x(720, 250), 360.0)
+        self.assertEqual(resistance_x(720, 700), resistance_x(720, 500))
 
     def test_a_slow_lean_never_builds(self):
         machine = engine()
@@ -183,10 +216,11 @@ class BreakthroughTests(unittest.TestCase):
 
     def test_arrival_point_sits_just_inside_the_edge(self):
         self.assertEqual(CrossingEngine.arrival_point("left", 0.5, BOUNDS), (2.0, 558.0))
-        self.assertEqual(CrossingEngine.arrival_point("right", 0.0, BOUNDS), (1725.0, 0.0))
-        self.assertEqual(CrossingEngine.arrival_point("top", 1.0, BOUNDS), (1727.0, 2.0))
+        # An end of an edge lands LANDING_CLEAR_PX in, clear of the edge and corner beside it.
+        self.assertEqual(CrossingEngine.arrival_point("right", 0.0, BOUNDS), (1725.0, 10.0))
+        self.assertEqual(CrossingEngine.arrival_point("top", 1.0, BOUNDS), (1717.0, 2.0))
         self.assertEqual(CrossingEngine.arrival_point("bottom", 0.5, BOUNDS), (863.5, 1114.0))
-        self.assertEqual(CrossingEngine.arrival_point("left", 7.0, BOUNDS)[1], 1116.0)
+        self.assertEqual(CrossingEngine.arrival_point("left", 7.0, BOUNDS)[1], 1106.0)
 
 
 class GuardTests(unittest.TestCase):
@@ -343,6 +377,22 @@ class MonitorLayoutTests(unittest.TestCase):
         step = self.feed_at(engine(), 1727.0, 500.0, 20, 0, side, (0, 0, 3648, 1117))
         self.assertFalse(step.crossed)
 
+    def test_a_zone_on_one_display_holds_and_crosses_at_its_internal_seam(self):
+        machine = CrossingEngine(
+            resistance_px=20,
+            ways=[Ways("peer", frozenset({"edge"}), "right", frozenset(), "top_right",
+                       "0", "display-a", "left")],
+        )
+        displays = [(0, 0, 100, 100), (100, 0, 200, 100)]
+        result = None
+        for index in range(20):
+            result = machine.feed(99, 50, 5, 0, (0, 0, 200, 100), 1 + index * 0.01,
+                                  displays=displays)
+            if result.crossed:
+                break
+        self.assertTrue(result.crossed)
+        self.assertEqual((result.display, result.side), ("display-a", "left"))
+
     def test_the_bottom_of_a_short_display_beside_a_tall_one_crosses(self):
         tall_short = [(0, 0, 100, 300), (100, 0, 200, 100)]
         step = self.feed_at(engine(edge="bottom"), 150.0, 99.0, 0, 20, tall_short, (0, 0, 200, 300))
@@ -366,6 +416,19 @@ class MonitorLayoutTests(unittest.TestCase):
         x, y = CrossingEngine.arrival_point("left", 0.9, (0, 0, 1920, 2062), displays=stacked)
         self.assertEqual(x, 2.0)
         self.assertGreater(y, 982)
+
+    def test_an_arrival_with_no_display_named_lands_where_it_crossed_as_on_the_pc(self):
+        # rc16 bug hunt (11-10-2026): a switch naming no display (a 1.5.1 peer, or a picture without
+        # this Mac's displays) laid the whole edge's fraction across one display, about a display's
+        # width from where the pointer crossed. return_edge.arrival_position keeps the point.
+        side_by_side = [(0, 0, 1920, 1080), (1920, 0, 3840, 1080)]
+        x, y = CrossingEngine.arrival_point("top", 0.49, (0, 0, 3840, 1080), displays=side_by_side)
+        self.assertAlmostEqual(x, 0.49 * 3839, delta=1.0)
+        self.assertEqual(y, 2.0)
+        stacked = [(0, 0, 1920, 1080), (0, 1080, 1920, 2160)]
+        x, y = CrossingEngine.arrival_point("left", 0.25, (0, 0, 1920, 2160), displays=stacked)
+        self.assertAlmostEqual(y, 0.25 * 2159, delta=1.0)
+        self.assertEqual(x, 2.0)
 
 
 

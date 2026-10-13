@@ -42,14 +42,21 @@ class GeometryTests(unittest.TestCase):
         # that point: the left monitor for most of the left edge, the primary above it, where the
         # primary's own left edge is the wall.
         self.assertEqual(arrival_position(ARRANGEMENT, "left", 0.5), (-1920, 720))
-        self.assertEqual(arrival_position(ARRANGEMENT, "left", 0.0), (0, 0))
+        # The very end of an edge lands LANDING_CLEAR_PX in, clear of the edge and corner beside it.
+        self.assertEqual(arrival_position(ARRANGEMENT, "left", 0.0), (0, 10))
         # right: the primary, at its last pixel column.
         self.assertEqual(arrival_position(ARRANGEMENT, "right", 0.5), (2559, 720))
         # top: 10% of 4480 from x=-1920 is over the left monitor, whose top is exposed at y=200.
         self.assertEqual(arrival_position(ARRANGEMENT, "top", 0.1), (-1472, 200))
         self.assertEqual(arrival_position(ARRANGEMENT, "top", 0.75), (1440, 0))
         # bottom: the primary reaches y=1439; the left monitor stops at 1279.
-        self.assertEqual(arrival_position(ARRANGEMENT, "bottom", 1.0), (2559, 1439))
+        self.assertEqual(arrival_position(ARRANGEMENT, "bottom", 1.0), (2549, 1439))
+
+    def test_arrival_can_target_a_named_display_side(self):
+        displays = {"panel-right": Rect(100, 0, 100, 100)}
+        self.assertEqual(arrival_position([Rect(0, 0, 100, 100), displays["panel-right"]],
+                                          "left", 0.5, display="panel-right", side="right",
+                                          display_map=displays), (199, 50))
 
 
 class PressureTests(unittest.TestCase):
@@ -65,6 +72,24 @@ class PressureTests(unittest.TestCase):
         self.assertEqual(self.feed((-1000, 500), -40).action, PASS)
         self.assertEqual(self.feed((-1920, 500), 5).action, PASS)
         self.assertEqual(self.edge.pressure, 0.0)
+
+    def test_display_zone_holds_and_crosses_at_an_internal_seam(self):
+        clock = FakeClock()
+        left, right = Rect(0, 0, 100, 100), Rect(100, 0, 100, 100)
+        edge = ReturnEdge("right", resistance_px=10, clock=clock, display="left")
+        first = edge.feed([left, right], (100, 50), 6, 0, display_map={"left": left, "right": right})
+        self.assertEqual((first.action, first.position), (HOLD, (99, 50)))
+        second = edge.feed([left, right], (99, 50), 6, 0, display_map={"left": left, "right": right})
+        self.assertEqual((second.action, second.edge, second.offset), (CROSS, "left", 0.5))
+
+    def test_crossing_returns_the_receiving_display_and_side(self):
+        clock = FakeClock()
+        left, right = Rect(0, 0, 100, 100), Rect(100, 0, 100, 100)
+        edge = ReturnEdge("right", resistance_px=10, clock=clock, display="left",
+                          target_display="panel-right", target_side="left")
+        edge.feed([left, right], (100, 50), 6, 0, display_map={"left": left, "right": right})
+        result = edge.feed([left, right], (99, 50), 6, 0, display_map={"left": left, "right": right})
+        self.assertEqual((result.display, result.side), ("panel-right", "left"))
 
     def test_outward_push_at_the_edge_holds_and_accumulates(self):
         outcome = self.feed((-1920, 500), -30, 4)
@@ -86,6 +111,25 @@ class PressureTests(unittest.TestCase):
         self.assertAlmostEqual(self.feed((-1920, 500), 0, after=0.2).pressure, 0.0)
         self.feed((-1920, 500), -60)
         self.assertAlmostEqual(self.feed((-1920, 500), 0, after=0.1).pressure, 0.25)
+
+    def test_pressure_at_is_side_effect_free_and_uses_fixed_decay_at_120_and_500(self):
+        for resistance in (120, 500):
+            clock = FakeClock()
+            edge = ReturnEdge("left", resistance_px=resistance, clock=clock)
+            edge.feed(ARRANGEMENT, (-1920, 500), -100, 0)
+            clock.advance(0.2)
+            with self.subTest(resistance=resistance):
+                self.assertAlmostEqual(edge.pressure_at(clock()) * resistance, 40.0)
+                self.assertAlmostEqual(edge._travel, 100.0)
+
+
+    def test_track_endpoints_and_fill_head_share_the_same_coordinate_scale(self):
+        from core.resistance_strip import resistance_x
+
+        self.assertEqual(resistance_x(720, 0), 18.0)
+        self.assertEqual(resistance_x(720, 500), 702.0)
+        self.assertEqual(resistance_x(720, 250), 360.0)
+        self.assertEqual(resistance_x(720, 700), resistance_x(720, 500))
 
     def test_breakthrough_sends_the_opposite_edge_and_the_offset(self):
         self.feed((-1920, 720), -100)
@@ -174,7 +218,7 @@ class LandingMonitorTests(unittest.TestCase):
 
     def test_a_monitor_left_of_and_above_the_primary(self):
         monitors = [Rect(0, 0, 1728, 1117), Rect(-2560, -200, 2560, 1440)]
-        self.assertEqual(arrival_position(monitors, "left", 0.0), (-2560, -200))
+        self.assertEqual(arrival_position(monitors, "left", 0.0), (-2560, -190))
         self.assertEqual(arrival_position(monitors, "right", 0.5)[0], 1727)
 
 

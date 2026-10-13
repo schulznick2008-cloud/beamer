@@ -5,7 +5,8 @@ import time
 from unittest import mock
 
 from mac_app.tests.design_offscreen import (
-    AppKit, kvm_bridge_app, lit_pixels, offscreen_control_window, rect_list, resize_measurements, settle, tiles,
+    AppKit, accent_pixels_near_top_edge, kvm_bridge_app, lit_pixels, offscreen_control_window,
+    raster, rect_list, resize_measurements, settle, tiles,
 )
 
 widgets = kvm_bridge_app.widgets
@@ -27,22 +28,6 @@ def measured_stack(vertical=True, spacing=10):
     view.setAlignment_(AppKit.NSLayoutAttributeLeading if vertical else AppKit.NSLayoutAttributeCenterY)
     view.setDistribution_(AppKit.NSStackViewDistributionFill)
     return view
-
-
-def raster(view):
-    rep = view.bitmapImageRepForCachingDisplayInRect_(view.bounds())
-    view.cacheDisplayInRect_toBitmapImageRep_(view.bounds(), rep)
-    return rep
-
-
-def accent_pixels_near_top_edge(view):
-    rep = raster(view)
-    left, right = int(rep.pixelsWide() * .25), int(rep.pixelsWide() * .75)
-    return sum(
-        1 for y in range(2, min(16, rep.pixelsHigh())) for x in range(left, right)
-        if (lambda colour: colour.blueComponent() > .55 and
-            colour.blueComponent() - colour.redComponent() > .18)(rep.colorAtX_y_(x, y))
-    )
 
 
 def raster_difference(a, b):
@@ -162,12 +147,20 @@ class DesignOffscreenTests(unittest.TestCase):
         control._select_page("design")
         control.window.setFrame_display_(((100000, 100000), control.window.minSize()), False)
         settle(control.window)
-        for selector in (control.length_select, control.size_select):
-            self.assertLessEqual(selector.view.frame().size.width, 240)
-            self.assertEqual(selector.layout_columns, 1)
-            for _, cell, words in selector.cells:
-                self.assertGreaterEqual(cell.bounds().size.height, 28)
-                self.assertGreaterEqual(words.view.frame().size.width, words.view.attributedStringValue().size().width)
+        # The 320 pt window's column leaves the track about 100 pt beside its readout; what must hold
+        # is that the value reads in full, the track stays wider than it, and neither leaves the row.
+        for selector, readout in ((control.length_select, control.length_readout),
+                                  (control.size_select, control.size_readout)):
+            slider, words = selector.slider, readout.view
+            row = slider.superview().frame().size.width
+            self.assertTrue(slider.isEnabled())
+            self.assertGreaterEqual(words.frame().size.width, words.attributedStringValue().size().width)
+            self.assertGreater(slider.frame().size.width, words.frame().size.width)
+            for view in (slider, words):
+                # Alignment rects: a slider's frame runs 2 pt past its track on each side by design.
+                laid = view.alignmentRectForFrame_(view.frame())
+                self.assertGreaterEqual(laid.origin.x, -1)
+                self.assertLessEqual(laid.origin.x + laid.size.width, row + 1)
 
     def test_stacked_length_and_size_share_the_field_column(self):
         control = offscreen_control_window()
@@ -184,9 +177,9 @@ class DesignOffscreenTests(unittest.TestCase):
         control._select_page("design")
         control.window.setFrame_display_(((100000, 100000), (1900, 900)), False)
         settle(control.window)
-        self.assertAlmostEqual(control.length_select.view.frame().size.width, 240, delta=1)
-        self.assertAlmostEqual(control.size_select.view.frame().size.width, 240, delta=1)
-        self.assertAlmostEqual(control.length_row.frame().size.width, control.size_row.frame().size.width, delta=1)
+        self.assertAlmostEqual(control.length_select.slider.frame().size.width,
+                               control.size_select.slider.frame().size.width, delta=1)
+        self.assertGreater(control.length_select.slider.frame().size.width, 240)
 
     def test_trackpad_options_do_not_truncate_at_any_width(self):
         control = offscreen_control_window()

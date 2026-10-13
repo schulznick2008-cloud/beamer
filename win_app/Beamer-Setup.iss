@@ -39,7 +39,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 ; Autostart is asked for, never assumed, so it starts unticked.
-Name: "autostart"; Description: "Automatically start Beamer at Windows login"; GroupDescription: "Startup options:"; Flags: unchecked
+Name: "autostart"; Description: "Start Beamer elevated at sign-in without another UAC prompt"; GroupDescription: "Startup options:"; Flags: unchecked
 
 [Files]
 Source: "dist\Beamer.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -49,17 +49,62 @@ Source: "dist\Beamer.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; instead of adding a second Beamer to the Start Menu.
 Name: "{autoprograms}\Beamer"; Filename: "{app}\Beamer.exe"
 
+[InstallDelete]
+; Remove pre-task autostart entries. A Startup shortcut launches the requireAdministrator exe
+; through Explorer and raises UAC on every sign-in, even when the scheduled task is also present.
+Type: files; Name: "{userstartup}\Beamer.lnk"
+
+[Registry]
+; The same legacy Run entry has the same UAC behaviour as the old Startup shortcut.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "Beamer"; Flags: deletevalue
+
 [Run]
 ; CreateProcess refuses a requireAdministrator exe from this non-elevated setup (error 740);
 ; shellexec lets Windows raise the UAC prompt instead.
 Filename: "{app}\Beamer.exe"; Description: "{cm:LaunchProgram,Beamer}"; Flags: nowait postinstall skipifsilent shellexec
-; A plain Startup-folder shortcut would UAC-prompt on every logon, so autostart is a Scheduled Task
-; with RunLevel Highest. Creating one needs elevation this setup does not have, so the step asks
-; for it; --hidden brings Beamer up in the tray rather than with a window.
-Filename: "schtasks.exe"; Parameters: "/Create /RL HIGHEST /SC ONLOGON /TN Beamer /TR ""\""{app}\Beamer.exe\"" --hidden"" /F"; Tasks: autostart; Flags: runhidden shellexec waituntilterminated; Verb: runas
 
 [UninstallRun]
-; The rules and the task were written elevated (by the app, or by the autostart step above), so
-; removing them needs elevation the per-user uninstaller does not have: one prompt, one command,
-; rather than three deletions that fail silently and leave them behind.
-Filename: "cmd.exe"; Parameters: "/c netsh advfirewall firewall delete rule name=""Beamer Receiver (TCP-In)"" & netsh advfirewall firewall delete rule name=""Beamer Pairing (UDP-In)"" & netsh advfirewall firewall delete rule name=""Beamer Pairing (TCP-In)"" & schtasks /Delete /TN Beamer /F"; Flags: runhidden shellexec waituntilterminated; Verb: runas; RunOnceId: "BeamerCleanup"
+; The elevated app reads the interactive account from the session, then removes its task, the
+; legacy global task and firewall rules without relying on the UAC administrator's identity.
+Filename: "{app}\Beamer.exe"; Parameters: "--uninstall-cleanup"; Flags: runhidden shellexec waituntilterminated; Verb: runas; RunOnceId: "BeamerCleanup"
+
+[Code]
+function RunTaskOperation(const Filename, Params: String; var ResultCode: Integer): Boolean;
+begin
+  if IsAdmin then
+    Result := Exec(Filename, Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+  else
+    Result := ShellExec('runas', Filename, Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function TaskCommandFailure(const Action: String; const Started: Boolean; const ResultCode: Integer): String;
+begin
+  if (not Started) and (ResultCode = 1223) then
+    Result := 'You cancelled the permission request.'
+  else if not Started then
+    Result := 'Windows could not start the task operation: ' + SysErrorMessage(ResultCode)
+  else
+    Result := 'Windows returned exit code ' + IntToStr(ResultCode) + '.';
+  Result := Action + ' ' + Result;
+end;
+
+// Keep the old elevated starter until first run migrates it successfully. This also preserves
+// autostart when a silent upgrade does not launch Beamer after replacing the executable.
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  Started: Boolean;
+  Failure: String;
+begin
+  if (CurStep = ssPostInstall) and WizardIsTaskSelected('autostart') then
+  begin
+    Started := RunTaskOperation(ExpandConstant('{app}\Beamer.exe'), '--enable-autostart', ResultCode);
+    if (not Started) or (ResultCode <> 0) then
+    begin
+      Failure := TaskCommandFailure('Could not run Beamer sign-in setup.', Started, ResultCode);
+      Log(Failure);
+      RaiseException('Beamer was installed, but start at sign-in was not configured. It requires Beamer and the signed-in session to use the same administrator account. ' + Failure);
+    end;
+  end;
+end;

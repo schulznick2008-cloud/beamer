@@ -1,15 +1,16 @@
-"""A machine's zones, one peer at a time (WIRE.md sections 5 and 8), shared by both desktops.
+"""Local way intent, picture-to-zone compilation, and the desktops' crossing helpers.
 
-What the Crossing page reads and writes for the machine it has chosen, the side settled with each
-peer by `arrangement`, the sentence for two zones over one stretch, which machine the shortcut and
-the Send button pick, and which machines that may drive this one cannot follow a zone. Pure: each
-app calls these on its settings under its own lock and writes the file itself.
+Crossing events live in crossing_state; mutating entry points here are compatibility
+wrappers for the existing app loaders and pages. WIRE.md sections 5 and 8 are unchanged.
 """
 
 import base64
 import binascii
 import copy
+import math
 import re
+import sys
+import time
 from typing import Callable, Optional
 
 from core import peerlist
@@ -28,6 +29,669 @@ _JUMP_KEYS = {"backspace", "caps_lock", "delete", "down", "end", "enter", "esc",
               "left", "page_down", "page_up", "pause", "print_screen", "right", "space", "tab", "up",
               "menu", "num_lock", "scroll_lock", "browser_back", "browser_forward", "volume_mute",
               "volume_down", "volume_up", "media_next", "media_prev", "media_stop", "media_play_pause"}
+
+
+ATLAS_SENTENCES = {
+    "set_elsewhere": "Set on {first} or {second}.",
+    "between": "Crosses between {first} and {second}.",
+    "gap": "No edge leads to {name}. The shortcut and the menu still reach it.",
+    "edge_off": "Edge to {name} is off. Tick Edge to turn it back on.",
+    "unpicked": "None of the thirds picked for {name} touch its tile. Click a third along its edge.",
+    "overlap": "{first} overlaps {second}. Drag them apart.",
+}
+ATLAS_PARTS = ("start", "middle", "end")
+DIAGRAM_THIS = (120.0, 75.0)
+DIAGRAM_OTHER = (112.0, 63.0)
+DIAGRAM_GAP = 10.0
+DIAGRAM_SPLIT_GAP = 6.0
+DIAGRAM_MARGIN = 12.0
+
+
+def diagram_layout(width, height, machines):
+    """The legacy star placement, shared by callers that draw the Crossing arrangement."""
+    tw, th = DIAGRAM_THIS
+    ow, oh = DIAGRAM_OTHER
+    gap, split, margin = DIAGRAM_GAP, DIAGRAM_SPLIT_GAP, DIAGRAM_MARGIN
+    placed = [None] * len(machines)
+    for side in EDGES:
+        indexes = [i for i, (where, _third) in enumerate(machines) if where == side]
+        if indexes and all(machines[i][1] is not None for i in indexes):
+            indexes.sort(key=lambda i: machines[i][1])
+        count = len(indexes)
+        if not count:
+            continue
+        w, h = ow / count, oh / count
+        upright = side in ("left", "right")
+        step = (h if upright else w) + split
+        start = ((th if upright else tw) - (step * count - split)) / 2
+        for order, index in enumerate(indexes):
+            along = start + order * step
+            placed[index] = {"left": (-gap-w, along), "right": (tw+gap, along),
+                             "top": (along, -gap-h), "bottom": (along, th+gap)}[side] + (w, h)
+    frames = [(0.0, 0.0, tw, th)] + [frame for frame in placed if frame is not None]
+    left, top = min(f[0] for f in frames), min(f[1] for f in frames)
+    span_w = max(f[0]+f[2] for f in frames)-left
+    span_h = max(f[1]+f[3] for f in frames)-top
+    scale = 1.0
+    if span_w > width or span_h > height:
+        scale = min((width-2*margin)/span_w, (height-2*margin)/span_h)
+    dx, dy = (width-span_w*scale)/2-left*scale, (height-span_h*scale)/2-top*scale
+    def fit(frame):
+        x, y, w, h = frame
+        return dx+x*scale, dy+y*scale, w*scale, h*scale
+    return fit(frames[0]), [None if frame is None else fit(frame) for frame in placed]
+
+
+def layout_ids(settings, layout=None):
+    """Machine ids allowed here, including named third parties in active peers' current paired lists."""
+    own = settings.get("machine_id", "")
+    entries = settings.get("peers", [])
+    known = {own} if isinstance(own, str) and own else set()
+    desktops = [peer for peer in entries if peer.get("port", 24820) != 0]
+    desktop_ids = {peer.get("id") for peer in desktops
+                   if isinstance(peer.get("id"), str) and peer.get("id")}
+    known.update(desktop_ids)
+    layout = layout if isinstance(layout, dict) else {}
+    for peer in desktops:
+        if (peer.get("in_use", True) is False or peer.get("left_out") is True
+                or peerlist.dormant_reason(peer) is not None):
+            continue
+        paired_with = peer.get("paired_with", [])
+        if isinstance(paired_with, list):
+            known.update(ident for ident in paired_with
+                         if isinstance(ident, str) and ident not in known
+                         and _valid_tile_name(layout.get(ident)))
+    return known
+
+
+def _valid_tile_name(tile):
+    name = tile.get("name") if isinstance(tile, dict) else None
+    return isinstance(name, str) and bool(name.strip()) and len(name) <= 64
+
+
+def retain_held_peer_tiles(settings, layout, held_layout=None, received_layout=None):
+    """Keep received peer tiles, filling only those omitted by the other machine."""
+    result = copy.deepcopy(layout) if isinstance(layout, dict) else {}
+    if isinstance(received_layout, dict):
+        allowed = layout_ids(settings, received_layout)
+        result.update({ident: copy.deepcopy(tile) for ident, tile in received_layout.items() if ident in allowed})
+    held_layout = held_layout if isinstance(held_layout, dict) else settings.get("layout", {})
+    protected_ids = layout_ids(settings, held_layout)
+    missing = sorted(ident for ident in protected_ids if ident and ident not in result)
+    if not missing:
+        return result
+    kept = {peer: held_layout[peer] for peer in missing if isinstance(held_layout.get(peer), dict)}
+    defaults = derive_layout({**settings, "layout": {**result, **kept}}, gap=0)
+    for peer in missing:
+        tile = held_layout.get(peer) if isinstance(held_layout, dict) else None
+        if not isinstance(tile, dict):
+            tile = defaults.get(peer)
+        if isinstance(tile, dict):
+            result[peer] = copy.deepcopy(tile)
+    return result
+
+
+def prune_layout(settings, now=None):
+    """Drop tiles outside the local map rules and remove legacy vouch metadata."""
+    layout = settings.get("layout")
+    if not isinstance(layout, dict):
+        return False
+    allowed = layout_ids(settings, layout)
+    cleaned = copy.deepcopy({ident: tile for ident, tile in layout.items() if ident in allowed})
+    dropped = len(cleaned) != len(layout)
+    for tile in cleaned.values():
+        if isinstance(tile, dict):
+            tile.pop("vouched_by", None)
+    if cleaned == layout:
+        return False
+    settings["layout"] = cleaned
+    if dropped:
+        settings["layout_set_at"] = next_stamp(settings.get("layout_set_at", 0), time.time() if now is None else now)
+        settings["layout_by"] = settings.get("machine_id", "")
+    return True
+
+
+def derive_layout(settings, width=160, height=100, gap=12):
+    """Default one-tile-per-machine positions derived from the local sides and zones."""
+    own = settings.get("machine_id", "")
+    saved_tiles = settings.get("layout") or {}
+    saved = {key: tile for key, tile in saved_tiles.items() if key in layout_ids(settings, saved_tiles)}
+    held = saved.get(own)
+    x0, y0 = (held.get("x", 0), held.get("y", 0)) if isinstance(held, dict) else (0, 0)
+    if isinstance(held, dict) and type(held.get("w")) is int and type(held.get("h")) is int:
+        width, height = held["w"], held["h"]
+    result = {own: {"x": x0, "y": y0, "w": width, "h": height}}
+    for peer, tile in saved.items():
+        if isinstance(tile, dict) and all(type(tile.get(key)) is int for key in ("x", "y", "w", "h")) and tile["w"] > 0 and tile["h"] > 0:
+            result[peer] = {key: tile[key] for key in ("x", "y", "w", "h")}
+            if "displays" in tile and _valid_tile_displays(tile):
+                result[peer]["displays"] = copy.deepcopy(tile["displays"])
+                if tile.get("display_offsets"):
+                    result[peer]["display_offsets"] = copy.deepcopy(tile["display_offsets"])
+            if _valid_tile_name(tile):
+                result[peer]["name"] = tile["name"].strip()
+    entries = [p for p in settings.get("peers", []) if p.get("id") and p.get("port", 24820) != 0]
+    # A shelved machine's kept tile is off the map, so it never blocks an active one's place.
+    shelved = {p["id"] for p in entries if p.get("left_out") is True or p.get("in_use", True) is False
+               or peerlist.dormant_reason(p) is not None}
+    def active():
+        return {key: tile for key, tile in result.items() if key not in shelved}
+    for side in EDGES:
+        group = []
+        for peer in entries:
+            if peer.get("side") != side or peer.get("id") in result:
+                continue
+            zones = {z.get("kind"): z for z in settings.get("zones", []) if z.get("peer") == peer["id"] and z.get("off") is not True}
+            parts = zones.get("part", {}).get("parts", [])
+            rank = min((ATLAS_PARTS.index(p) for p in parts if p in ATLAS_PARTS), default=1)
+            group.append((peer["id"], rank if "part" in zones else None))
+        if group and all(item[1] is not None for item in group):
+            group.sort(key=lambda item: item[1])
+        for index, (peer, _rank) in enumerate(group):
+            centre = y0 + height / 2 if side in ("left", "right") else x0 + width / 2
+            along = centre + (index - (len(group)-1)/2) * ((height if side in ("left", "right") else width) + gap)
+            if side == "left": rect = (x0-gap-width, along-height/2, width, height)
+            elif side == "right": rect = (x0+width+gap, along-height/2, width, height)
+            elif side == "top": rect = (along-width/2, y0-gap-height, width, height)
+            else: rect = (along-width/2, y0+height+gap, width, height)
+            tile = dict(zip(("x", "y", "w", "h"), map(round, rect)))
+            if any(_overlaps(tile, other) for other in active().values()):
+                tile = {**tile, **snap_position(tile, own, active(), radius=math.inf)}
+            result[peer] = tile
+    unplaced = [peer["id"] for peer in entries if peer["id"] not in result]
+    if unplaced:
+        below = max((tile["y"] + tile["h"] for key, tile in active().items() if key != own), default=y0+height)
+        for index, peer in enumerate(unplaced):
+            x = x0 + width/2 + (index - (len(unplaced)-1)/2) * (width + gap) - width/2
+            tile = {"x": round(x), "y": round(below + gap), "w": width, "h": height}
+            result[peer] = snap_position(tile, own, active(), radius=math.inf)
+    return result
+
+
+def crossing_stretches(contact, own, thirds):
+    """The parts of a contact with `own`'s tile that cross: the whole contact, or only the stretches
+    of it inside the listed thirds of `own`'s side when some but not all are."""
+    side, start, end = contact
+    if side == "corner" or not thirds or set(thirds) >= set(PARTS):
+        return [contact]
+    origin, length = (own["y"], own["h"]) if side in ("left", "right") else (own["x"], own["w"])
+    stretches = []
+    for index, part in enumerate(PARTS):
+        if part in thirds:
+            low, high = max(start, origin+index*length/3), min(end, origin+(index+1)*length/3)
+            if high > low:
+                stretches.append((side, low, high))
+    return stretches
+
+
+def _rect_contact(a, b):
+    ax, ay, aw, ah = (a[k] for k in ("x", "y", "w", "h")); bx, by, bw, bh = (b[k] for k in ("x", "y", "w", "h"))
+    ar, ab, br, bb = ax+aw, ay+ah, bx+bw, by+bh
+    along_y, along_x = min(ab, bb)-max(ay, by), min(ar, br)-max(ax, bx)
+    if br == ax and along_y > 0: return "left", max(ay, by), min(ab, bb)
+    if bx == ar and along_y > 0: return "right", max(ay, by), min(ab, bb)
+    if bb == ay and along_x > 0: return "top", max(ax, bx), min(ar, br)
+    if by == ab and along_x > 0: return "bottom", max(ax, bx), min(ar, br)
+    corners = {(ax, ay): "top_left", (ar, ay): "top_right", (ax, ab): "bottom_left", (ar, ab): "bottom_right"}
+    for point, corner in corners.items():
+        if point in ((bx, by), (bx+bw, by), (bx, by+bh), (bx+bw, by+bh)):
+            return "corner", corner, ""
+    return None
+
+
+def display_contacts(own, peer):
+    """[(screen, contact, target)]: each of `own`'s display frames that touches one of `peer`'s, with
+    their contact, as the engine finds its zones; a tile without displays is its own one frame."""
+    return [(screen, contact, target)
+            for screen in _display_frames(own)
+            for target in _display_frames(peer)
+            if (contact := _rect_contact(screen, target))]
+
+
+def side_contacts(own, peer):
+    """[(screen, contact)]: the side contacts of `display_contacts` for drawing, with those that abut
+    along the same one of `own`'s screens and sides (the peer's displays side by side) joined into one
+    stretch, so a join between the peer's displays is not drawn as a break."""
+    found = sorted(((screen, contact) for screen, contact, _target in display_contacts(own, peer)
+                    if contact[0] in EDGES),
+                   key=lambda item: (str(item[0]["display"]), item[1][0], item[1][1]))
+    joined = []
+    for screen, contact in found:
+        if joined:
+            held, (side, start, end) = joined[-1]
+            if held["display"] == screen["display"] and side == contact[0] and abs(end - contact[1]) < 1e-6:
+                joined[-1] = (held, (side, start, contact[2]))
+                continue
+        joined.append((screen, contact))
+    return joined
+
+
+def _overlaps(a, b):
+    return a["x"] < b["x"]+b["w"] and b["x"] < a["x"]+a["w"] and a["y"] < b["y"]+b["h"] and b["y"] < a["y"]+a["h"]
+
+
+def _display_frames(tile):
+    """Map the physical display arrangement over the full bounds of its group tile."""
+    screens = tile.get("displays")
+    if not isinstance(screens, dict) or not screens:
+        return [{"display": None, **{key: tile[key] for key in ("x", "y", "w", "h")}}]
+    left = min(rect["x"] for rect in screens.values())
+    top = min(rect["y"] for rect in screens.values())
+    right = max(rect["x"] + rect["w"] for rect in screens.values())
+    bottom = max(rect["y"] + rect["h"] for rect in screens.values())
+    scale_x = tile["w"] / (right - left)
+    scale_y = tile["h"] / (bottom - top)
+    offset_x, offset_y = tile["x"], tile["y"]
+    offsets = tile.get("display_offsets", {})
+    return [{"display": key,
+             "x": offset_x + (rect["x"] - left) * scale_x + offsets.get(key, {}).get("x", 0),
+             "y": offset_y + (rect["y"] - top) * scale_y + offsets.get(key, {}).get("y", 0),
+             "w": rect["w"] * scale_x, "h": rect["h"] * scale_y}
+            for key, rect in sorted(screens.items(), key=lambda item: (item[1]["y"], item[1]["x"], item[0]))]
+
+
+def snap_position(tile, own_id, layout, radius=12):
+    """Nearest free snap on a side's thirds, centre, flush alignments or a corner."""
+    own = layout.get(own_id, {"x": 0, "y": 0, "w": 160, "h": 100})
+    ox, oy, ow, oh = (own[k] for k in ("x", "y", "w", "h")); x, y, w, h = (tile[k] for k in ("x", "y", "w", "h"))
+    candidates = []
+    def add(cx, cy, centred=False):
+        candidates.append(({"x": round(cx), "y": round(cy), "w": w, "h": h}, centred))
+
+    for side in EDGES:
+        for i in range(4):
+            if side in ("left", "right"):
+                cx, cy = (ox-w if side == "left" else ox+ow), oy+i*oh/3-h/2
+            else:
+                cx, cy = ox+i*ow/3-w/2, (oy-h if side == "top" else oy+oh)
+            add(cx, cy)
+        if side in ("left", "right"):
+            cx = ox-w if side == "left" else ox+ow
+            add(cx, oy+(oh-h)/2, centred=True)
+            add(cx, oy)
+            add(cx, oy+oh-h)
+        else:
+            cy = oy-h if side == "top" else oy+oh
+            add(ox+(ow-w)/2, cy, centred=True)
+            add(ox, cy)
+            add(ox+ow-w, cy)
+    candidates.extend((({"x": round(ox-w), "y": round(oy-h), "w": w, "h": h}, False),
+                       ({"x": round(ox+ow), "y": round(oy-h), "w": w, "h": h}, False),
+                       ({"x": round(ox-w), "y": round(oy+oh), "w": w, "h": h}, False),
+                       ({"x": round(ox+ow), "y": round(oy+oh), "w": w, "h": h}, False)))
+    free = [(candidate, centred) for candidate, centred in candidates
+            if not any(k != own_id and _overlaps(candidate, other) for k, other in layout.items())]
+    near = [(candidate, centred) for candidate, centred in free
+            if math.hypot(candidate["x"]-x, candidate["y"]-y) <= radius * (1.5 if centred else 1)]
+    return min(near or free,
+               key=lambda item: (abs(item[0]["x"]-x)+abs(item[0]["y"]-y), not item[1],
+                                 abs(item[0]["x"]-x), abs(item[0]["y"]-y)),
+               default=(dict(tile), False))[0]
+
+
+def within_snap_radius(tile, snap, own_id, layout, radius):
+    """Whether a free snap candidate is close enough to preview or accept."""
+    own = layout.get(own_id, {"x": 0, "y": 0, "w": 160, "h": 100})
+    ox, oy, ow, oh = (own[k] for k in ("x", "y", "w", "h"))
+    w, h = tile["w"], tile["h"]
+    centred = any(
+        (snap["x"], snap["y"]) == position
+        for position in ((round(ox-w), round(oy+(oh-h)/2)),
+                         (round(ox+ow), round(oy+(oh-h)/2)),
+                         (round(ox+(ow-w)/2), round(oy-h)),
+                         (round(ox+(ow-w)/2), round(oy+oh)))
+    )
+    return math.hypot(snap["x"]-tile["x"], snap["y"]-tile["y"]) <= radius * (1.5 if centred else 1)
+
+
+def place_beside(layout, own_id, peer, side):
+    """`peer`'s tile centred against `own_id`'s on `side`, so its whole edge crosses; the nearest free
+    snap point when another tile is there already."""
+    own, tile = layout[own_id], layout[peer]
+    ox, oy, ow, oh = (own[k] for k in ("x", "y", "w", "h")); w, h = tile["w"], tile["h"]
+    x, y = {"left": (ox-w, oy+(oh-h)/2), "right": (ox+ow, oy+(oh-h)/2),
+            "top": (ox+(ow-w)/2, oy-h), "bottom": (ox+(ow-w)/2, oy+oh)}[side]
+    placed = {**tile, "x": round(x), "y": round(y)}
+    others = {key: value for key, value in layout.items() if key != peer}
+    if any(key != own_id and _overlaps(placed, other) for key, other in others.items()):
+        return {**tile, **snap_position(placed, own_id, others, radius=math.inf)}
+    return placed
+
+
+def share_side(layout, own_id, peer, side, ignore=()):
+    """`peer` joins the tiles already on `own_id`'s `side`, the row re-centred on that side as
+    derive_layout groups them, so every one still touches it; {} when they cannot all touch or the
+    row would overlap another tile. Tiles in `ignore` (shelved ones) never block."""
+    own = layout[own_id]
+    vertical = side in ("left", "right")
+    along, size = ("y", "h") if vertical else ("x", "w")
+    group = sorted((key for key, tile in layout.items() if key not in (own_id, peer, *ignore)
+                    and (_rect_contact(own, tile) or ("",))[0] == side), key=lambda key: layout[key][along])
+    if not group:
+        return {}
+    placed, start = {}, own[along] + own[size]/2 - sum(layout[key][size] for key in (*group, peer))/2
+    for key in (*group, peer):
+        tile = layout[key]
+        across = {"left": own["x"]-tile["w"], "right": own["x"]+own["w"],
+                  "top": own["y"]-tile["h"], "bottom": own["y"]+own["h"]}[side]
+        placed[key] = {**tile, along: round(start), ("x" if vertical else "y"): round(across)}
+        start += tile[size]
+    others = [tile for key, tile in layout.items() if key not in (own_id, *placed, *ignore)]
+    if any(not _rect_contact(own, tile) or _rect_contact(own, tile)[0] != side for tile in placed.values()) or any(
+            _overlaps(tile, other) for tile in placed.values() for other in others):
+        return {}
+    # A moved tile keeps every contact it had with the machines beyond it, or two of them stop crossing.
+    beyond = {key: tile for key, tile in layout.items() if key not in (own_id, peer, *placed, *ignore)}
+    if any(_rect_contact(layout[key], other) != _rect_contact(placed[key], other)
+           for key in group for other in beyond.values()):
+        return {}
+    return placed
+
+
+def corner_edge(corner, side):
+    """The edge a PC's corner zone crosses: its side when that is one of the corner's two edges, else
+    the corner's horizontal edge, as the Mac's always is. A corner push only fires through one of its
+    own edges (receiver.zone_models), so a top-left corner for a machine on the right crossing by the
+    right edge was silently never armed (Ledger harness, 10-10-2026)."""
+    return side if side in EDGES and side in corner.split("_") else corner.split("_")[1]
+
+
+def _valid_tile_displays(tile):
+    screens = tile.get("displays")
+    if screens is not None and not (isinstance(screens, dict) and 1 <= len(screens) <= 16
+                                    and all(isinstance(key, str) and key.isascii() and 1 <= len(key) <= 64
+                                            and isinstance(rect, dict)
+                                            and all(type(rect.get(name)) is int for name in ("x", "y", "w", "h"))
+                                            and rect["w"] > 0 and rect["h"] > 0
+                                            for key, rect in screens.items())):
+        return False
+    offsets = tile.get("display_offsets", {})
+    return (isinstance(offsets, dict) and len(offsets) <= 16
+            and (not offsets or isinstance(screens, dict))
+            and all(key in screens and isinstance(offset, dict)
+                    and type(offset.get("x")) is int and type(offset.get("y")) is int
+                    for key, offset in offsets.items()))
+
+
+def refresh_displays(settings, display_map, now=None):
+    """Record this machine's current logical display rectangles in the shared layout."""
+    own = settings.get("machine_id")
+    tile = (settings.get("layout") or {}).get(own)
+    if not isinstance(tile, dict) or not isinstance(display_map, dict) or not display_map:
+        return False
+    screens = {}
+    for key, rect in display_map.items():
+        if not isinstance(key, str) or not key.isascii() or not 1 <= len(key) <= 64:
+            return False
+        if not isinstance(rect, return_edge.Rect):
+            return False
+        screens[key] = {"x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height}
+    if tile.get("displays") == screens:
+        return False
+    offsets = tile.get("display_offsets")
+    if isinstance(offsets, dict):
+        tile["display_offsets"] = {key: value for key, value in offsets.items() if key in screens}
+    tile["displays"] = screens
+    stamp = time.time() if now is None else now
+    settings["layout_set_at"] = next_stamp(settings.get("layout_set_at", 0), stamp)
+    settings["layout_by"] = own
+    return True
+
+
+def _read_intent(settings, peer):
+    """Read legacy zones once at migration; thereafter only the peer's saved intent."""
+    entry = _entry(settings, peer) or {}
+    held = entry.get("ways")
+    if isinstance(held, dict):
+        return {"edge": held.get("edge", True) is True,
+                "thirds": [part for part in PARTS if part in held.get("thirds", PARTS)] or list(PARTS),
+                "corner": held.get("corner", False) is True,
+                "corner_at": held.get("corner_at") if held.get("corner_at") in CORNERS else DEFAULT_CORNER,
+                "notch": held.get("notch", False) is True}
+    mine = [zone for zone in settings.get("zones", []) if zone.get("peer") == peer]
+    if not mine:
+        return dict(edge=True, thirds=list(PARTS), corner=False, corner_at=DEFAULT_CORNER, notch=False)
+    kept = entry.get("left_out_ways") if entry.get("left_out") is True else None
+    if isinstance(kept, list):
+        # Left out in rc12: every zone is off and the kinds in use were kept here for Put back.
+        on = lambda zone: zone.get("kind") in kept and zone.get("page_off") is not True
+    else:
+        # Off only by the page's own untick. A pick that touches no contact today (`unpicked`) and a
+        # way set aside while its machine slept (`aside`) were still on in rc12.
+        on = lambda zone: zone.get("page_off") is not True and (
+            zone.get("off") is not True or zone.get("unpicked") is True or zone.get("aside") is True)
+    active_edge = any(zone.get("kind") == "edge" and on(zone) for zone in mine)
+    active_part = [zone for zone in mine if zone.get("kind") == "part" and on(zone)]
+    picked = next((zone["page_parts"] for zone in mine
+                   if zone.get("kind") == "part" and isinstance(zone.get("page_parts"), list)
+                   and zone["page_parts"]), None)
+    # The whole edge in use wins over any thirds: over a pick left on an off part zone (the page showed
+    # the whole edge), and over a part zone also in use (1.4.x let both be on; the edge covered them).
+    if active_edge:
+        parts = list(PARTS)
+    else:
+        parts = picked if picked is not None else [part for zone in active_part for part in zone.get("parts", [])]
+    if not parts:
+        parts = next((zone.get("parts") for zone in mine if zone.get("kind") == "part"
+                      and zone.get("parts")), list(PARTS))
+    corner = next((zone.get("corner") for zone in mine if zone.get("kind") == "corner"), DEFAULT_CORNER)
+    return dict(edge=active_edge or bool(active_part),
+                thirds=[part for part in PARTS if part in parts] or list(PARTS),
+                corner=any(zone.get("kind") == "corner" and on(zone) for zone in mine),
+                corner_at=corner if corner in CORNERS else DEFAULT_CORNER,
+                notch=any(zone.get("kind") == "notch" and on(zone) for zone in mine))
+
+
+def picture_capable(settings, capable=()):
+    """The machines that place by the picture: `capable` as the caller knows it, else the entries
+    that advertise `layout`. Empty means no capability information at all."""
+    peers = settings.get("peers", [])
+    if not capable and any("caps" in entry for entry in peers):
+        return {settings.get("machine_id", "")} | {entry.get("id") for entry in peers if "layout" in entry.get("caps", [])}
+    return set(capable)
+
+
+def compile_layout(settings, layout, moved=None, capable=(), now=None, platform="pc",
+                   live=None, gone=None):
+    """Generate zones from the picture and saved intent, without changing the caller's settings.
+
+    An explicit capability set (including this machine) keeps old peers on their side-based path.
+    With no capability information, tiles are treated as picture peers for existing canvas callers.
+    """
+    if not isinstance(layout, dict):
+        return {"accepted": False, "tiles": {}}
+    layout = copy.deepcopy({key: tile for key, tile in layout.items() if key in layout_ids(settings, layout)})
+    own_id = settings.get("machine_id", "")
+    layout.setdefault(own_id, derive_layout(settings).get(own_id, dict(x=0, y=0, w=160, h=100)))
+    if any(not isinstance(tile, dict)
+           or any(type(tile.get(key)) is not int for key in ("x", "y", "w", "h"))
+           or tile["w"] < 1 or tile["h"] < 1 or not _valid_tile_displays(tile) for tile in layout.values()):
+        return {"accepted": False, "tiles": {}}
+    saved = copy.deepcopy(settings)
+    peers = {entry.get("id"): entry for entry in saved.get("peers", [])}
+    for peer, entry in peers.items():
+        if _zoned(entry):
+            entry["ways"] = _read_intent(settings, peer)
+            entry.pop("left_out_ways", None)
+    inactive = {peer for peer, entry in peers.items()
+                if entry.get("left_out") is True or entry.get("in_use", True) is False
+                or peerlist.dormant_reason(entry) is not None or (gone is not None and gone(peer))}
+    active = {peer: tile for peer, tile in layout.items() if peer not in inactive}
+    screens = {peer: _display_frames(tile) for peer, tile in active.items()}
+    surfaces = [(peer, screen) for peer, frames in screens.items() for screen in frames]
+    overlaps = {}
+    for index, (one, a) in enumerate(surfaces):
+        for two, b in surfaces[index + 1:]:
+            if one != two and _overlaps(a, b):
+                overlaps.setdefault(one, set()).add(two)
+                overlaps.setdefault(two, set()).add(one)
+    contacts = {}
+    for peer in peers:
+        contacts[peer] = [] if peer in overlaps or peer in inactive or peer not in active or own_id not in active \
+            else display_contacts(active[own_id], active[peer])
+    crowded = {}
+    for peer, found in contacts.items():
+        for screen, contact, target in found:
+            if contact[0] in EDGES:
+                crowded.setdefault((screen["display"], contact[0]), set()).add(peer)
+    if any(len(group) >= 4 for group in crowded.values()):
+        result = {"accepted": False, "tiles": {}}
+        if moved in active and moved != own_id:
+            result.update(snap={moved: snap_position(active[moved], own_id,
+                          {key: tile for key, tile in active.items() if key != moved})},
+                          tiles={moved: {"state": "overlap", "thirds": [], "sentence_keys": []}})
+        return result
+    capable = picture_capable(saved, capable)
+    picture_peers = set(capable) if capable else set(layout)
+    held_sides = {peer: entry.get("side", "") for peer, entry in peers.items()}
+    stamp = time.time() if now is None else now
+    if layout != saved.get("layout"):
+        saved.update(layout=copy.deepcopy(layout),
+                     layout_set_at=next_stamp(saved.get("layout_set_at"), stamp), layout_by=own_id)
+    else:
+        saved["layout"] = copy.deepcopy(layout)
+    allocations = {}
+    for peer, found in contacts.items():
+        entry = peers[peer]
+        if peer not in picture_peers or not _zoned(entry) or not entry["ways"]["edge"]:
+            continue
+        for index, (screen, contact, target) in enumerate(found):
+            side, start, end = contact
+            if side not in EDGES:
+                continue
+            origin, length = (screen["y"], screen["h"]) if side in ("left", "right") else (screen["x"], screen["w"])
+            for third, part in enumerate(PARTS):
+                overlap = min(end, origin + (third + 1) * length / 3) - max(start, origin + third * length / 3)
+                if overlap + 1e-9 < length / 6:
+                    continue
+                key = (screen["display"], side, part)
+                rank = (overlap, _id_bytes(peer) or peer.encode(), -index)
+                if key not in allocations or rank > allocations[key][0]:
+                    allocations[key] = (rank, peer, index)
+    zones, tiles, corners = [], {}, set()
+    notch_taken = False
+    def add_zone(peer, kind, screen=None, side=None, target=None, **fields):
+        zone = dict(peer=peer, kind=kind, **fields)
+        if screen is not None:
+            if screen["display"] is not None:
+                zone["display"] = screen["display"]
+            zone["side"] = side
+            if target is not None and target["display"] is not None and side in EDGES:
+                zone.update(target_display=target["display"], target_side=return_edge.OPPOSITE[side])
+        zones.append(zone)
+    for peer, entry in peers.items():
+        if not _zoned(entry):
+            tiles[peer] = {"state": "gap", "thirds": [], "sentence_keys": ["gap"]}
+            continue
+        intent = entry["ways"]
+        found = contacts.get(peer, [])
+        if peer in inactive:
+            tiles[peer] = {"state": "dormant", "thirds": [], "sentence_keys": []}
+            continue
+        if peer in picture_peers:
+            side = next((contact[0] for screen, contact, target in found if contact[0] in EDGES), "")
+            if side != entry.get("side", ""):
+                entry.update(side=side, side_set_at=saved.get("layout_set_at", int(stamp)),
+                             side_by=saved.get("layout_by") or own_id)
+        states, touched = [], set()
+        if peer in picture_peers:
+            for index, (screen, contact, target) in enumerate(found):
+                side = contact[0]
+                if side == "corner":
+                    corner = contact[1]
+                    key = (screen["display"], corner)
+                    if (intent["edge"] or intent["corner"]) and key not in corners:
+                        corners.add(key)
+                        edge = corner.split("_")[1]
+                        add_zone(peer, "corner", screen, edge, target, corner=corner, edge=edge)
+                        states.append("corner")
+                    continue
+                assigned = [part for part in PARTS if allocations.get((screen["display"], side, part), (None, None, None))[1:] == (peer, index)]
+                touched.update(assigned)
+                kept = [part for part in assigned if part in intent["thirds"]]
+                if intent["edge"] and kept:
+                    kind = "edge" if len(kept) == 3 else "part"
+                    add_zone(peer, kind, screen, side, target, **({"parts": kept} if kind == "part" else {}))
+                    states.append(kind)
+                if intent["corner"]:
+                    corner = intent["corner_at"]
+                    key = (screen["display"], corner)
+                    if key not in corners:
+                        corners.add(key)
+                        edge = corner.split("_")[1] if platform == "mac" else corner_edge(corner, side)
+                        # A corner may cross a different edge from the contact; its landing pair follows that edge.
+                        add_zone(peer, "corner", screen, edge, target, corner=corner, edge=edge)
+                        states.append("corner")
+        else:
+            side = entry.get("side", "")
+            # Picture contacts reserve their thirds even when the local pick narrows them.
+            reserved = {part for (display, edge, part) in allocations if edge == side}
+            occupied = {part for zone in zones if zone["kind"] in ("edge", "part")
+                        and zone.get("side", peers.get(zone["peer"], {}).get("side")) == side
+                        for part in (PARTS if zone["kind"] == "edge" else zone["parts"])}
+            kept = [part for part in intent["thirds"] if part not in reserved | occupied]
+            if intent["edge"] and side in EDGES and kept:
+                kind = "edge" if len(kept) == 3 else "part"
+                add_zone(peer, kind, **({"parts": kept} if kind == "part" else {}))
+                states.append(kind)
+                touched.update(kept)
+            if intent["corner"] and (None, intent["corner_at"]) not in corners:
+                corners.add((None, intent["corner_at"]))
+                edge = intent["corner_at"].split("_")[1] if platform == "mac" else corner_edge(intent["corner_at"], side)
+                add_zone(peer, "corner", corner=intent["corner_at"], edge=edge)
+                states.append("corner")
+        if platform == "mac" and intent["notch"] and not notch_taken:
+            add_zone(peer, "notch")
+            notch_taken = True
+        state = next((kind for kind in ("edge", "part", "corner") if kind in states), "gap")
+        tiles[peer] = {"state": state, "thirds": [part for part in PARTS if part in touched],
+                       "sentence_keys": ["gap"] if state == "gap" else []}
+        if found and not states and intent["edge"] and touched:
+            tiles[peer].update(unpicked=True, sentence_keys=["unpicked"])
+    for peer, found in contacts.items():
+        if peer in inactive or found or peer not in active:
+            continue
+        for other in contacts:
+            if other != peer and other not in inactive and not contacts[other] and other in active and _rect_contact(active[peer], active[other]):
+                state = "between" if peer in capable and other in capable else "set-elsewhere"
+                tiles[peer] = {"state": state, "thirds": [], "sentence_keys": ["between" if state == "between" else "set_elsewhere"]}
+    for peer, others in overlaps.items():
+        if peer in peers and peer not in inactive:
+            tiles[peer] = {"state": "overlap", "thirds": [], "sentence_keys": ["overlap"], "overlap_with": min(others)}
+    saved["zones"] = zones
+    arrangements = [{"peer": peer, "side": entry.get("side", ""), "set_at": entry.get("side_set_at", 0),
+                     "by": entry.get("side_by", "")} for peer, entry in peers.items()
+                    if held_sides[peer] != entry.get("side", "")]
+    result = dict(accepted=moved not in overlaps, tiles=tiles, layout=copy.deepcopy(layout),
+                  arrangements=arrangements, settings=saved)
+    if moved in overlaps and moved != own_id:
+        result["snap"] = {moved: snap_position(layout[moved], own_id,
+                            {key: tile for key, tile in active.items() if key != moved})}
+    return result
+
+
+def inverse_layout(settings, layout, width=160, height=100, gap=12, peer=None, old_side=None):
+    """Re-place peers after an incoming arrangement changes their settled side."""
+    updated = copy.deepcopy(layout)
+    if peer is None:
+        derived = derive_layout({**settings, "layout": {}}, width, height, gap)
+    else:
+        own = layout.get(settings.get("machine_id"), {"x": 0, "y": 0, "w": width, "h": height})
+        contact = _rect_contact(own, layout[peer]) if peer in layout else None
+        old_side = old_side or (contact[0] if contact and contact[0] != "corner" else "")
+        if not old_side and peer in layout:
+            tile = layout[peer]
+            if tile["x"] + tile["w"] == own["x"] - gap: old_side = "left"
+            elif tile["x"] == own["x"] + own["w"] + gap: old_side = "right"
+            elif tile["y"] + tile["h"] == own["y"] - gap: old_side = "top"
+            elif tile["y"] == own["y"] + own["h"] + gap: old_side = "bottom"
+        entry = next((item for item in settings.get("peers", []) if item.get("id") == peer), {})
+        affected = {side for side in (old_side, entry.get("side", "")) if side in EDGES}
+        saved = {key: value for key, value in settings.get("layout", {}).items() if key != peer}
+        derived = derive_layout({**settings, "layout": saved}, width, height, gap)
+        if peer in derived:
+            updated[peer] = derived[peer]
+    return updated
 
 
 def part_names(edge: str) -> dict:
@@ -51,6 +715,94 @@ def toggle_part(parts, part, on) -> list:
     if not chosen:
         chosen = set(parts)
     return [name for name in PARTS if name in chosen]
+
+
+# The whole edge and Part of the edge are one choice in two forms: every third, or the thirds picked.
+def picked_thirds(methods, parts) -> list:
+    """The thirds that cross for these ways: all three for the whole edge, the picked ones for Part
+    of the edge, none when neither is on."""
+    if "edge" in methods:
+        return list(PARTS)
+    if "part" in methods:
+        return [part for part in PARTS if part in parts] or list(DEFAULT_PARTS)
+    return []
+
+
+def pick_thirds(methods, thirds):
+    """(methods, parts) with the edge's form set from `thirds`: all three is the whole edge, some is
+    Part of the edge, none turns both off. Other ways are kept, in their order."""
+    thirds = [part for part in PARTS if part in thirds]
+    kept = [way for way in methods if way not in ("edge", "part")]
+    if not thirds:
+        return kept, list(DEFAULT_PARTS)
+    form = "edge" if len(thirds) == len(PARTS) else "part"
+    order = ("shortcut", "edge", "part", "corner", "notch")
+    return [way for way in order if way in set(kept) | {form}] + [way for way in kept if way not in order], thirds
+
+
+def toggle_third(methods, parts, part):
+    """(methods, parts) after one third is clicked, in the ledger or on the map: the last lit third
+    turns Edge off, keeping it as the remembered thirds; with Edge off, a click lights that third alone."""
+    current = picked_thirds(methods, parts)
+    if not current:
+        return pick_thirds(methods, [part])
+    chosen = [third for third in current if third != part] if part in current else current + [part]
+    if not chosen:
+        return [way for way in methods if way not in ("edge", "part")], list(current)
+    return pick_thirds(methods, chosen)
+
+
+def toggle_edge(methods, parts):
+    """(methods, parts) after the Edge text is clicked: on in any form turns off, keeping the thirds;
+    off turns on as the whole edge, so the whole edge is always one click away."""
+    if picked_thirds(methods, parts):
+        return [way for way in methods if way not in ("edge", "part")], [p for p in PARTS if p in parts] or list(PARTS)
+    return pick_thirds(methods, PARTS)
+
+
+def corner_holder(settings: dict, corner: str, exclude: Optional[str] = None) -> Optional[str]:
+    """The machine, other than `exclude`, whose Corner is on at `corner` of this machine's screen:
+    one corner per machine, never shared, so the page refuses that corner to anyone else. Left-out,
+    not-in-use and phone entries hold none."""
+    for entry in settings.get("peers", []):
+        ident = entry.get("id")
+        if (ident == exclude or not _zoned(entry) or entry.get("left_out") is True
+                or entry.get("in_use", True) is False):
+            continue
+        intent = _read_intent(settings, ident)
+        if intent["corner"] and intent["corner_at"] == corner:
+            return ident
+    return None
+
+
+def edge_form_detail(side, methods, parts, here="This Mac") -> str:
+    """The Edge way's detail on the Crossing page: which form crosses, or where to place it first."""
+    if side not in EDGES:
+        return f"Place it beside {here} on the map"
+    thirds = picked_thirds(methods, parts)
+    if not thirds:
+        return "Whole edge or the thirds you pick"
+    if len(thirds) == len(PARTS):
+        return "Whole edge"
+    names = [part_names(side)[part] for part in thirds]
+    named = names[0] if len(names) == 1 else " and ".join([", ".join(names[:-1]), names[-1].lower()])
+    return f"{named.capitalize()} third{'s' if len(names) > 1 else ''}"
+
+
+def third_stretches(contact, own):
+    """[(third, side, low, high)]: each third of `own`'s side that a side contact covers, clipped to
+    the contact, for the map's click targets. None for a corner contact."""
+    side, start, end = contact
+    if side == "corner":
+        return []
+    origin, length = (own["y"], own["h"]) if side in ("left", "right") else (own["x"], own["w"])
+    found = []
+    for index, part in enumerate(PARTS):
+        low, high = max(start, origin + index * length / 3), min(end, origin + (index + 1) * length / 3)
+        if high > low:
+            found.append((part, side, low, high))
+    return found
+
 
 
 def valid_jump_key(value) -> bool:
@@ -144,165 +896,114 @@ def _entry(settings: dict, peer: str) -> Optional[dict]:
     return next((entry for entry in settings["peers"] if entry.get("id") == peer), None)
 
 
-def _mine(settings: dict, peer: str) -> dict:
-    found = {}
-    for zone in settings["zones"]:
-        if zone.get("peer") == peer:
-            found.setdefault(zone.get("kind"), zone)
-    return found
+
+
+
+
 
 
 def ways(settings: dict, peer: str) -> dict:
-    """The ways across to one peer as the Crossing page shows them: its `side`, the kinds of zone in
-    use in section 8's order of kinds, the thirds and the corner its zones hold (the defaults where
-    it has none)."""
+    """Read the peer's saved intent, including thirds remembered while Edge is off."""
     entry = _entry(settings, peer) or {}
-    mine = _mine(settings, peer)
-    parts = mine.get("part", {}).get("parts")
-    corner = mine.get("corner", {}).get("corner")
-    return {
-        "side": entry.get("side") if entry.get("side") in EDGES else "",
-        "methods": [kind for kind in KIND_WORDS if kind in mine and mine[kind].get("off") is not True],
-        "parts": [part for part in PARTS if part in parts] if isinstance(parts, list) and parts else list(DEFAULT_PARTS),
-        "corner": corner if corner in CORNERS else DEFAULT_CORNER,
-    }
+    intent = _read_intent(settings, peer)
+    methods = []
+    if entry and intent["edge"]:
+        methods.append("edge" if len(intent["thirds"]) == 3 else "part")
+    methods += [kind for kind in ("corner", "notch") if entry and intent[kind]]
+    return dict(side=entry.get("side") if entry.get("side") in EDGES else "",
+                methods=methods, parts=list(intent["thirds"]), corner=intent["corner_at"])
 
 
 def edit(settings: dict, peer: str, *, side: str, methods, parts, corner: str, kinds,
-         corner_edge: Callable[[str, str], str], now: float) -> bool:
-    """Writes one peer's ways: its `side`, and one zone of each of `kinds` (the kinds this app
-    offers), in use when named in `methods` and `off` otherwise. The whole edge covers its thirds,
-    so with both chosen the thirds are written `off` (section 8). `corner_edge(corner, side)` is
-    the edge this app's corner crosses. A changed side is stamped by this machine, never below the
-    stamp held plus one. Returns whether the side changed, which the caller sends as `arrangement`.
-    KeyError when no entry has `peer`."""
+         corner_edge: Callable[[str, str], str], now: float, **legacy) -> bool:
+    """Compatibility wrapper: side edits place a tile; way edits save independent intent."""
+    from core import crossing_state
     entry = _entry(settings, peer)
     if entry is None:
         raise KeyError(peer)
-    if entry.get("port") == 0:
+    if not _zoned(entry):
         raise ValueError("a phone cannot have a side or zones")
-    side = side if side in EDGES else ""
-    moved = bool(side) and side != entry.get("side")
+    moved = side in EDGES and side != entry.get("side")
+    held = copy.deepcopy(settings)
     if moved:
-        entry.update(side=side, side_set_at=next_stamp(entry.get("side_set_at"), now), side_by=settings["machine_id"])
-    methods = set(methods)
-    if "edge" in methods:
-        methods.discard("part")
-    parts = [part for part in PARTS if part in parts] or list(DEFAULT_PARTS)
-    corner = corner if corner in CORNERS else DEFAULT_CORNER
-    fields = {"edge": {}, "part": {"parts": parts}, "corner": {"corner": corner, "edge": corner_edge(corner, side)},
-              "notch": {}}
-    mine = _mine(settings, peer)
-    for kind in kinds:
-        zone = mine.get(kind)
-        if zone is None:
-            zone = {"peer": peer, "kind": kind}
-            settings["zones"].append(zone)
-        zone.update(fields[kind])
-        zone.pop("aside", None)
-        if kind in methods:
-            zone.pop("off", None)
-        else:
-            zone["off"] = True
+        held["layout"] = derive_layout(held, gap=0)
+        held["layout"][peer] = place_beside(held["layout"], held["machine_id"], peer, side)
+        held["layout_set_at"] = next_stamp(held.get("layout_set_at"), now)
+        held["layout_by"] = held["machine_id"]
+    chosen = set(methods)
+    platform = "mac" if "notch" in kinds else "pc"
+    out = crossing_state.edit_ways(held, peer, platform=platform, edge=bool(chosen & {"edge", "part"}),
+             thirds=list(PARTS) if "edge" in chosen else parts, corner="corner" in chosen, corner_at=corner,
+             notch="notch" in chosen if platform == "mac" else None, live=None, gone=None, now=now)
+    settings.clear()
+    settings.update(out["settings"])
     return moved
 
 
-def _stretch(zone: dict, sides: dict) -> set:
+
+
+def leave_out(settings: dict, peer: str, *, platform=None, capable=()) -> None:
+    """Compatibility wrapper: shelf the peer while keeping its intent."""
+    from core import crossing_state
+    out = crossing_state.leave_out(settings, peer, platform=platform or _platform(settings), capable=capable)
+    settings.clear()
+    settings.update(out["settings"])
+
+
+def put_back(settings: dict, peer: str, *, platform=None, capable=()) -> None:
+    """Compatibility wrapper: compile the peer's held intent again."""
+    from core import crossing_state
+    out = crossing_state.put_back(settings, peer, platform=platform or _platform(settings), capable=capable)
+    settings.clear()
+    settings.update(out["settings"])
+
+
+def _platform(settings):
+    return "mac" if sys.platform == "darwin" else "pc"
+
+
+def _stretch(zone: dict, sides: dict, peers=()) -> set:
     """What a zone in use covers, for the rule that two never share one (section 8); the notch is
     one stretch of its own, as a Mac has one notch."""
+    owner = next((entry for entry in peers if entry.get("id") == zone.get("peer")), None)
+    if owner is not None and (owner.get("in_use", True) is False or owner.get("left_out") is True
+                              or owner.get("dormant") is True):
+        return set()
     if zone.get("kind") == "notch":
-        return {("notch",)}
-    side = sides.get(zone.get("peer"), "")
+        return {("notch", "all")}
+    side = zone.get("side", sides.get(zone.get("peer"), ""))
+    display = zone.get("display")
     kind = zone.get("kind")
     if kind == "corner" and zone.get("corner") in CORNERS:
-        return {("corner", zone["corner"])}
+        return {(('display_corner', display), zone["corner"])} if display is not None else {("corner", zone["corner"])}
+    scope = ("display", display, side) if display is not None else side
     if kind == "edge" and side in EDGES:
-        return {(side, part) for part in PARTS}
+        return {(scope, part) for part in PARTS}
     if kind == "part" and side in EDGES and isinstance(zone.get("parts"), list):
-        return {(side, part) for part in zone["parts"] if part in PARTS}
+        return {(scope, part) for part in zone["parts"] if part in PARTS}
     return set()
 
 
-def share_offer(settings: dict, peer: str, live: Optional[Callable[[str], bool]] = None) -> Optional[dict]:
-    """Propose thirds for `peer` when another machine already uses part of its side. A machine with
-    no link now is never offered a third: choosing the side takes it from that one (`give_way`)."""
-    entry = _entry(settings, peer)
-    side = entry.get("side") if entry else ""
-    if side not in EDGES:
-        return None
-    sides = {item.get("id"): item.get("side", "") for item in settings["peers"]}
-    holders = _side_holders(settings, peer, live)
-    if not holders:
-        return None
-    holder_set = set(holders)
-    assigned = {}
-    for zone in settings["zones"]:
-        owner = zone.get("peer")
-        if owner not in holder_set or zone.get("off") is True or sides.get(owner) != side:
-            continue
-        if zone.get("kind") not in ("edge", "part"):
-            continue
-        covered = {part for stretch_side, part in _stretch(zone, sides) if stretch_side == side}
-        if not covered:
-            continue
-        for part in PARTS:
-            if part in covered:
-                assigned.setdefault(part, owner)
-    thirds = {part: assigned.get(part, peer) for part in PARTS}
-    if peer not in thirds.values():
-        thirds["end"] = peer
-    return {"side": side, "holders": holders, "thirds": thirds}
+def _stretch_side(stretch):
+    scope = stretch[0]
+    return scope[2] if isinstance(scope, tuple) and scope[0] == "display" else scope
+
+
+def share_offer(settings: dict, peer: str, live=None) -> Optional[dict]:
+    """No-op: shared stretches are chosen by contacts on the map."""
+    return None
 
 
 def share(settings: dict, side: str, thirds: dict, *, kinds) -> list:
-    """Writes a side split by thirds (`thirds`: part -> machine id) after checking every third and its
-    machine, before anything changes: each machine on that side gets its thirds as a part zone in use
-    and its whole edge off; one left with none keeps its part zone off. Returns every machine to tell:
-    those whose zones changed and those whose way back or way_back_by did (section 8)."""
+    """No-op retained for app imports: the map owns shared stretches."""
     if side not in EDGES or not isinstance(thirds, dict) or set(thirds) != set(PARTS):
         raise ValueError("a split needs every third of a known side")
-    peers = {entry.get("id"): entry for entry in peerlist.desktops(settings["peers"])}
+    peers = {entry.get("id"): entry for entry in settings.get("peers", []) if _zoned(entry)}
     if any(not isinstance(peer, str) or peers.get(peer, {}).get("side") != side for peer in thirds.values()):
-        raise ValueError("every third must belong to a machine on that side")
+        raise ValueError("every third must belong to a desktop on that side")
     if "part" not in kinds:
         raise ValueError("this app does not offer parts of an edge")
-    sides = {entry.get("id"): entry.get("side", "") for entry in settings["peers"]}
-    owners = set(thirds.values())
-    told = way_back_state(settings)
-    changed = []
-    for entry in settings["peers"]:
-        if entry.get("port") == 0:
-            continue
-        peer = entry.get("id")
-        mine = _mine(settings, peer)
-        zones = [zone for zone in mine.values() if zone.get("off") is not True and
-                 any(stretch[0] == side for stretch in _stretch(zone, sides))]
-        if entry.get("side") != side or (not zones and peer not in owners):
-            continue
-        edge = mine.get("edge")
-        part = mine.get("part")
-        expected = [name for name in PARTS if thirds[name] == peer]
-        before = (dict(edge) if edge else None, dict(part) if part else None)
-        if edge is not None:
-            edge["off"] = True
-            edge.pop("aside", None)
-        if part is None:
-            part = {"peer": peer, "kind": "part"}
-            settings["zones"].append(part)
-        part.pop("aside", None)
-        if expected:
-            part["parts"] = expected
-            part.pop("off", None)
-        else:
-            # Off, never empty: the settings refuse a part zone that names no third.
-            if not (isinstance(part.get("parts"), list) and part["parts"]):
-                part["parts"] = list(DEFAULT_PARTS)
-            part["off"] = True
-        if before != (dict(edge) if edge else None, dict(part)):
-            changed.append(peer)
-    # A machine whose zones did not change can still be told something new: who holds its side.
-    changed += [peer for peer, state in way_back_state(settings).items() if told.get(peer) != state and peer not in changed]
-    return changed
+    return []
 
 
 def _clashing(settings: dict):
@@ -312,7 +1013,7 @@ def _clashing(settings: dict):
     for zone in settings["zones"]:
         if zone.get("off") is True:
             continue
-        for stretch in sorted(_stretch(zone, sides)):
+        for stretch in sorted(_stretch(zone, sides, settings["peers"])):
             if stretch in seen:
                 return seen[stretch], zone, stretch
             seen[stretch] = zone
@@ -329,12 +1030,21 @@ def clash(settings: dict, here: str) -> Optional[str]:
     peers = settings["peers"]
     one = peerlist.label_for(peers, peer_id=first.get("peer")) or peerlist.UNNAMED
     other = peerlist.label_for(peers, peer_id=second.get("peer")) or peerlist.UNNAMED
-    where = {"notch": "the notch", "corner": f"the {stretch[-1].replace('_', ' ')} corner"}.get(
-        stretch[0], f"the {stretch[0]} edge")
+    scope, part = stretch
+    if isinstance(scope, tuple) and scope[0] == "display":
+        where = f"the {scope[2]} edge of display {scope[1]}"
+        kind = scope[0]
+    elif isinstance(scope, tuple) and scope[0] == "display_corner":
+        where = f"the {part.replace('_', ' ')} corner of display {scope[1]}"
+        kind = "corner"
+    else:
+        where = {"notch": "the notch", "corner": f"the {part.replace('_', ' ')} corner"}.get(
+            scope, f"the {scope} edge")
+        kind = scope
     if first.get("peer") == second.get("peer"):
         return f"Two of the ways to {one} cover {where} of {here}. Keep one of them."
     fix = {"notch": "Turn the notch off for one of them.", "corner": "Choose another corner for one of them."}.get(
-        stretch[0], "Move one of them to another side, or give each its own thirds of the edge.")
+        kind, "Move one of them to another side, or give each its own thirds of the edge.")
     return f"{one} and {other} would both lead from {where} of {here}. {fix}"
 
 
@@ -351,44 +1061,19 @@ def _id_bytes(text) -> Optional[bytes]:
 def arrangement(settings: dict, peer: str, edge: str, set_at: int, by: str, here: str, way_back=None,
                 way_back_by=None, corner_edge: Optional[Callable[[str, str], str]] = None,
                 live: Optional[Callable[[str], bool]] = None):
-    """A peer's `arrangement` (section 8): `edge` is the peer's edge that faces this machine, so this
-    machine's side for it is the opposite. Taken when newer than the side held: a higher stamp, or the
-    same stamp and the larger `by` as bytes. A machine with no zone yet gets its whole edge for that
-    side, and a side that would put two zones in use over one stretch is applied and turns this peer's
-    clashing zones off. `way_back` and `way_back_by`, when carried, are kept on the entry whether or
-    not the side was newer. `corner_edge(corner, side)`, the app's own, rewrites the edge its corner zones
-    for the peer cross, as `edit` does, since a PC's corner crosses the side. `live(id)`, when given,
-    says whether a machine has a link up now: one that has not gives way (`give_way`). Returns
-    (changed, notices), a sentence for each zone turned off; `here` is "this Mac" or "this PC"."""
-    entry = _entry(settings, peer)
-    by_bytes = _id_bytes(by)
-    if entry is None or entry.get("port") == 0 or edge not in EDGES or by_bytes is None:
-        return False, []
-    told = isinstance(way_back, bool) and entry.get("way_back") is not way_back
-    if told:
-        entry["way_back"] = way_back
+    """Compatibility wrapper; advertised caps select the picture or old-peer path."""
+    from core import crossing_state, protocol
+    capable = {settings.get("machine_id", "")}
+    capable.update(p.get("id") for p in settings.get("peers", []) if "layout" in p.get("caps", []))
+    read = dict(edge=edge, set_at=set_at, by=protocol.read_id(by))
     if isinstance(way_back, bool):
-        holder = _id_bytes(way_back_by)
-        valid_holder = holder is not None and way_back is False and holder != _id_bytes(settings.get("machine_id"))
-        if valid_holder:
-            valid_text = way_back_by
-            if entry.get("way_back_by") != valid_text:
-                entry["way_back_by"] = valid_text
-                told = True
-        elif "way_back_by" in entry:
-            del entry["way_back_by"]
-            told = True
-    held = (int(entry.get("side_set_at") or 0), _id_bytes(entry.get("side_by")) or b"")
-    if (int(set_at), by_bytes) <= held:
-        return told, []
-    entry.update(side=return_edge.OPPOSITE[edge], side_set_at=int(set_at), side_by=by)
-    if corner_edge is not None:
-        for zone in settings["zones"]:
-            if zone.get("peer") == peer and zone.get("kind") == "corner" and zone.get("corner") in CORNERS:
-                zone["edge"] = corner_edge(zone["corner"], entry["side"])
-    if peer not in {zone.get("peer") for zone in settings["zones"]}:
-        settings["zones"].append({"peer": peer, "kind": "edge"})
-    return True, _turn_off_clashes(settings, entry, here, live)
+        read.update(way_back=way_back, way_back_by=protocol.read_id(way_back_by))
+    out = crossing_state.receive_arrangement(settings, peer, read,
+             platform="mac" if "mac" in here.lower() else "pc", capable=capable,
+             live=live, gone=None, now=time.time())
+    settings.clear()
+    settings.update(out["settings"])
+    return out["changed"], []
 
 
 def _zoned(entry: dict) -> bool:
@@ -412,35 +1097,27 @@ def default_side(settings: dict) -> bool:
 
 
 def ensure_zones(settings: dict) -> bool:
-    """Gives every machine with no zone at all its whole edge, `off` when its side is another machine's
-    already, so the settings stay readable (section 8, overlap). Pairing never made zones before
-    1.5.0-beta.5, so a machine paired since 1.4.x has none until this runs. True when it added any."""
-    sides = {entry.get("id"): entry.get("side", "") for entry in settings["peers"]}
-    covered = set()
-    for zone in settings["zones"]:
-        if zone.get("off") is not True:
-            covered |= _stretch(zone, sides)
-    zoned = {zone.get("peer") for zone in settings["zones"]}
-    added = False
-    for entry in settings["peers"]:
-        if not _zoned(entry) or entry["id"] in zoned:
-            continue
-        zone = {"peer": entry["id"], "kind": "edge"}
-        stretch = _stretch(zone, sides)
-        if stretch & covered:
-            zone["off"] = True
-        else:
-            covered |= stretch
-        settings["zones"].append(zone)
-        added = True
-    return added
+    """Compatibility loader: seed intent and compile instead of persisting off zones."""
+    from core import crossing_state
+    out = crossing_state.migrate(settings, _platform(settings))
+    settings.clear()
+    settings.update(out["settings"])
+    return out["changed"]
 
 
 def has_way(settings: dict, peer: str) -> bool:
     """Whether a zone in use leads to `peer` and can fire: a corner or the notch, or an edge or thirds
     of a side that is set. What `arrangement`'s `way_back` says to that machine."""
     sides = {entry.get("id"): entry.get("side", "") for entry in settings["peers"]}
-    return any(zone.get("peer") == peer and zone.get("off") is not True and _stretch(zone, sides)
+    return any(zone.get("peer") == peer and zone.get("off") is not True and _stretch(zone, sides, settings["peers"])
+               for zone in settings["zones"])
+
+
+def crosses_on_map(settings: dict, peer: str) -> bool:
+    """Whether an active edge, part or corner crosses the peer's contact on the map."""
+    sides = {entry.get("id"): entry.get("side", "") for entry in settings["peers"]}
+    return any(zone.get("peer") == peer and zone.get("kind") in ("edge", "part", "corner")
+               and zone.get("off") is not True and _stretch(zone, sides, settings["peers"])
                for zone in settings["zones"])
 
 
@@ -459,7 +1136,7 @@ def blocked_sentence(settings: dict, peer: str, here: str, live: Optional[Callab
     name = peerlist.label_for(peers, peer_id=peer) or peerlist.UNNAMED
     other = peerlist.label_for(peers, peer_id=holder) or peerlist.UNNAMED
     return (f"{name} has no way in: {other} already leads from the {side} edge of {here}. Give each its own "
-            "thirds of that edge under Part of the edge, or move one to another side.")
+            "thirds of that edge by moving the machines on the map, or move one to another side.")
 
 
 def no_way_back_sentence(settings: dict, peer: str) -> str:
@@ -506,97 +1183,35 @@ def _side_holders(settings: dict, peer: str, live: Optional[Callable[[str], bool
     if side not in EDGES:
         return []
     sides = {item.get("id"): item.get("side", "") for item in settings["peers"]}
-    stretches = {(side, part) for part in PARTS}
     holders = []
     for zone in settings["zones"]:
         owner = zone.get("peer")
         if (owner != peer and owner not in holders and zone.get("off") is not True
-                and zone.get("kind") in ("edge", "part") and _stretch(zone, sides) & stretches
+                and zone.get("kind") in ("edge", "part")
+                and any(_stretch_side(stretch) == side for stretch in _stretch(zone, sides, settings["peers"]))
                 and (live is None or live(owner))):
             holders.append(owner)
     return holders
 
 
-def settle(settings: dict, peer: str, here: str, live: Optional[Callable[[str], bool]] = None) -> list:
-    """After a machine's side moved here: its zones that now clash with another machine's are turned
-    off, as when the side arrives from that machine, and a sentence for each is returned. With
-    `live`, a machine with no link now gives way instead (`give_way`)."""
-    entry = _entry(settings, peer)
-    return _turn_off_clashes(settings, entry, here, live) if entry is not None else []
+def settle(settings: dict, peer: str, here: str, live=None) -> list:
+    """No-op: compilation already assigns every stretch once."""
+    return []
 
 
-def give_way(settings: dict, peer: str, here: str, live: Optional[Callable[[str], bool]]) -> list:
-    """Sets aside every zone in use of a machine with no link now (`live(id)` false) that covers a
-    stretch one of `peer`'s zones in use covers, and returns a sentence for each. The zone is `off`
-    and carries `aside`: a machine with its lid shut is not gone, so `settle_presence` puts the zone
-    back when it connects, and turns it off for good only when it is found to have removed this one
-    (06-10-2026). Nothing without `live`."""
-    if live is None:
-        return []
-    sides = {item.get("id"): item.get("side", "") for item in settings["peers"]}
-    wanted = set()
-    for zone in settings["zones"]:
-        if zone.get("peer") == peer and zone.get("off") is not True:
-            wanted |= _stretch(zone, sides)
-    peers = settings["peers"]
-    name = peerlist.label_for(peers, peer_id=peer) or peerlist.UNNAMED
-    notices = []
-    for zone in settings["zones"]:
-        owner = zone.get("peer")
-        if owner == peer or zone.get("off") is True or not (_stretch(zone, sides) & wanted) or live(owner):
-            continue
-        zone["off"] = True
-        zone["aside"] = True
-        other = peerlist.label_for(peers, peer_id=owner) or peerlist.UNNAMED
-        notices.append(f"{other} is not connected, so {name} takes that part of {here}'s screen for now and "
-                       f"{other}'s {KIND_WORDS.get(zone.get('kind'), 'zone')} is set aside until it connects.")
-    return notices
+def give_way(settings: dict, peer: str, here: str, live=None) -> list:
+    """No-op: a sleeping machine retains its intent and picture."""
+    return []
 
 
-def presence_due(settings: dict, live: Callable[[str], bool], gone: Callable[[str], bool]) -> bool:
-    """Whether `settle_presence` would change anything now: a zone is set aside (`give_way`) for a
-    machine that has connected, or has removed this pairing, since."""
-    if not any(zone.get("aside") is True for zone in settings["zones"]):
-        return False
-    probe = copy.deepcopy(settings)
-    settle_presence(probe, "", live, gone)
-    return probe != settings
+def presence_due(settings: dict, live, gone) -> bool:
+    """No-op: no aside state remains to settle."""
+    return False
 
 
-def settle_presence(settings: dict, here: str, live: Callable[[str], bool], gone: Callable[[str], bool]) -> list:
-    """What became of the zones `give_way` set aside, as the links stand now: a machine with a link
-    up has its zone back unless another zone in use covers that stretch (then it stays off, as when two
-    machines that are both here want one stretch, and the Crossing page offers the thirds), and a machine
-    `gone(id)` says has removed this pairing keeps its zone off for good. Returns a sentence for each
-    zone it settled, apart from those put back; settings change in place."""
-    sides = {item.get("id"): item.get("side", "") for item in settings["peers"]}
-    peers = settings["peers"]
-    notices = []
-    for zone in settings["zones"]:
-        if zone.get("aside") is not True:
-            continue
-        owner = zone.get("peer")
-        if zone.get("off") is not True:
-            del zone["aside"]
-            continue
-        name = peerlist.label_for(peers, peer_id=owner) or peerlist.UNNAMED
-        word = KIND_WORDS.get(zone.get("kind"), "zone")
-        if gone(owner):
-            del zone["aside"]
-            notices.append(f"{name} no longer has this pairing, so its {word} stays off. Remove {name} here and "
-                           "pair the two again.")
-        elif live(owner):
-            del zone["aside"]
-            stretch = _stretch(zone, sides)
-            holder = next((other.get("peer") for other in settings["zones"] if other is not zone
-                           and other.get("off") is not True and _stretch(other, sides) & stretch), None)
-            if holder is None:
-                del zone["off"]
-            else:
-                held = peerlist.label_for(peers, peer_id=holder) or peerlist.UNNAMED
-                notices.append(f"{name} is connected again, but {held} leads from that part of {here}'s screen, so "
-                               f"{name}'s {word} stays off. Share the side on the Crossing page.")
-    return notices
+def settle_presence(settings: dict, here: str, live, gone) -> list:
+    """No-op: events recompile instead of restoring zone history."""
+    return []
 
 
 def gone_sentence(settings: dict, peer: str, here: str, gone: Callable[[str], bool]) -> str:
@@ -610,33 +1225,11 @@ def gone_sentence(settings: dict, peer: str, here: str, gone: Callable[[str], bo
     return f"{name} no longer has this pairing, so it has no way in. Remove {name} here and pair the two again."
 
 
-def _turn_off_clashes(settings: dict, entry: dict, here: str, live: Optional[Callable[[str], bool]] = None) -> list:
-    notices = give_way(settings, entry.get("id"), here, live)
-    sides = {item.get("id"): item.get("side", "") for item in settings["peers"]}
-    peers = settings["peers"]
-    covered = {}
-    mine = []
-    for zone in settings["zones"]:
-        if zone.get("off") is True:
-            continue
-        if zone.get("peer") == entry.get("id"):
-            mine.append(zone)
-            continue
-        for stretch in _stretch(zone, sides):
-            covered.setdefault(stretch, zone.get("peer"))
-    name = peerlist.label_for(peers, peer_id=entry.get("id")) or peerlist.UNNAMED
-    for zone in mine:
-        stretch = _stretch(zone, sides)
-        other = next((covered[item] for item in sorted(stretch) if item in covered), None)
-        if other is None:
-            for item in stretch:
-                covered.setdefault(item, entry.get("id"))
-            continue
-        zone["off"] = True
-        other_name = peerlist.label_for(peers, peer_id=other) or peerlist.UNNAMED
-        notices.append(f"{other_name} and {name} now lead from the same part of {here}'s screen, so {name}'s "
-                       f"{KIND_WORDS.get(zone.get('kind'), 'zone')} is off.")
-    return notices
+
+
+def _turn_off_clashes(settings: dict, entry: dict, here: str, live=None) -> list:
+    """No-op retained for older callers: compilation resolves overlap."""
+    return []
 
 
 def _sendable(entry: dict) -> bool:
@@ -655,6 +1248,83 @@ def shortcut_peer(peers: list, last: Optional[str], ready: Callable[[str], bool]
         return last
     fallback = last if last in candidates else (candidates[0] if candidates else None)
     return next((ident for ident in candidates if ready(ident)), fallback)
+
+
+def shortcut_order(peers: list, machine_id: str, positions: dict, mode: str = "next") -> list:
+    """Sendable peers in drawing reading order, rotated after this machine, followed by home.
+
+    `positions` maps machine ids to the frames returned by the arrangement drawing. Entries without
+    a frame follow in peers-list order; `None` at the end is home.
+    """
+    entries = [entry for entry in peers if _sendable(entry)
+               and (mode != "ticked" or entry.get("shortcut_cycle") is not False)]
+    placed = []
+    unplaced = []
+    for index, entry in enumerate(entries):
+        ident = entry["id"]
+        frame = positions.get(ident)
+        if frame is None:
+            unplaced.append((index, ident))
+        else:
+            x, y, _width, height = frame
+            placed.append((y + height / 2, x + _width / 2, height, index, ident))
+    placed.sort(key=lambda item: (item[0], item[1], item[3]))
+    rows = []
+    for item in placed:
+        centre_y, _centre_x, height, _index, ident = item
+        if not rows or centre_y - rows[-1][0][0] > min(height, rows[-1][0][2]) / 2:
+            rows.append([item])
+        else:
+            rows[-1].append(item)
+    reading = [item[4] for row in rows for item in sorted(row, key=lambda item: (item[1], item[3]))]
+    home = positions.get(machine_id)
+    if home is not None:
+        hx, hy, _hw, hh = home
+        hcy, hcx = hy + hh / 2, hx + _hw / 2
+        insertion = next((index for index, ident in enumerate(reading)
+                          if positions[ident][1] + positions[ident][3] / 2 - hcy >
+                          min(positions[ident][3], hh) / 2 or
+                          (abs(positions[ident][1] + positions[ident][3] / 2 - hcy) <=
+                           min(positions[ident][3], hh) / 2 and
+                           positions[ident][0] + positions[ident][2] / 2 > hcx)), len(reading))
+        reading[insertion:insertion] = []
+        before = reading[:insertion]
+        after = reading[insertion:]
+        reading = after + before
+    reading.extend(ident for _index, ident in unplaced)
+    return reading + [None]
+
+
+def next_target(settings: dict, order: list, current: Optional[str], ready: Callable[[Optional[str]], bool]):
+    """Next ready peer or home, and the peer ids skipped because they are not ready."""
+    peers = [ident for ident in order if ident is not None]
+    if current is None:
+        start = 0
+    else:
+        start = peers.index(current) + 1 if current in peers else 0
+    candidates = peers[start:]
+    skipped = []
+    for ident in candidates:
+        if ready(ident):
+            return ident, skipped
+        skipped.append(ident)
+    if current is None and peers:
+        return peers[0], skipped
+    return None, skipped
+
+
+def hold_target(settings: dict, order: list, last: Optional[str], ready: Callable[[str], bool]):
+    """The Hold-style destination and any preceding peers that were not ready."""
+    peers = [ident for ident in order if ident is not None]
+    candidates = peers
+    if settings.get("shortcut_goes_to", "last") == "last" and last in peers:
+        candidates = [last] + [ident for ident in peers if ident != last]
+    skipped = []
+    for ident in candidates:
+        if ready(ident):
+            return ident, skipped
+        skipped.append(ident)
+    return (peers[0] if peers else None), skipped
 
 
 def missing_pairings(settings: dict, peer: str) -> list:

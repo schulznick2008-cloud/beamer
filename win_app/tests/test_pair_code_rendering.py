@@ -22,8 +22,12 @@ class PairCodeRenderingTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
         previous_font = cls.app.font()
         previous_stylesheet = cls.app.styleSheet()
+        previous_dark = theme.is_dark()
+        cls.addClassCleanup(theme.set_dark, previous_dark)
         cls.addClassCleanup(cls.app.setStyleSheet, previous_stylesheet)
         cls.addClassCleanup(cls.app.setFont, previous_font)
+        # The pixel threshold measures pale digit ink, so a prior window's light palette cannot leak in.
+        theme.set_dark(True)
         theme.init_fonts()
         cls.app.setFont(theme.font(theme.TYPE["body"]))
         cls.app.setStyleSheet(theme.stylesheet())
@@ -165,7 +169,7 @@ class PairCodeRenderingTests(unittest.TestCase):
                         measurements)
 
     def test_pair_action_precedes_the_machines_list(self):
-        module = machines_win.MachinesModule(*([lambda *_: None] * 5))
+        module = machines_win.MachinesModule(*([lambda *_: None] * 6))
         module.resize(560, 300)
         module.show()
         self.app.processEvents()
@@ -176,7 +180,7 @@ class PairCodeRenderingTests(unittest.TestCase):
         entry = {"token": "test-machine", "name": "Studio", "platform": "macos", "port": 24820,
                  "host": "192.0.2.10", "send": True, "allow_drive": False, "in_use": True}
         state = machines_win.peers_view.PeerState("amber", "Waiting", "Looking for Studio.")
-        module.set_peers([(entry, "Studio", state, "Mac · 192.0.2.10 · port 24820")])
+        module.set_peers([(entry, "Studio", state, "Mac · 192.0.2.10 · port 24820")], cycle_mode="last")
         self.app.processEvents()
         row = module.rows["test-machine"]
         button_y = module.pair_button.mapTo(module, module.pair_button.rect().topLeft()).y()

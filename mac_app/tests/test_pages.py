@@ -154,11 +154,12 @@ class CrossingPageRulesTests(unittest.TestCase):
 
     def test_rows_follow_the_ways(self):
         self.assertEqual(pages.crossing_rows(["shortcut"]),
-                         {"edge": True, "parts": False, "corner": False, "dragging": False,
+                         {"edge": True, "parts": False, "corner": True, "dragging": True,
                           "resistance": False, "shortcut": True})
         rows = pages.crossing_rows(["part"])
         self.assertTrue(rows["edge"] and rows["parts"] and rows["resistance"])
-        self.assertFalse(rows["shortcut"] or rows["corner"])
+        self.assertFalse(rows["shortcut"])
+        self.assertTrue(rows["corner"] and rows["dragging"])
         self.assertTrue(pages.crossing_rows(["corner"])["edge"])
         self.assertTrue(pages.crossing_rows(["notch"])["resistance"])
         # Where the PC sits shows whatever the ways: the PC's edge facing this Mac always leads here.

@@ -54,7 +54,7 @@ def _run_real_font_window():
     theme.init_fonts()
     app.setFont(theme.font(theme.TYPE["body"]))
     assert theme.sans() == tokens.UI_FAMILY
-    work_root = Path(__file__).resolve().parents[2] / "renders" / "test-working"
+    work_root = Path(__file__).resolve().parents[1] / "renders" / "test-working"
     work_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=work_root) as directory:
         config_path = Path(directory) / "settings.json"

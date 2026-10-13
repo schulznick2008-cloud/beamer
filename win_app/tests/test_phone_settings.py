@@ -29,7 +29,7 @@ def peer(number, phone=False, **fields):
 
 class PhoneSettingsTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(dir=ROOT)
+        directory = tempfile.TemporaryDirectory(dir=ROOT / "win_app")
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "settings.json"
         self.phone = peer(2, phone=True)
@@ -51,6 +51,7 @@ class PhoneSettingsTests(unittest.TestCase):
             with self.subTest(order=[p["port"] for p in peers]):
                 before = self.put(peers)
                 config = app_config.load_config(self.path)
+                before = app_config.load_settings(self.path)
                 desktop = next((p for p in peers if p["port"]), None)
                 self.assertEqual(config.auth_token, desktop["token"] if desktop else "")
                 self.assertEqual(config.mac_host, desktop["host"] if desktop else "")

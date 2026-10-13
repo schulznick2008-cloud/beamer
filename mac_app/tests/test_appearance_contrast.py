@@ -286,7 +286,7 @@ class AppearanceContrast(unittest.TestCase):
         return checked, cards, failures
 
     def test_every_page_reads_in_dark_and_in_light_chosen_from_another_page(self):
-        # Toby's path: the window built dark, Light chosen on the Design page, then every other page.
+        # A user's path: the window built dark, Light chosen on the Design page, then every other page.
         self._choose("dark")
         self.control._select_page("design")
         self._choose("light")

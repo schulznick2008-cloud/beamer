@@ -541,9 +541,11 @@ class Pressable(AppKit.NSView):
     ring = None
     ring_owner = None
     selection_mark = None
+    selection_check = None
     tile_content = None
     ring_inset = -3.0
     pointer_cursor = False
+    selection_size = 16
 
     @objc.python_method
     def set_tile_state(self, selected=None, hovered=None):
@@ -566,21 +568,36 @@ class Pressable(AppKit.NSView):
     @objc.python_method
     def add_selection_mark(self):
         mark = Quartz.CAShapeLayer.layer()
-        path = Quartz.CGPathCreateMutable()
-        Quartz.CGPathMoveToPoint(path, None, 1, 6)
-        Quartz.CGPathAddLineToPoint(path, None, 4, 3)
-        Quartz.CGPathAddLineToPoint(path, None, 10, 10)
-        mark.setPath_(path)
-        mark.setFillColor_(None)
-        mark.setLineWidth_(2)
+        mark.setPath_(Quartz.CGPathCreateWithEllipseInRect(((0, 0), (self.selection_size, self.selection_size)), None))
         mark.setHidden_(True)
         self.layer().addSublayer_(mark)
         self.selection_mark = mark
+        check = Quartz.CAShapeLayer.layer()
+        path = Quartz.CGPathCreateMutable()
+        # The tile's layer is unflipped: y runs up, so the tick's foot is its lowest y.
+        Quartz.CGPathMoveToPoint(path, None, 3.5, 8)
+        Quartz.CGPathAddLineToPoint(path, None, 6.5, 5.5)
+        Quartz.CGPathAddLineToPoint(path, None, 12.5, 12)
+        check.setPath_(path)
+        check.setFillColor_(None)
+        check.setLineWidth_(2)
+        check.setLineCap_(Quartz.kCALineCapRound)
+        check.setLineJoin_(Quartz.kCALineJoinRound)
+        check.setHidden_(True)
+        self.layer().addSublayer_(check)
+        self.selection_check = check
 
     @objc.python_method
     def show_selection_mark(self, selected):
         self.selection_mark.setHidden_(not selected)
-        theme.tint(self.selection_mark, stroke='signal')
+        self.selection_check.setHidden_(not selected)
+        if selected:
+            # The preview and captions are subviews added after the mark, so their layers sit
+            # above it; zPosition would lift it on screen but not in renderInContext.
+            self.layer().addSublayer_(self.selection_mark)
+            self.layer().addSublayer_(self.selection_check)
+        theme.tint(self.selection_mark, fill='signal')
+        theme.tint(self.selection_check, stroke='ground')
         self.setNeedsLayout_(True)
 
     def acceptsFirstResponder(self):
@@ -634,14 +651,28 @@ class Pressable(AppKit.NSView):
         objc.super(Pressable, self).layout()
         content = getattr(self, 'tile_content', None)
         if content is not None:
-            content.arrange(self.bounds().size)
+            if hasattr(content, "preview"):
+                content.arrange(self.bounds().size, selected=not self.selection_mark.isHidden())
+            else:
+                content.arrange(self.bounds().size)
         ring = getattr(self, "ring", None)
         if ring is not None:
             inset = getattr(self, "ring_inset", -3.0)
             ring.setFrame_(AppKit.NSInsetRect(self.bounds(), inset, inset))
         mark = getattr(self, 'selection_mark', None)
         if mark is not None and not mark.isHidden():
-            mark.setFrame_(((self.bounds().size.width - 18, self.bounds().size.height - 18), (12, 12)))
+            content = getattr(self, 'tile_content', None)
+            if content is not None and hasattr(content, "preview"):
+                name_frame = content.name.view.frame()
+                frame = ((8, name_frame.origin.y + (name_frame.size.height - self.selection_size) / 2),
+                         (self.selection_size, self.selection_size))
+            else:
+                frame = ((self.bounds().size.width - 24, self.bounds().size.height - 24),
+                         (self.selection_size, self.selection_size))
+            mark.setFrame_(frame)
+            self.selection_check.setFrame_(frame)
+        elif getattr(self, 'tile_content', None) is not None and hasattr(self.tile_content, "preview"):
+            self.tile_content.arrange(self.bounds().size, selected=False)
         owner = getattr(self, "ring_owner", None)
         if owner is not None:
             owner.follow(self)
@@ -914,7 +945,9 @@ class FieldRow:
         self.stacked = None
         if caption is not None and not control.accessibilityLabel():
             control.setAccessibilityLabel_(caption)
-        selector = getattr(control, 'segmented_owner', None)
+        # Looked up once: a missing attribute on an AppKit view is a slow selector search, and a
+        # slider has none, so asking on every layout pass cost each live-resize frame 2 ms.
+        self.selector = selector = getattr(control, 'segmented_owner', None)
         if selector is not None:
             selector.set_cap({'Length': 240, 'Size': 240, 'This window': 252,
                               'Ticks at': 360, 'Style for': 240, 'Show at': 264}.get(caption, selector.cap))
@@ -922,9 +955,8 @@ class FieldRow:
 
     def arrange(self, width):
         stacked = self.caption is None or width < 528
-        selector = getattr(self.control, 'segmented_owner', None)
-        if selector is not None:
-            selector.set_available_width(max(0, width - (0 if stacked else 196)))
+        if self.selector is not None:
+            self.selector.set_available_width(max(0, width - (0 if stacked else 196)))
         if stacked == self.stacked:
             return
         self.stacked = stacked
@@ -1249,7 +1281,7 @@ class Segmented:
 class MenuChoice:
     """Native menu keeps full machine names available without growing the column."""
     def __init__(self, choices, on_change=None):
-        self.choices = list(choices)
+        self.choices = []
         self.on_change = on_change
         self.view = box()
         self.popup = _autolayout(AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(((0, 0), (0, 0)), False))
@@ -1260,12 +1292,17 @@ class MenuChoice:
         # Native popup frames extend beyond their alignment rect by seven points.
         pin(self.popup, self.view, (0, 4, 0, 4))
         self.items = []
-        for value, title in choices:
-            self.popup.addItemWithTitle_(title)
-            item = self.popup.lastItem()
-            item.setToolTip_(title)
-            self.items.append((value, item))
-        self.target = _Target.alloc().initWithCallback_(self._changed)
+        self.set_choices(choices)
+        # PyObjC's target holds Python attributes outside the cyclic GC graph. A bound method
+        # here keeps this picker, its popup and its target alive after removal from the stack.
+        owner = weakref.ref(self)
+
+        def changed(sender):
+            choice = owner()
+            if choice is not None:
+                choice._changed(sender)
+
+        self.target = _Target.alloc().initWithCallback_(changed)
         self.popup.setTarget_(self.target)
         self.popup.setAction_('fire:')
         self.view.widthAnchor().constraintLessThanOrEqualToConstant_(320).setActive_(True)
@@ -1275,6 +1312,21 @@ class MenuChoice:
         self.view.heightAnchor().constraintGreaterThanOrEqualToConstant_(30).setActive_(True)
         squeeze(self.view)
         squeeze(self.popup)
+
+    def set_choices(self, choices):
+        choices = list(choices)
+        if choices == self.choices:
+            return
+        value = self.value if self.choices else ""
+        self.popup.removeAllItems()
+        self.choices = choices
+        self.items = []
+        for value_key, title in choices:
+            self.popup.addItemWithTitle_(title)
+            item = self.popup.lastItem()
+            item.setToolTip_(title)
+            self.items.append((value_key, item))
+        self.value = value
 
     @property
     def value(self):
@@ -1636,13 +1688,22 @@ class JumpKeyRecorder:
 
     HINT = "Click, then press a key combination"
 
-    def __init__(self, value="", on_change=None, on_arm=None):
+    def __init__(self, value="", on_change=None, on_arm=None, compact=False):
         self.value = value or ""
         self.on_change = on_change
         self.on_arm = on_arm
         self.monitor = None
+        self.compact = compact
         self.view = pressable(self._clicked, "edge", radius=theme.RADIUS["keycap"])
         self.view.setAccessibilityLabel_("Jump straight here key, " + self._title())
+        if compact:
+            self.key = Label("", theme.TYPE["small"], ink="ink_2", wrap=True)
+            self.hint = Label(self.HINT, theme.TYPE["small"], ink="ink_3", wrap=True)
+            for label in (self.key, self.hint):
+                label.view.setTranslatesAutoresizingMaskIntoConstraints_(True)
+                self.view.addSubview_(label.view)
+            self._show_title()
+            return
         face = box("ground", radius=theme.RADIUS["keycap"] - 1)
         self.view.addSubview_(face)
         pin(face, self.view, (1, 1, 3, 1))
@@ -1658,6 +1719,15 @@ class JumpKeyRecorder:
 
     def _show_title(self, ink=None):
         has_value = bool(self.value)
+        if self.compact:
+            symbols = {"ctrl": "⌃", "alt": "⌥", "shift": "⇧", "cmd": "⌘"}
+            parts = self.value.split("+")
+            title = "".join(symbols.get(part, part) for part in parts[:-1]) + " " + key_title(parts[-1])
+            self.key.set(title.strip() if has_value else "Set a key", size=theme.TYPE["small"] if has_value else 12.5,
+                         ink=ink or ("ink" if has_value else "ink_2"), mono=has_value)
+            self.hint.view.setHidden_(True)
+            paint(self.view, "well" if has_value else None, "edge" if has_value else None, radius=4)
+            return
         self.key.set(
             self._title(),
             size=theme.TYPE["keycap"] if has_value else theme.TYPE["body"],
@@ -1683,6 +1753,9 @@ class JumpKeyRecorder:
         self.key.set("Press a key combination…", size=theme.TYPE["body"], ink="signal", mono=False)
         self.hint.set("Click again to cancel")
         paint(self.view, "signal")
+        if self.compact:
+            self.hint.view.setHidden_(False)
+            paint(self.view, "well", "signal", radius=4)
         self.monitor = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
             AppKit.NSEventMaskKeyDown | AppKit.NSEventMaskFlagsChanged, self._recorded
         )
@@ -1693,6 +1766,11 @@ class JumpKeyRecorder:
         if event.type() != AppKit.NSEventTypeKeyDown:
             return event
         flags = int(event.modifierFlags())
+        if int(event.keyCode()) == 53 and not flags & (
+                AppKit.NSEventModifierFlagControl | AppKit.NSEventModifierFlagOption |
+                AppKit.NSEventModifierFlagShift | AppKit.NSEventModifierFlagCommand):
+            self._stop()
+            return None
         modifiers = []
         for name, flag in (("ctrl", AppKit.NSEventModifierFlagControl), ("alt", AppKit.NSEventModifierFlagOption),
                            ("shift", AppKit.NSEventModifierFlagShift), ("cmd", AppKit.NSEventModifierFlagCommand)):
@@ -1713,14 +1791,33 @@ class JumpKeyRecorder:
         self._stop()
 
     def _stop(self):
+        was_armed = self.monitor is not None
         if self.monitor is not None:
             AppKit.NSEvent.removeMonitor_(self.monitor)
             self.monitor = None
-            if self.on_arm is not None:
-                self.on_arm(False)
         self._show_title()
         self.hint.set(self.HINT)
-        paint(self.view, "edge")
+        if not self.compact:
+            paint(self.view, "edge")
+        if was_armed and self.on_arm is not None:
+            self.on_arm(False)
+
+    def arrange_compact(self, available):
+        padding = 6 if self.value or self.monitor is not None else 0
+        text = self.key.view.attributedStringValue()
+        width = min(available, math.ceil(text.size().width) + 2 * padding + 4)
+        if self.monitor is not None:
+            width = available
+        text_width = max(1, width - 2 * padding)
+        options = AppKit.NSStringDrawingUsesLineFragmentOrigin | AppKit.NSStringDrawingUsesFontLeading
+        height = max(24, math.ceil(text.boundingRectWithSize_options_((text_width, 1000), options).size.height) + 8)
+        self.key.view.setFrame_(((padding, 3), (text_width, height - 6)))
+        if self.monitor is not None:
+            hint_height = math.ceil(self.hint.view.attributedStringValue().boundingRectWithSize_options_(
+                (text_width, 1000), options).size.height) + 4
+            self.hint.view.setFrame_(((padding, height), (text_width, hint_height)))
+            height += hint_height + 6
+        return width, height
 
 
 class IgnoredRecorder:
@@ -1963,11 +2060,14 @@ class Sidebar:
         ])
         self.word = Label("", theme.SIDEBAR_WORD, 700, wrap=True)
         self.peer = Label("", theme.TYPE["small"], mono=True, ink="ink_3")
+        self.response_time = Label("", theme.TYPE["small"], ink="ink_3", wrap=True)
+        self.response_time.view.setHidden_(True)
         squeeze(self.peer.view)
         words = stack(spacing=3)
         self.link_words = words
         add(words, self.word.view)
         add(words, self.peer.view)
+        add(words, self.response_time.view)
         line = stack(vertical=False, spacing=5)
         line.setAlignment_(AppKit.NSLayoutAttributeTop)
         line.addArrangedSubview_(slot)
@@ -1975,6 +2075,10 @@ class Sidebar:
         link.addSubview_(line)
         pin(line, link, (18, 12, 18, 14))
         add(column, link)
+        self.response_rail = Label("", theme.TYPE["small"], ink="ink_3", align=AppKit.NSTextAlignmentCenter)
+        self.response_rail.view.setHidden_(True)
+        add(column, self.response_rail.view)
+        column.setCustomSpacing_afterView_(6, self.response_rail.view)
         rule = add(column, hairline())
         column.setCustomSpacing_afterView_(12, rule)
 
@@ -2089,6 +2193,7 @@ class Sidebar:
             return
         self.collapsed = collapsed
         self.link_words.setHidden_(collapsed)
+        self.response_rail.view.setHidden_(not collapsed or not getattr(self, "_response_connected", False))
         for (_name, _row, _icon, words, _bar, dot), inset, width, dot_inset in zip(
                 self.rows.values(), self.row_insets, self.row_widths, self.dot_insets):
             words.view.setHidden_(collapsed)
@@ -2114,12 +2219,24 @@ class Sidebar:
         self.select(key)
         self.on_select(key)
 
-    def set_link(self, state, peer):
+    def set_link(self, state, peer, response_time_ms=None, connected=False):
+        self._response_connected = connected
         self.led.set(state.led, state.blink)
         self.word.set(state.word, ink=state.tone)
         self.peer.set(peer)
-        self.header.setAccessibilityLabel_(f'{state.word}, {peer}')
-        self.header.setToolTip_(f'{state.word}, {peer}')
+        if connected:
+            response = f"Response time: {response_time_ms} ms" if response_time_ms is not None else "Response time: —"
+            spoken_response = response if response_time_ms is not None else "Response time: no fresh measurement"
+        else:
+            response = spoken_response = ""
+        self.response_time.set(response)
+        self.response_time.view.setHidden_(not connected)
+        self.response_rail.set(f"{response_time_ms} ms" if response_time_ms is not None else "—")
+        self.response_rail.view.setAccessibilityLabel_(spoken_response)
+        self.response_rail.view.setHidden_(not connected or not getattr(self, "collapsed", False))
+        description = ", ".join(part for part in (state.word, peer, spoken_response) if part)
+        self.header.setAccessibilityLabel_(description)
+        self.header.setToolTip_(description)
 
     def set_dots(self, marks):
         for page, (name, row, _icon, _words, _bar, dot) in self.rows.items():
@@ -2211,9 +2328,12 @@ class Ring:
 
 class ChoiceGrid:
     """Each family wraps within its own equal-width grid; partial rows keep that width."""
-    def __init__(self, view, cells, owner, swatches=False):
+    def __init__(self, view, cells, owner, swatches=False, keep_columns=False):
         self.view, self.cells, self.owner = view, cells, owner
         self.swatches = swatches
+        # A style group shorter than a row keeps its family's tile width, so a lone Aperture is
+        # the size of the tiles above and below it rather than the whole row.
+        self.keep_columns = keep_columns
         self.columns = None
         self.last_width = None
         self.height = view.heightAnchor().constraintEqualToConstant_(0)
@@ -2224,7 +2344,8 @@ class ChoiceGrid:
     def arrange(self, width):
         column = width + 32
         count = (5 if column >= 600 else 3 if column >= 400 else 2) if self.swatches else (3 if column >= 600 else 2 if column >= 400 else 1)
-        count = min(count, len(self.cells))
+        if not self.keep_columns:
+            count = min(count, len(self.cells))
         if width == self.last_width:
             return
         self.last_width = width
@@ -2243,6 +2364,7 @@ class ChoiceGrid:
 
 class _TileContent:
     """Keep preview geometry out of the page's constraint engine during live resize."""
+    CHECK_ROOM = 22
     def __init__(self, preview, name, detail):
         self.preview, self.name, self.detail = preview, name, detail
         self.last_size = None
@@ -2252,20 +2374,23 @@ class _TileContent:
             if c.firstItem() == preview and c.secondItem() in (None, preview)
         ])
 
-    def arrange(self, size):
+    def arrange(self, size, selected=False):
         dimensions = (size.width, size.height)
         caption = tuple((label.text, label.size, label.weight) for label in (self.name, self.detail))
-        if (dimensions, caption) == self.last_size:
+        if (dimensions, caption, selected) == self.last_size:
             return
-        self.last_size = (dimensions, caption)
+        self.last_size = (dimensions, caption, selected)
         width, height = dimensions
         text_width = max(1, width - 16)
+        # The name always leaves room for the check it shows while chosen, so choosing a tile
+        # moves its name and nothing else.
+        name_width = max(1, text_width - self.CHECK_ROOM)
         key = (text_width, caption)
         heights = self.measurements.get(key)
         if heights is None:
             heights = [math.ceil(label.view.attributedStringValue().boundingRectWithSize_options_(
-                (text_width, 1000), AppKit.NSStringDrawingUsesLineFragmentOrigin).size.height)
-                       for label in (self.name, self.detail)]
+                (room, 1000), AppKit.NSStringDrawingUsesLineFragmentOrigin).size.height)
+                       for label, room in ((self.name, name_width), (self.detail, text_width))]
             if len(self.measurements) >= 64:
                 self.measurements.clear()
             self.measurements[key] = heights
@@ -2275,8 +2400,8 @@ class _TileContent:
         self.preview.setFrame_(((width / 2 - preview_width / 2, height - 8 - preview_height),
                                (preview_width, preview_height)))
         self.preview.setNeedsLayout_(True)
-        self.name.view.setFrame_(((8, height - 14 - preview_height - name_height),
-                                 (text_width, name_height)))
+        self.name.view.setFrame_(((8 + (self.CHECK_ROOM if selected else 0), height - 14 - preview_height - name_height),
+                                 (name_width, name_height)))
         self.detail.view.setFrame_(((8, height - 18 - preview_height - name_height - detail_height),
                                    (text_width, detail_height)))
         self.name.view.setNeedsDisplay_(True)
@@ -2304,7 +2429,8 @@ class _SwatchContent:
 class ChoiceTiles:
     """A row or stack of preview cards. Style families use the full-width stacked form."""
 
-    def __init__(self, choices, on_change=None, columns=None, tile_width=None, vertical=False, responsive=False, aspect=True):
+    def __init__(self, choices, on_change=None, columns=None, tile_width=None, vertical=False, responsive=False, aspect=True,
+                 keep_columns=False):
         self.on_change = on_change
         self._value = None
         self.enabled = True
@@ -2395,7 +2521,7 @@ class ChoiceTiles:
         self.ring = None if vertical else Ring(self.view, theme.RADIUS["segment"])
         self.ring_shared = False
         if responsive:
-            self.grid = ChoiceGrid(self.view, [tile for _, tile, _ in self.tiles], self)
+            self.grid = ChoiceGrid(self.view, [tile for _, tile, _ in self.tiles], self, keep_columns=keep_columns)
             self.view.owner = self.grid
             self.grid.arrange(640)
 
@@ -2420,11 +2546,20 @@ class ChoiceTiles:
             self.ring.show(chosen_tile, self.enabled)
 
     def set_enabled(self, enabled):
+        if enabled == self.enabled:
+            return
         self.enabled = enabled
         self.view.setAlphaValue_(1.0 if enabled else 0.45)
         for _value, tile, _name in self.tiles:
             tile.enabled = enabled
         self.value = self._value
+
+    def set_detail(self, value, detail):
+        for candidate, tile, _name in self.tiles:
+            if candidate == value:
+                tile.tile_content.detail.set(detail)
+                tile.setNeedsLayout_(True)
+                return
 
     def _choose(self, value):
         if value == self._value:
@@ -2524,6 +2659,8 @@ class Swatches:
             self.ring.show(chosen_chip, self.enabled)
 
     def set_enabled(self, enabled):
+        if enabled == self.enabled:
+            return
         self.enabled = enabled
         self.view.setAlphaValue_(1.0 if enabled else 0.45)
         for _value, cell, _chip, _name in self.cells:
@@ -2580,6 +2717,12 @@ class Linked:
     def set_enabled(self, enabled):
         for row in self.rows:
             row.set_enabled(enabled)
+
+    def set_detail(self, value, detail):
+        for row in self.rows:
+            if value in row.values:
+                row.set_detail(value, detail)
+                return
 
     def _chosen(self, value):
         self.value = value

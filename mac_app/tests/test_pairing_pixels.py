@@ -96,7 +96,8 @@ class PairingPixelsTests(unittest.TestCase):
         self.window.setReleasedWhenClosed_(False)
         self.window.setAppearance_(theme.appearance_named(True))
         owner = SimpleNamespace(window=self.window, _shown=lambda text: text)
-        controller = SimpleNamespace(cfg=SimpleNamespace(hide_addresses=False))
+        controller = SimpleNamespace(cfg=SimpleNamespace(hide_addresses=False),
+                                     book=SimpleNamespace(peers=lambda: []))
         self.panel = machines_panel.MachinesPanel(controller, mock.Mock(), mock.Mock(), owner)
         self.panel.rows = lambda: []
         self.panel.service = SimpleNamespace(code=None, machines=lambda: [], seconds_left=60, outcome=None,

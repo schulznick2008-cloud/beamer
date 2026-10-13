@@ -24,6 +24,7 @@ from bridge import (
     CONNECT_TIMEOUT_SECONDS,
     CROSSING_RETRY_SECONDS,
     KVMController,
+    KeyResult,
     QuartzEventTranslator,
 )
 from bridge_fakes import (  # noqa: F401  (re-exported)
@@ -40,7 +41,7 @@ from bridge_fakes import (  # noqa: F401  (re-exported)
     settle,
 )
 from fake_link import OTHER_ID, PEER_ID, FakeLink, bring_up
-from gestures import CHORD, DOCK_CONTROL_TYPE, MAGNIFY_TYPE, SWIPE_TYPE
+from gestures import CHORD, DOCK_CONTROL_TYPE, GESTURE_TYPE, MAGNIFY_TYPE, SWIPE_TYPE
 from input_injector_mac import INJECTED_MARK
 
 
@@ -422,8 +423,42 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(link.dropped, [])
         self.assertFalse(link.stopped)
 
+    def test_hid_activity_missing_from_the_tap_returns_input_home(self):
+        class ActiveHIDQuartz(FakeQuartz):
+            kCGEventSourceStateHIDSystemState = 1
+            kCGAnyInputEventType = 0
+            hid_seconds_ago = 0.0
+
+            @classmethod
+            def CGEventSourceSecondsSinceLastEventType(cls, source, event_type):
+                return cls.hid_seconds_ago
+
+        controller = make_controller(self.clock, quartz=ActiveHIDQuartz)
+        self.addCleanup(controller.stop_event.set)
+        link = bring_up(controller)
+        controller.event_tap = object()
+        event = {FakeQuartz.kCGMouseEventDeltaX: 1, FakeQuartz.kCGMouseEventDeltaY: 0}
+        controller._event_tap_callback(None, FakeQuartz.kCGEventMouseMoved, event, None)
+        self.assertTrue(controller.set_redirecting(True))
+        self.clock.value += 3.0
+
+        with self.assertLogs(controller.logger, level="WARNING") as said:
+            controller._check_tap_watchdog()
+
+        self.assertFalse(controller.redirecting)
+        self.assertFalse(controller.owner.away)
+        self.assertIn(True, [enabled for _tap, enabled in ActiveHIDQuartz.tap_enable_calls])
+        self.assertTrue(any("event tap is not receiving input" in line for line in said.output), said.output)
+        self.assertTrue(link.live())
+
+    def test_move_logs_that_the_shortcut_double_tap_started_it(self):
+        bring_up(self.controller)
+        with self.assertLogs(self.controller.logger, level="INFO") as said:
+            self._double_tap()
+        self.assertTrue(any("move started by shortcut double-tap" in line for line in said.output), said.output)
+
     def test_the_shortcut_there_and_back_never_clicks_on_this_mac(self):
-        """Toby 06-10: a grey box round the pointer after the shortcut, "which clicked on return". A
+        """A report, 06-10: a grey box round the pointer after the shortcut, "which clicked on return". A
         click made while away, and one held across the return, reach this Mac as nothing but the
         user's own events: no button is posted, made or handed back that the hand did not press."""
         bring_up(self.controller)
@@ -552,6 +587,39 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(sent_home, [True])
         self.assertFalse(self.controller.redirecting)
 
+    def test_next_shortcut_moves_from_home_to_the_first_machine(self):
+        cfg = crossing_config(PAIRED_TOKEN, methods=["shortcut"])
+        cfg.crossing["shortcut_goes_to"] = "next"
+        controller = make_controller(self.clock, cfg)
+        self.addCleanup(controller.stop_event.set)
+        bring_up(controller)
+        target = protocol.id_text(PEER_ID)
+        controller._shortcut_cycle = lambda: [target, None]
+        controller._ready = lambda _ident: True
+        selected = []
+        controller.set_redirecting = lambda value, **kwargs: selected.append((value, kwargs.get("peer"))) or True
+        controller._handle_trigger(KeyResult(True, True, False, []), object())
+        self.clock.value = 10.2
+        controller._handle_trigger(KeyResult(True, True, False, []), object())
+        self.assertEqual(selected, [(True, target)])
+
+    def test_hold_shortcut_announces_an_unready_last_machine(self):
+        cfg = crossing_config(PAIRED_TOKEN, methods=["shortcut"])
+        cfg.trigger_style = "hold"
+        controller = make_controller(self.clock, cfg)
+        self.addCleanup(controller.stop_event.set)
+        bring_up(controller)
+        first, second = "first", protocol.id_text(PEER_ID)
+        controller._last_peer = first
+        controller._shortcut_cycle = lambda: [first, second, None]
+        controller._ready = lambda ident: ident == second
+        skipped = []
+        selected = []
+        controller._announce_shortcut_skips = skipped.extend
+        controller.set_redirecting = lambda value, **kwargs: selected.append((value, kwargs.get("peer"))) or True
+        controller._handle_trigger(KeyResult(True, True, False, []), object())
+        self.assertEqual((selected, skipped), ([(True, second)], [first]))
+
     def test_the_pcs_injected_trigger_is_not_this_macs_while_receiving(self):
         sent_home = []
         bring_up(self.controller)
@@ -598,6 +666,20 @@ class ControllerTests(unittest.TestCase):
         self.controller.connection_status = "Waiting to connect"
         # Must not raise even though the callback is broken.
         self.assertFalse(self.controller.set_redirecting(True))
+
+    def test_holding_a_key_trigger_never_toggles(self):
+        # The Windows trigger counted autorepeat as taps until 1.5.2; the Mac reads the tap's
+        # autorepeat field, and this holds it to that.
+        bring_up(self.controller)
+        self.controller.cfg.trigger_key = "f13"
+        press = {FakeQuartz.kCGKeyboardEventKeycode: 0x69, FakeQuartz.kCGKeyboardEventAutorepeat: 0, "flags": 0}
+        repeat = dict(press)
+        repeat[FakeQuartz.kCGKeyboardEventAutorepeat] = 1
+        self._tap(FakeQuartz.kCGEventKeyDown, press)
+        for step in range(30):
+            self.clock.value = 10.5 + 0.033 * step
+            self._tap(FakeQuartz.kCGEventKeyDown, repeat)
+            self.assertFalse(self.controller.redirecting)
 
     def test_double_tap_survives_a_missed_key_up(self):
         # Regression: the old toggle-based modifier tracking desynced when a
@@ -1026,16 +1108,17 @@ class MediaKeyWiringTests(unittest.TestCase):
             {"type": protocol.MSG_KEYUP, "data": {"key": "volume_up"}},
         )
 
-    def test_non_media_system_event_passes_through(self):
-        # NX code 3 is brightness-up, which Windows has no equivalent for.
+    def test_brightness_system_event_is_forwarded(self):
         controller = self._controller(lambda event: (8, self._data1(3)))
         redirect_to(controller)
-        raw_event = object()
         self.assertIs(
-            controller._event_tap_callback(None, self.SYSDEFINED, raw_event, None),
-            raw_event,
+            controller._event_tap_callback(None, self.SYSDEFINED, object(), None),
+            None,
         )
-        self.assertTrue(controller.outbound.empty())
+        self.assertEqual(
+            controller.outbound.get_nowait(),
+            {"type": protocol.MSG_KEYDOWN, "data": {"key": "brightness_down"}},
+        )
 
     def test_not_redirecting_passes_through_without_converting(self):
         calls = []
@@ -1218,6 +1301,27 @@ class DockControlWiringTests(unittest.TestCase):
         self.assertIsNone(controller._event_tap_callback(None, DOCK_CONTROL_TYPE, object(), None))
         self.assertTrue(controller.outbound.empty())
         self.assertTrue(controller.redirecting)
+
+
+class Type29GestureWiringTests(unittest.TestCase):
+    def test_zoom_fields_are_translated_and_swallowed_while_redirecting(self):
+        controller = make_controller(FakeClock())
+        redirect_to(controller)
+        raw_event = {110: 8, 113: 0.06, 132: 2}
+
+        returned = controller._event_tap_callback(None, GESTURE_TYPE, raw_event, None)
+
+        self.assertIsNone(returned)
+        self.assertEqual(controller.outbound.get_nowait(), {"type": CHORD, "data": {"action": "zoom_in"}})
+        self.assertTrue(controller.outbound.empty())
+
+    def test_type29_scroll_subtype_passes_through_unchanged(self):
+        controller = make_controller(FakeClock())
+        redirect_to(controller)
+        raw_event = {110: 6, 113: 0.5, 132: 2}
+
+        self.assertIs(controller._event_tap_callback(None, GESTURE_TYPE, raw_event, None), raw_event)
+        self.assertTrue(controller.outbound.empty())
 
 
 class CrossingWiringTests(unittest.TestCase):
@@ -1682,6 +1786,37 @@ class RoundTripTests(unittest.TestCase):
 
 
 class HeldKeyMappingTests(unittest.TestCase):
+    def test_command_tab_switches_to_alt_for_the_hold_and_releases_alt(self):
+        controller = KVMController.__new__(KVMController)
+        controller.cfg = types.SimpleNamespace(key_map=config.KEY_MAP_STYLES["semantic"])
+        controller._sent_names = {}
+        link = FakeLink("token", types.SimpleNamespace(peers=lambda: []), lambda: {})
+        link.peer_id = b"peer"
+        link._live = True
+        link.peer_platform = "windows"
+        controller._peers_up = {b"peer": link}
+
+        for kind, key in (
+            (protocol.MSG_KEYDOWN, "cmd"),
+            (protocol.MSG_KEYDOWN, "tab"),
+            (protocol.MSG_KEYDOWN, "tab"),
+            (protocol.MSG_KEYDOWN, "shift"),
+            (protocol.MSG_KEYDOWN, "tab"),
+            (protocol.MSG_KEYUP, "tab"),
+            (protocol.MSG_KEYUP, "shift"),
+            (protocol.MSG_KEYUP, "cmd"),
+        ):
+            controller._send(types.SimpleNamespace(peer=b"peer", message={"type": kind, "data": {"key": key}}))
+
+        self.assertEqual(
+            [(message["type"], message["data"]["key"]) for message in link._sent],
+            [(protocol.MSG_KEYDOWN, "ctrl"), (protocol.MSG_KEYUP, "ctrl"),
+             (protocol.MSG_KEYDOWN, "alt"), (protocol.MSG_KEYDOWN, "tab"),
+             (protocol.MSG_KEYDOWN, "tab"), (protocol.MSG_KEYDOWN, "shift"),
+             (protocol.MSG_KEYDOWN, "tab"), (protocol.MSG_KEYUP, "tab"),
+             (protocol.MSG_KEYUP, "shift"), (protocol.MSG_KEYUP, "alt")],
+        )
+
     def test_key_release_keeps_the_mapping_used_for_its_press(self):
         controller = KVMController.__new__(KVMController)
         controller.cfg = types.SimpleNamespace(key_map=config.KEY_MAP_STYLES["semantic"])

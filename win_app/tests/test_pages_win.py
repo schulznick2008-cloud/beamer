@@ -1,11 +1,14 @@
 import os
 import unittest
 import sys
+import time
+from unittest import mock
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import app_config
 from core import effects
+from core import ways
 import pages_win
 
 try:
@@ -225,7 +228,7 @@ class SwitchGroupsTest(unittest.TestCase):
 
     def test_simple_and_aperture_come_first_then_the_crossing_directions(self):
         groups = pages_win.switch_groups()
-        self.assertEqual(groups[0], ("Simple", (("match", "Same as crossing", "Plays the crossing style"),
+        self.assertEqual(groups[0], ("Simple", (("match", "Same as crossing", "Plays Glow"),
                                                 ("locator", "Ring", "Closes onto the pointer"))))
         self.assertEqual(groups[1], ("Light", (("aperture", "Aperture", "Showpiece"),)))
         self.assertEqual(groups[2:], pages_win.style_groups()[1:])
@@ -313,6 +316,7 @@ class CrossingPageTest(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
+        from PySide6.QtCore import QCoreApplication, QEvent
         from PySide6.QtWidgets import QApplication
 
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -333,6 +337,7 @@ class CrossingPageTest(unittest.TestCase):
         app_config.write_settings(self.path, settings)
         self.page = kvm_bridge_win.WindowsApplication(self.path)
         self.page._send_to = lambda peer, message: True
+        self.addCleanup(QCoreApplication.sendPostedEvents, None, QEvent.Type.DeferredDelete)
         self.addCleanup(self.page.deleteLater)
         self.addCleanup(self.page.server.stop)
 
@@ -340,14 +345,50 @@ class CrossingPageTest(unittest.TestCase):
         app_config.set_ways(self.path, self.peer, side=side, methods=list(methods), parts=list(parts), corner="top_left")
         self.page._pull_peer_fields()
 
-    def shown(self):
-        import motion
+    def test_fixture_releases_window_before_the_next_case(self):
+        from shiboken6 import isValid
 
         page = self.page
-        rows = {key for key, row in page.crossing_rows.items() if motion.target_shown(row)}
-        rows |= {"resistance"} if motion.target_shown(page.resistance_module) else set()
-        rows |= {"shortcut"} if motion.target_shown(page.shortcut_module) else set()
-        return rows
+        self.doCleanups()
+        self.assertFalse(isValid(page))
+
+    def test_incoming_layout_keeps_a_locally_held_paired_tile_when_missing(self):
+        from core import protocol, settings_sync
+        from core.tests import responder_harness as harness
+
+        settings = app_config.load_settings(self.path)
+        paired = protocol.id_text(bytes(range(110, 126)))
+        own = settings["machine_id"]
+        settings["peers"][0]["paired_with"] = [paired]
+        settings["layout"][own] = {"x": 0, "y": 0, "w": 160, "h": 100}
+        settings["layout"][self.peer] = {"x": 172, "y": 0, "w": 160, "h": 100}
+        settings["layout"][paired] = {"x": 500, "y": 100, "w": 160, "h": 100, "name": "Test box"}
+        app_config.write_settings(self.path, settings)
+        self.page._config = app_config.load_config(self.path)
+        source_id = protocol.read_id(self.peer)
+        self.page._peer_caps = lambda: {source_id: {"settings", "layout"}}
+        self.page._design_peer_caps = lambda: {self.peer: {"settings", "layout"}}
+        incoming = {
+            settings["machine_id"]: dict(settings["layout"][settings["machine_id"]]),
+            self.peer: dict(settings["layout"][self.peer]),
+        }
+        data = settings_sync.message_data(False, 0, by=self.peer,
+                    layout_state={"set_at": self.page._config.layout_set_at + 1, "by": self.peer, "tiles": incoming})
+
+        self.page._on_settings(self.peer, data)
+
+        self.assertEqual(app_config.load_settings(self.path)["layout"][paired], settings["layout"][paired])
+
+    def test_each_gap_has_its_own_ledger_place_instruction(self):
+        from core import protocol
+        from core.tests import responder_harness as harness
+        settings = app_config.load_settings(self.path)
+        second = protocol.id_text(harness.C)
+        settings["peers"].append(harness.entry(harness.C, "Other", side="right"))
+        settings["layout"][second] = dict(x=500, y=100, w=160, h=100)
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        self.assertEqual(self.page.crossing_ledger.rows[second].edge_value.text(), "Off")
 
     def test_the_native_titlebar_can_maximise_and_has_no_width_cap(self):
         from PySide6.QtCore import Qt
@@ -365,53 +406,432 @@ class CrossingPageTest(unittest.TestCase):
         self.page._select_page("crossing")
         QApplication.processEvents()
 
-        self.assertLessEqual(self.page.arrangement_diagram.width(), tokens.PAGE_CONTENT_MAX)
-        self.assertLessEqual(max(button.width() for button in self.page.edge_choice._buttons.values()), tokens.PAGE_CONTENT_MAX / 4)
+        self.assertLessEqual(self.page.atlas_canvas.width(), tokens.PAGE_CONTENT_MAX)
 
-    def test_jump_placeholder_uses_body_text_with_the_hint_below(self):
+    def test_ledger_jump_arms_its_hint_in_place(self):
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertEqual(row.jump.key.text(), "Set a key")
+        self.assertTrue(row.jump.hint.isHidden())
+        row.jump._toggle()
+        self.assertFalse(row.jump.hint.isHidden())
+
+    def test_ledger_rows_stay_in_place_while_ways_change(self):
+        self.ways()
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertEqual(row.edge_glyph.picked, [])
+        self.assertEqual(row.corner_glyph.corner, "")
+        self.ways(["corner"])
+        self.assertEqual(row.corner_glyph.corner, "top_left")
+        self.assertIs(row, self.page.crossing_ledger.rows[self.peer])
+
+    def test_the_canvas_replaces_the_side_and_thirds_choices(self):
+        self.assertTrue(hasattr(self.page, "atlas_canvas"))
+        self.assertFalse(hasattr(self.page, "edge_choice"))
+        self.assertFalse(hasattr(self.page, "parts_choice"))
+
+    def test_display_gesture_hint_is_below_the_canvas(self):
         from PySide6.QtWidgets import QApplication
 
         self.page.resize(820, 700)
         self.page.show()
         self.page._select_page("crossing")
+        for _ in range(8):
+            QApplication.processEvents()
+
+        self.assertEqual(self.page.atlas_canvas_hint.text(), "Alt-click a display to split or group · drag to move · click a third of a lit edge to leave it out")
+        self.assertIs(self.page.atlas_canvas_hint.parentWidget(), self.page.atlas_canvas.parentWidget())
+        self.assertGreaterEqual(self.page.atlas_canvas_hint.y(),
+                                self.page.atlas_canvas.y() + self.page.atlas_canvas.height())
+
+    def test_an_edge_learned_from_a_peer_updates_its_canvas_tile(self):
+        page = self.page
+        self.ways(["part"])
+        old_y = page.atlas_canvas.tiles[self.peer]["y"]
+        page._design_peer_caps = lambda: {self.peer: {"settings"}}
+        page._on_arrangement(self.peer, "bottom", int(time.time()), self.peer)
+        self.assertIn(self.peer, page.atlas_canvas.tiles)
+        saved_layout = app_config.load_settings(self.path)["layout"]
+        self.assertNotEqual(page.atlas_canvas.tiles[self.peer]["y"], old_y)
+        self.assertEqual(page.atlas_canvas.tiles[self.peer]["y"], saved_layout[self.peer]["y"])
+
+    def test_older_peer_status_requires_known_capabilities_and_uses_peer_version(self):
+        from PySide6.QtWidgets import QApplication
+
+        settings = app_config.load_settings(self.path)
+        settings["peers"][0]["app"] = "Beamer 1.5.2"
+        settings["peers"][0]["platform"] = "windows"
+        app_config.write_settings(self.path, settings)
+        page = self.page
+        page._live = lambda _peer: False
+        page._pull_peer_fields()
+        page._design_peer_caps = lambda: {}
+        page._reflect_ways()
+        self.assertNotIn("only sees which side", page.crossing_ledger.rows[self.peer].status.text())
+
+        page._design_peer_caps = lambda: {self.peer: frozenset({"settings"})}
+        page._reflect_ways()
+        self.assertEqual(page.crossing_ledger.rows[self.peer].status.text(), "Beamer 1.5.2 · only sees which side")
+        self.assertIn("Windows · Offline", page.atlas_canvas.states[self.peer]["detail"])
         QApplication.processEvents()
 
-        self.assertEqual(self.page.jump_recorder.key.property("vernier"), "body")
-        self.assertLess(self.page.jump_recorder.key.y(), self.page.jump_recorder.hint.y())
+    def test_inactive_peer_keeps_a_ledger_row_without_crossing_zones(self):
+        settings = app_config.load_settings(self.path)
+        settings["peers"][0]["in_use"] = False
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        self.assertIn(self.peer, self.page.crossing_ledger.rows)
+        self.assertFalse(ways.has_way(app_config.load_settings(self.path), self.peer))
+        self.assertFalse(hasattr(self.page, "selected_machine_header"))
 
-    def test_rows_hide_and_come_back_with_the_ways(self):
-        self.ways()
-        self.assertEqual(self.shown(), {"edge", "shortcut"})
-        self.page._ways_changed("shortcut", False)
-        self.ways(["part"])
-        self.assertEqual(self.shown(), {"edge", "parts", "dragging", "resistance"})
-        self.assertTrue(self.page.way_boxes["part"].isChecked())
-        self.assertFalse(self.page.way_boxes["shortcut"].isChecked())
+    def test_left_out_ledger_row_names_the_peer_and_puts_it_back(self):
+        self.page._canvas_left_out(self.peer, True)
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertEqual(row.name.full_text, "Mac")
+        self.assertEqual(row.status.text(), "macOS · Left out")
+        self.assertEqual(row.leave.text(), "Put back")
+        row.leave.click()
+        self.assertFalse(app_config.load_settings(self.path)["peers"][0].get("left_out", False))
 
-    def test_the_chips_are_named_for_the_current_edge(self):
-        self.ways(["part"], ["start", "end"])
-        buttons = self.page.part_buttons
-        self.assertEqual([buttons[p].text() for p in ("start", "middle", "end")], ["Top", "Middle", "Bottom"])
-        self.assertEqual([buttons[p].isChecked() for p in ("start", "middle", "end")], [True, False, True])
-        self.ways(["part"], ["start", "end"], side="top")
-        self.assertEqual([buttons[p].text() for p in ("start", "middle", "end")], ["Left", "Middle", "Right"])
+    def test_tile_selection_and_saved_corner_are_reflected_in_its_ledger_row(self):
+        self.ways(["corner"])
+        self.page._choose_machine(self.peer)
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertTrue(row.selected)
+        self.assertEqual(row.corner_glyph.corner, "top_left")
 
-    def test_an_edge_learned_from_a_peer_renames_the_chips(self):
-        page = self.page
-        self.ways(["part"])
-        page._on_arrangement(self.peer, "bottom", 1790000999, self.peer)
-        buttons = page.part_buttons
-        self.assertEqual([buttons[p].text() for p in ("start", "middle", "end")], ["Left", "Middle", "Right"])
-        self.assertIn("top edge", page.parts_note.text())
+    def test_crossing_refresh_accepts_an_ordinary_edge_without_a_sentence(self):
+        self.ways(["edge"])
+        self.page._reflect_ways()
+        self.assertEqual(self.page.atlas_canvas.states[self.peer]["state"], "edge")
 
-    def test_unticking_the_last_part_leaves_it_on(self):
-        page = self.page
-        self.ways(["part"], ["middle"])
-        page.part_buttons["middle"].setChecked(False)
-        page._set_part("middle", False)
-        parts = [zone for zone in app_config.load_settings(self.path)["zones"] if zone["kind"] == "part"][0]["parts"]
-        self.assertEqual(parts, ["middle"])
-        self.assertTrue(page.part_buttons["middle"].isChecked())
+    def test_text_capabilities_allow_the_shared_contact_state(self):
+        from core import protocol
+        from core.tests import responder_harness as harness
+
+        settings = app_config.load_settings(self.path)
+        second = protocol.id_text(harness.C)
+        settings["peers"].append(harness.entry(harness.C, "Linux box", side="right"))
+        settings["layout"] = {
+            self.page._config.machine_id: {"x": 0, "y": 0, "w": 160, "h": 100},
+            self.peer: {"x": 172, "y": 0, "w": 160, "h": 100},
+            second: {"x": 332, "y": 0, "w": 160, "h": 100},
+        }
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        self.page._design_peer_caps = lambda: {self.peer: frozenset({"layout"}),
+                                               second: frozenset({"layout"})}
+        self.page._reflect_ways()
+
+        self.assertEqual(self.page.atlas_canvas.states[self.peer]["state"], "between")
+        self.assertEqual(self.page.atlas_canvas.states[second]["state"], "between")
+
+    def test_corner_can_be_enabled_when_it_is_currently_off(self):
+        self.ways(["edge"])
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertEqual(row.corner_glyph.corner, "")
+        row.corner_glyph.buttons["top_left"].click()
+        self.assertEqual(row.corner_glyph.corner, "top_left")
+        self.assertTrue(app_config.load_settings(self.path)["peers"][0]["ways"]["corner"])
+
+    def test_layout_drop_keeps_the_compiled_side_and_its_stamp(self):
+        layout = {self.page._config.machine_id: {"x": 0, "y": 0, "w": 160, "h": 100},
+                  self.peer: {"x": 0, "y": -100, "w": 160, "h": 100}}
+        self.page._layout_dropped(layout, self.peer)
+        saved = app_config.load_settings(self.path)
+        entry = next(peer for peer in saved["peers"] if peer["id"] == self.peer)
+        self.assertEqual(entry["side"], "top")
+        self.assertGreater(entry["side_set_at"], 0)
+
+    def test_edge_off_clears_ledger_segments_and_map_crossing_marks(self):
+        self.ways([])
+        self.assertEqual(self.page.atlas_canvas.states[self.peer]["state"], "gap")
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertEqual(row.edge_value.text(), "Off")
+        self.assertEqual(row.edge_glyph.picked, [])
+        self.assertFalse(ways.has_way(app_config.load_settings(self.path), self.peer))
+
+    def test_ledger_edge_text_toggles_the_canonical_zone(self):
+        self.ways(["edge"])
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertEqual(row.edge_value.text(), "Whole edge")
+        row.edge_text.click()
+        self.assertFalse(ways.has_way(app_config.load_settings(self.path), self.peer))
+        row.edge_text.click()
+        self.assertTrue(ways.has_way(app_config.load_settings(self.path), self.peer))
+
+    def test_ledger_edge_text_turns_parts_off_and_remembers_them(self):
+        self.ways(["part"], parts=["start"])
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertEqual(row.edge_glyph.picked, ["start"])
+        row.edge_text.click()
+        self.assertFalse(ways.has_way(app_config.load_settings(self.path), self.peer))
+        self.assertEqual(app_config.load_settings(self.path)["peers"][0]["ways"]["thirds"], ["start"])
+
+    def test_gap_ledger_disables_edge_editing_and_never_moves_the_tile(self):
+        self.ways([])
+        settings = app_config.load_settings(self.path)
+        settings["layout"][self.peer] = dict(x=520, y=240, w=160, h=100)
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertEqual(row.edge_detail.text(), "place it on the map")
+        self.assertFalse(row.edge_text.isEnabled())
+        row.edge_text.click()
+        current = app_config.load_settings(self.path)
+        self.assertEqual(current["layout"][self.peer], settings["layout"][self.peer])
+        self.assertFalse(ways.has_way(current, self.peer))
+
+    def test_ledger_and_map_light_the_picked_thirds(self):
+        self.ways(["part"], parts=["start"])
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertEqual(row.edge_glyph.picked, ["start"])
+        self.assertTrue(row.edge_glyph.buttons["start"].isChecked())
+        self.assertFalse(row.edge_glyph.buttons["end"].isChecked())
+        self.assertEqual(self.page.atlas_canvas.states[self.peer]["thirds"], ["start"])
+
+    def test_overlapping_drop_persists_an_accepted_free_snap(self):
+        from core import protocol
+        from core.tests import responder_harness as harness
+        settings = app_config.load_settings(self.path)
+        second = protocol.id_text(harness.C)
+        settings["peers"].append(harness.entry(harness.C, "Linux box", side="right"))
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        layout = {self.page._config.machine_id: dict(x=0, y=0, w=160, h=100),
+                  self.peer: dict(x=160, y=0, w=160, h=100), second: dict(x=160, y=0, w=160, h=100)}
+        self.assertTrue(self.page._layout_dropped(layout, second))
+        saved = app_config.load_settings(self.path)["layout"]
+        self.assertFalse(ways._overlaps(saved[self.peer], saved[second]))
+        self.assertEqual(self.page.atlas_canvas.tiles[second], saved[second])
+
+    def test_overlap_without_a_free_snap_restores_the_saved_picture(self):
+        from unittest import mock
+        from core import ways
+
+        own = self.page._config.machine_id
+        saved = app_config.load_settings(self.path)
+        overlap = {"x": 0, "y": 0, "w": 160, "h": 100}
+        layout = {own: dict(overlap), self.peer: dict(overlap)}
+        with mock.patch.object(ways, "snap_position", return_value=dict(overlap)), \
+                mock.patch.object(self.page.atlas_canvas, "animate_tile") as animate:
+            self.assertFalse(self.page._layout_dropped(layout, self.peer))
+        animate.assert_not_called()
+        self.assertEqual(app_config.load_settings(self.path), saved)
+        self.assertIn("cannot connect", self.page.atlas_canvas.accessibleDescription())
+
+    def test_shelved_position_does_not_block_a_drop_and_is_remembered(self):
+        from core import protocol
+        from core.tests import responder_harness as harness
+
+        settings = app_config.load_settings(self.path)
+        shelf = protocol.id_text(harness.C)
+        settings["peers"].append(harness.entry(harness.C, "Shelf", side="right", left_out=True))
+        tile = {"x": 160, "y": 0, "w": 160, "h": 100}
+        settings["layout"] = {self.page._config.machine_id: {"x": 0, "y": 0, "w": 160, "h": 100},
+                              self.peer: {"x": -160, "y": 0, "w": 160, "h": 100}, shelf: tile}
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        layout = {key: dict(value) for key, value in settings["layout"].items()}
+        layout[self.peer] = tile
+        self.assertTrue(self.page._layout_dropped(layout, self.peer))
+        saved = app_config.load_settings(self.path)
+        self.assertEqual(saved["layout"][shelf], tile)
+        self.assertEqual(saved["layout"][self.peer], tile)
+        self.assertEqual(self.page.atlas_canvas.states[self.peer]["state"], "edge")
+
+    def test_shared_layout_accepts_shelved_overlap_and_named_paired_third_party(self):
+        from core import protocol, settings_sync
+        from core.tests import responder_harness as harness
+
+        settings = app_config.load_settings(self.path)
+        shelf = protocol.id_text(harness.C)
+        foreign = protocol.id_text(bytes(range(110, 126)))
+        next(entry for entry in settings["peers"] if entry["id"] == self.peer)["paired_with"] = [foreign]
+        settings["peers"].append(harness.entry(harness.C, "Shelf", side="right", left_out=True))
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        self.page._peer_caps = lambda: {harness.B: {"layout"}}
+        tile = {"x": 160, "y": 0, "w": 160, "h": 100}
+        layout = {self.page._config.machine_id: {"x": 0, "y": 0, "w": 160, "h": 100},
+                  self.peer: tile, shelf: tile,
+                  foreign: {"x": 320, "y": 0, "w": 160, "h": 100, "name": "Test box"}}
+        layout_stamp = int(time.time()) + 100
+        data = settings_sync.message_data(False, 100, {}, by=self.peer,
+                    layout_state={"set_at": layout_stamp, "by": self.peer, "tiles": layout})
+        self.page._on_settings(self.peer, data)
+        saved = app_config.load_settings(self.path)
+        self.assertEqual(set(saved["layout"]), set(layout))
+        for peer, tile in layout.items():
+            expected = {key: tile[key] for key in ("x", "y", "w", "h")}
+            self.assertEqual({key: saved["layout"][peer][key] for key in expected}, expected)
+        self.assertNotIn("vouched_by", saved["layout"][foreign])
+        self.assertGreaterEqual(saved["layout_set_at"], layout_stamp)
+
+    def test_shared_layout_gap_tells_an_older_peer_its_way_back_changed(self):
+        from core import protocol, settings_sync
+        from core.tests import responder_harness as harness
+
+        settings = app_config.load_settings(self.path)
+        source = protocol.id_text(harness.C)
+        settings["peers"][0].update(side_set_at=100, side_by=self.page._config.machine_id)
+        settings["peers"].append(harness.entry(harness.C, "Source", side="left"))
+        app_config.write_settings(self.path, settings)
+        self.ways(["edge"])
+        self.page._peer_caps = lambda: {harness.C: {"layout"}, harness.B: {"settings"}}
+        sent = []
+        self.page._send_to = lambda peer, message: sent.append((peer, message)) or True
+        layout = {self.page._config.machine_id: {"x": 0, "y": 0, "w": 160, "h": 100},
+                  self.peer: {"x": 200, "y": 0, "w": 160, "h": 100},
+                  source: {"x": -200, "y": 0, "w": 160, "h": 100}}
+        data = settings_sync.message_data(False, 100, {}, by=source,
+                    layout_state={"set_at": app_config.load_settings(self.path).get("layout_set_at", 0) + 1,
+                                  "by": source, "tiles": layout})
+        self.page._on_settings(source, data)
+        arrangements = [message["data"] for peer, message in sent
+                        if peer == harness.B and message["type"] == protocol.MSG_ARRANGEMENT]
+        self.assertEqual(len(arrangements), 1)
+        self.assertFalse(arrangements[0]["way_back"])
+
+    def test_shared_picture_keeps_a_named_machine_listed_by_the_source_after_a_drop(self):
+        from core import protocol, settings_sync
+        from core.tests import responder_harness as harness
+
+        foreign = protocol.id_text(harness.C)
+        settings = app_config.load_settings(self.path)
+        next(entry for entry in settings["peers"] if entry["id"] == self.peer)["paired_with"] = [foreign]
+        app_config.write_settings(self.path, settings)
+        self.page._peer_caps = lambda: {harness.B: {"layout"}}
+        layout = {self.page._config.machine_id: {"x": 0, "y": 0, "w": 160, "h": 100},
+                  self.peer: {"x": 160, "y": 0, "w": 160, "h": 100},
+                  foreign: {"x": 320, "y": 0, "w": 160, "h": 100, "name": "Test box"}}
+        data = settings_sync.message_data(False, 100, {}, by=self.peer,
+                    layout_state={"set_at": settings.get("layout_set_at", 0) + 1,
+                                  "by": self.peer, "tiles": layout})
+        self.page._on_settings(self.peer, data)
+        named_foreign = layout[foreign]
+        self.assertEqual(self.page.atlas_canvas.tiles[foreign], named_foreign)
+        self.assertEqual(self.page.atlas_canvas.labels[foreign], "Test box")
+        dropped = {key: dict(tile) for key, tile in self.page.atlas_canvas.tiles.items()}
+        dropped[self.peer]["x"] = 160
+        self.assertTrue(self.page._layout_dropped(dropped, self.peer))
+        self.assertEqual(app_config.load_settings(self.path)["layout"][foreign], named_foreign)
+
+    def test_crossing_map_drops_the_rc7_ghost_tile_reproduction(self):
+        from core import protocol, settings_sync
+        from core.tests import responder_harness as harness
+
+        settings = app_config.load_settings(self.path)
+        own = settings["machine_id"]
+        pc = self.peer
+        laptop = protocol.id_text(harness.C)
+        phone, box, old_pc = (protocol.id_text(bytes([value]) * 16) for value in (11, 12, 13))
+        next(entry for entry in settings["peers"] if entry["id"] == pc).update(
+            left_out=True, paired_with=[phone, box])
+        settings["peers"].append(harness.entry(harness.C, "Laptop", paired_with=[old_pc]))
+        settings["peers"].append(harness.entry(phone, "Phone", platform="ios", port=0, token="t" * 43))
+        settings["layout"].update({
+            laptop: {"x": 172, "y": 0, "w": 160, "h": 100},
+            phone: {"x": 344, "y": 0, "w": 160, "h": 100, "vouched_by": pc},
+            box: {"x": 516, "y": 0, "w": 160, "h": 100, "vouched_by": pc},
+            old_pc: {"x": 688, "y": 0, "w": 160, "h": 100, "vouched_by": laptop},
+        })
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        source_id = protocol.read_id(laptop)
+        self.page._peer_caps = lambda: {source_id: {"settings", "layout"}}
+        self.page._design_peer_caps = lambda: {laptop: {"settings", "layout"}}
+        incoming = dict(settings["layout"])
+        data = settings_sync.message_data(False, 100, {}, by=laptop,
+                    layout_state={"set_at": settings.get("layout_set_at", 0) + 1,
+                                  "by": laptop, "tiles": incoming})
+
+        self.page._on_settings(laptop, data)
+        self.page._reflect_ways()
+
+        self.assertTrue({phone, box, old_pc}.isdisjoint(self.page.atlas_canvas.tiles))
+
+    def test_drop_to_a_gap_tells_the_peer_its_way_back_changed(self):
+        from core import protocol
+
+        settings = app_config.load_settings(self.path)
+        settings["peers"][0].update(side_set_at=100, side_by=self.page._config.machine_id)
+        app_config.write_settings(self.path, settings)
+        self.ways(["edge"])
+        sent = []
+        self.page._send_to = lambda peer, message: sent.append(message) or True
+        layout = {self.page._config.machine_id: {"x": 0, "y": 0, "w": 160, "h": 100},
+                  self.peer: {"x": 200, "y": 0, "w": 160, "h": 100}}
+        self.page._layout_dropped(layout, self.peer)
+        arrangements = [message["data"] for message in sent if message["type"] == protocol.MSG_ARRANGEMENT]
+        self.assertEqual(len(arrangements), 1)
+        self.assertFalse(arrangements[0]["way_back"])
+
+    def test_snap_radius_is_twelve_display_pixels(self):
+        self.page.atlas_canvas._scale = 0.5
+        layout = {self.page._config.machine_id: {"x": 0, "y": 0, "w": 160, "h": 100},
+                  self.peer: {"x": 180, "y": 17, "w": 160, "h": 100}}
+        self.page._layout_dropped(layout, self.peer)
+        self.assertEqual(app_config.load_settings(self.path)["layout"][self.peer]["x"], 160)
+
+    def test_own_tile_rename_hint_is_visible(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        canvas = self.page.atlas_canvas
+        canvas.resize(720, 260)
+        own = canvas.tile_rect(self.page._config.machine_id).center().toPoint()
+        QTest.mouseDClick(canvas, Qt.MouseButton.LeftButton, pos=own)
+        self.assertIn("Overview", canvas.accessibleDescription())
+
+    def test_rename_does_not_save_a_duplicate_names_display_suffix(self):
+        from core.tests import responder_harness as harness
+
+        settings = app_config.load_settings(self.path)
+        settings["peers"][0]["label"] = "Studio"
+        settings["peers"].append(harness.entry(harness.C, "Other", label="Studio", side="left"))
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        self.page.atlas_canvas.begin_rename(self.peer)
+        self.assertEqual(self.page.atlas_canvas.rename_edit.text(), "Studio")
+
+    def test_left_out_ledger_keys_tick_can_leave_the_shortcut_cycle(self):
+        self.page._canvas_left_out(self.peer, True)
+        self.page._set_shortcut_goes_to("ticked")
+        row = self.page.crossing_ledger.rows[self.peer]
+        row.cycle.setChecked(False)
+        self.assertFalse(app_config.load_settings(self.path)["peers"][0]["shortcut_cycle"])
+
+    def test_machine_row_cycle_tick_saves_and_updates_the_tile(self):
+        self.page._set_shortcut_goes_to("ticked")
+        row = next(iter(self.page.machines.rows.values()))
+        self.assertFalse(row.shortcut_cycle.isHidden())
+        row.shortcut_cycle.setChecked(False)
+        self.assertFalse(app_config.load_settings(self.path)["peers"][0]["shortcut_cycle"])
+        self.assertFalse(self.page.atlas_canvas.cycle[self.peer])
+
+    def test_dormant_map_tile_keeps_its_offline_ledger_row(self):
+        self.page._gone = lambda peer: peer == self.peer
+        self.page._reflect_ways()
+        self.assertIn(self.peer, self.page.atlas_canvas.shelf_ids)
+        row = self.page.crossing_ledger.rows[self.peer]
+        self.assertIn("Offline, ways kept", row.status.text())
+        self.assertFalse(hasattr(self.page, "left_out_shelf"))
+
+    def test_layout_drop_refusal_persists_the_animated_free_position(self):
+        from core import protocol, ways
+        from core.tests import responder_harness as harness
+
+        settings = app_config.load_settings(self.path)
+        second = protocol.id_text(harness.C)
+        settings["peers"].append(harness.entry(harness.C, "Linux box", side="right"))
+        app_config.write_settings(self.path, settings)
+        self.page._pull_peer_fields()
+        layout = {self.page._config.machine_id: {"x": 0, "y": 0, "w": 160, "h": 100},
+                  self.peer: {"x": 172, "y": 0, "w": 160, "h": 100},
+                  second: {"x": 172, "y": 0, "w": 160, "h": 100}}
+        self.page._layout_dropped(layout, second)
+        saved = app_config.load_settings(self.path)["layout"]
+        self.assertFalse(ways._overlaps(saved[self.peer], saved[second]))
 
     def test_the_crossing_line_gives_the_first_reason_nothing_can_cross(self):
         line = pages_win.crossing_state_sentence

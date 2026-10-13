@@ -268,6 +268,25 @@ class TcpTests(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.pc.paired))
         self.assertEqual(self.pc.paired[0]["token"], saved["token"])
 
+    def test_code_and_qr_repair_a_dormant_same_id_without_removing_it(self):
+        for use_qr in (False, True):
+            with self.subTest(qr=use_qr):
+                old = {**entry(PC_ID, name="TCP PC", paired_at=1_700_000_000),
+                       "linked": True, "dormant": True, "dormant_reason": "forgotten"}
+                self.mac.book.entries[:] = [old]
+                self.pc.book.entries.clear()
+                paired_before = len(self.pc.paired)
+                code = self.pc.service.begin_pairing()
+                if use_qr:
+                    saved = self.mac.service.pair_by_qr(self.pc.service.qr_text("127.0.0.1"))
+                else:
+                    saved = self.mac.service.pair_by_address("127.0.0.1", code, port=self.pc.tcp_port)
+                self.assertTrue(wait_until(lambda: len(self.pc.paired) > paired_before))
+                self.assertEqual(self.mac.book.entries, [saved])
+                self.assertEqual(self.mac.book.stored[-1][1], old)
+                self.assertEqual(self.pc.paired[-1]["token"], saved["token"])
+                self.assertNotIn("dormant", saved)
+
     def test_scanning_the_qr_of_a_machine_already_paired_does_not_pair(self):
         self.mac.book.entries.append(entry(PC_ID, name="TCP PC", paired_at=1_700_000_000))
         self.pc.service.begin_pairing()

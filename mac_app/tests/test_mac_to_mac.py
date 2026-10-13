@@ -17,13 +17,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import config
 import input_injector_mac
 import windows_input
-from bridge import KVMController
+from bridge import KVMController, links_from_store
 import bridge_fakes
 from bridge_fakes import PAIRED_TOKEN, FakeClock, FakeQuartz, crossing_config, quiet_logger
 from core import protocol
 from core.return_edge import Rect
 from core.tests.responder_harness import FakeDesktop, FakeInjector, entry
-from settings_store import SettingsStore
+from settings_store import SettingsStore, config_to_raw
 from two_machines import free_port, wait_for
 
 BOUNDS = (0, 0, 1728, 1117)
@@ -57,17 +57,19 @@ class _Mac:
         settings["zones"] = [{"peer": other.text, "kind": "edge"}]
         self.store.save_settings(settings)
         cfg = crossing_config(PAIRED_TOKEN, edge=side, resistance_px=40)
-        cfg.host, cfg.port, cfg.auth_token = "127.0.0.1", self.port, PAIRED_TOKEN
+        cfg.host, cfg.port, cfg.auth_token = "127.0.0.1", other.port, PAIRED_TOKEN
         cfg.reconnect_interval_s = 0.05
         cfg.key_map = key_map
         # Right Option is Beamer's own shortcut by default and stays on the Mac; moved off the
         # modifiers so every one of them is pressed through.
         cfg.trigger_key = "f19"
+        cfg = self.store.save(config_to_raw(cfg))
         self.cfg = cfg
         self.clipboard = bridge_fakes.FakeClipboard(f"on {self.name}")
+        book, identity = links_from_store(self.store, "1.5.2")
         self.controller = KVMController(
             cfg, logger=quiet_logger(), quartz=FakeQuartz, clock=self.clock, desktop_bounds=lambda: BOUNDS,
-            book=self.store.book(), clipboard=self.clipboard,
+            book=book, identity=identity, clipboard=self.clipboard,
         )
         self.controller.on_user_alert = lambda title, message: None
         self.injector = FakeInjector()

@@ -14,6 +14,13 @@ from core.return_edge import Rect
 
 
 class KeyPlanTests(unittest.TestCase):
+    def test_auxiliary_key_numbers_cover_volume_and_brightness(self):
+        self.assertEqual(injector.MEDIA_NX_KEYS["volume_up"], 0)
+        self.assertEqual(injector.MEDIA_NX_KEYS["volume_down"], 1)
+        self.assertEqual(injector.MEDIA_NX_KEYS["volume_mute"], 7)
+        self.assertEqual(injector.MEDIA_NX_KEYS["brightness_up"], 2)
+        self.assertEqual(injector.MEDIA_NX_KEYS["brightness_down"], 3)
+
     def plan(self, name, down=True, mods=None):
         return injector.plan_key_event(name, down, set() if mods is None else mods)
 

@@ -3,7 +3,7 @@ desktop while a crossing plays and in the Design page's previews.
 
 `replay` is the whole port of the Pen to Quartz, and takes the Quartz module as an argument so the
 tests can hand it a recording fake. `EffectsOverlay` owns one effects.Player, fed the same events
-today's glow is fed, and shows its frames in click-through panels at 60Hz only while something is
+today's glow is fed, and shows its frames in click-through panels only while something is
 playing. It keeps one panel per display the frame touches, because a window spanning two displays
 shows on only one of them while displays have separate Spaces, which is macOS's default.
 
@@ -17,19 +17,22 @@ import time
 import AppKit
 import Quartz
 import objc
-import rumps
 
 import crossing
 import desktop_mac
 from core import effects
+from frame_clock import FrameClock
 import notch_beam
 import notch_island
+import theme
 
 # Canvas's line caps and joins, as Core Graphics names them.
 _CAPS = {"butt": "kCGLineCapButt", "round": "kCGLineCapRound", "square": "kCGLineCapSquare"}
 _JOINS = {"miter": "kCGLineJoinMiter", "round": "kCGLineJoinRound", "bevel": "kCGLineJoinBevel"}
 CONIC_WEDGES = 72
 NOTCH_RADIUS = 10.0
+SEAM_TICK = 10
+SPECIMEN_FEATHER = 0.1
 
 
 def replay(cg, ctx, pens):
@@ -208,8 +211,8 @@ def region_of(via, mac_edge, region, box):
 
 
 # The screens in a preview, drawn the way the settings window draws everything else.
-_SCREEN_DARK = ("#2a2b26", "#161714")
-_SCREEN_LIGHT = ("#d9d8cf", "#b9b8ae")
+_SCREEN_DARK = (effects.PREVIEW_TILE_GROUND, effects.PREVIEW_TILE_GROUND)
+_SCREEN_LIGHT = _SCREEN_DARK
 
 
 def _rgb(hex_value, alpha=1.0):
@@ -218,9 +221,7 @@ def _rgb(hex_value, alpha=1.0):
 
 
 def draw_scene(cg, ctx, scene, width, height, method, dark, crop=None, pointer=18.0):
-    """One effects.preview_scene frame fitted into `width` x `height`: the screens, the pens, the
-    pointer (`pointer` points tall however far the scene is scaled), then the notch. `crop`
-    (x, y, w, h) shows only that part of the scene."""
+    """One real preview frame fitted to its camera, with screen fragments round a crossing seam."""
     scene_w, scene_h = effects.preview_size(method) if crop is None else crop[2:]
     ox, oy = (0.0, 0.0) if crop is None else crop[:2]
     scale = min(width / scene_w, height / scene_h)
@@ -230,17 +231,43 @@ def draw_scene(cg, ctx, scene, width, height, method, dark, crop=None, pointer=1
         cg.CGContextScaleCTM(ctx, scale, scale)
         cg.CGContextTranslateCTM(ctx, -ox, -oy)
         cg.CGContextClipToRect(ctx, ((ox, oy), (scene_w, scene_h)))
-        top, bottom = _SCREEN_DARK if dark else _SCREEN_LIGHT
-        space = cg.CGColorSpaceCreateWithName(cg.kCGColorSpaceSRGB)
-        ground = cg.CGGradientCreateWithColorComponents(space, list(_rgb(top) + _rgb(bottom)), [0.0, 1.0], 2)
-        for x, y, w, h, _os in scene["screens"]:
-            cg.CGContextSaveGState(ctx)
-            path = cg.CGPathCreateWithRoundedRect(((x, y), (w, h)), 14.0, 14.0, None)
-            cg.CGContextAddPath(ctx, path)
-            cg.CGContextClip(ctx)
-            cg.CGContextDrawLinearGradient(ctx, ground, (x, y), (x, y + h), 0)
-            cg.CGContextRestoreGState(ctx)
+        specimen = "seam" in scene
+        if specimen and scene["screens"]:
+            for x, y, w, h, _os in scene["screens"]:
+                left, top = max(x, ox) + 1 / scale, max(y, oy) + 1 / scale
+                right, bottom = min(x + w, ox + scene_w) - 1 / scale, min(y + h, oy + scene_h) - 1 / scale
+                if right <= left or bottom <= top:
+                    continue
+                radius = theme.RADIUS["field"] / scale
+                path = cg.CGPathCreateWithRoundedRect(((left, top), (right - left, bottom - top)), radius, radius, None)
+                cg.CGContextAddPath(ctx, path)
+                cg.CGContextSetFillColorWithColor(ctx, theme.cg("ground"))
+                cg.CGContextSetStrokeColorWithColor(ctx, theme.cg("rule"))
+                cg.CGContextSetLineWidth(ctx, 1 / scale)
+                cg.CGContextDrawPath(ctx, cg.kCGPathFillStroke)
+        if specimen:
+            ground = theme.rgb(theme.T["ground"])
+            shadow = cg.CGColorCreateGenericRGB(*(tuple(value * 0.8 for value in ground) + (0.35,)))
+            cg.CGContextSetShadowWithColor(ctx, (0.0, 1.0 / scale), 1.0 / scale, shadow)
+            cg.CGContextBeginTransparencyLayer(ctx, None)
+        else:
+            top, bottom = _SCREEN_DARK if dark else _SCREEN_LIGHT
+            space = cg.CGColorSpaceCreateWithName(cg.kCGColorSpaceSRGB)
+            ground = cg.CGGradientCreateWithColorComponents(space, list(_rgb(top) + _rgb(bottom)), [0.0, 1.0], 2)
+            for x, y, w, h, _os in scene["screens"]:
+                cg.CGContextSaveGState(ctx)
+                path = cg.CGPathCreateWithRoundedRect(((x, y), (w, h)), 14.0, 14.0, None)
+                cg.CGContextAddPath(ctx, path)
+                cg.CGContextClip(ctx)
+                cg.CGContextDrawLinearGradient(ctx, ground, (x, y), (x, y + h), 0)
+                cg.CGContextRestoreGState(ctx)
         replay(cg, ctx, scene["pens"])
+        if specimen:
+            _feather_specimen(cg, ctx, ox, oy, scene_w, scene_h)
+            cg.CGContextEndTransparencyLayer(ctx)
+            cg.CGContextSetShadowWithColor(ctx, (0.0, 0.0), 0.0, None)
+            if scene["seam"] is not None:
+                _paint_seam_tick(cg, ctx, scene["seam"], ox, oy, scene_w, scene_h, scale)
         if scene["pointer"] is not None:
             _pointer(cg, ctx, scene["pointer"][0], scene["pointer"][1], pointer / scale)
         if scene["notch"] is not None:
@@ -252,10 +279,46 @@ def draw_scene(cg, ctx, scene, width, height, method, dark, crop=None, pointer=1
         cg.CGContextRestoreGState(ctx)
 
 
+def _feather_specimen(cg, ctx, x, y, width, height):
+    space = cg.CGColorSpaceCreateWithName(cg.kCGColorSpaceSRGB)
+    components = (1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0)
+    positions = (0, SPECIMEN_FEATHER, 1 - SPECIMEN_FEATHER, 1)
+    cg.CGContextSetBlendMode(ctx, cg.kCGBlendModeDestinationIn)
+    for start, end in (((x, y), (x + width, y)), ((x, y), (x, y + height))):
+        gradient = cg.CGGradientCreateWithColorComponents(space, components, positions, 4)
+        cg.CGContextDrawLinearGradient(ctx, gradient, start, end, 0)
+    cg.CGContextSetBlendMode(ctx, cg.kCGBlendModeNormal)
+
+
+def _paint_seam_tick(cg, ctx, seam, x, y, width, height, scale):
+    x0, y0, x1, _y1 = seam
+    cg.CGContextSetStrokeColorWithColor(ctx, theme.cg("ink_2"))
+    cg.CGContextSetLineWidth(ctx, 1 / scale)
+    cg.CGContextBeginPath(ctx)
+    if x0 == x1:
+        start = (x0, y + height)
+        end = (x0, y + height - SEAM_TICK / scale)
+    else:
+        start = (x, y0)
+        end = (x + SEAM_TICK / scale, y0)
+    start = _pixel_centre(cg, ctx, start)
+    end = _pixel_centre(cg, ctx, end)
+    cg.CGContextMoveToPoint(ctx, *start)
+    cg.CGContextAddLineToPoint(ctx, *end)
+    cg.CGContextStrokePath(ctx)
+
+
+def _pixel_centre(cg, ctx, point):
+    device = cg.CGContextConvertPointToDeviceSpace(ctx, point)
+    aligned = (math.floor(device.x) + 0.5, math.floor(device.y) + 0.5)
+    user = cg.CGContextConvertPointToUserSpace(ctx, aligned)
+    return user.x, user.y
+
+
 def _pointer(cg, ctx, x, y, size):
     """The arrow pointer, `size` tall in the scene's own units."""
     unit = size / 18.0
-    shape = ((0.0, 0.0), (0.0, 1.0), (0.26, 0.76), (0.44, 1.12), (0.56, 1.06), (0.39, 0.7), (0.72, 0.7))
+    shape = effects.PREVIEW_POINTER
     cg.CGContextBeginPath(ctx)
     for index, (px, py) in enumerate(shape):
         (cg.CGContextMoveToPoint if index == 0 else cg.CGContextAddLineToPoint)(ctx, x + px * size, y + py * size)
@@ -299,7 +362,6 @@ class EffectsOverlay:
     crossing lands the pointer on this Mac, and `switched` when input arrives any other way.
     Coordinates in are Quartz global points."""
 
-    FRAME_S = 1 / 60
     PAD = 2.0
 
     def __init__(self, controller, logger):
@@ -316,7 +378,7 @@ class EffectsOverlay:
         self.displays = []
         self.pressure_now = None
         self.panels = {}
-        self.timer = rumps.Timer(self._tick, self.FRAME_S)
+        self.timer = FrameClock(None, lambda: self._tick(None))
         # Every module up front: a bundle without them (build 329) turns the effects off here, once,
         # and today's glow draws everything, instead of the first crossing finding out.
         try:
@@ -428,8 +490,9 @@ class EffectsOverlay:
         if self.fx is None:
             raise ValueError(f"no crossing effect called {feel['glow_style']!r}")
         self.palette = palette(feel["glow_colour"])
-        self.player.pace = effects.pace(feel.get("effect_length"))
+        self.player.pace = feel.get("effect_pace", effects.pace(feel.get("effect_length")))
         self.player.effect_size = feel.get("effect_size", "medium")
+        self.player.effect_size_fraction = feel.get("effect_size_fraction")
         self.reduced = reduce_motion()
         self.dark = dark_appearance()
         self.box = tuple(self.controller._current_desktop_bounds())

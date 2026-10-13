@@ -90,6 +90,57 @@ class MacRenderer:
     def save(self, image, path):
         path.write_bytes(bytes(image.representationUsingType_properties_(self.A.NSBitmapImageFileTypePNG, {})))
 
+    def design_tile(self, family, style, selected=False, hide_pointer=False):
+        from mac_app.tests.test_window_geometry import offscreen_control_window
+        from mac_app.tests.design_offscreen import settle
+        if not hasattr(self, "design"):
+            self.design = offscreen_control_window()
+            self.design.window.setFrame_display_(((100000, 100000), (1400, 1100)), False)
+            self.design._select_page("design")
+            settle(self.design.window)
+        choices = self.design.glow_style_select if family == "crossing" else self.design.switch_style_select
+        self.theme.repaint(self.design.window.contentView())
+        choices.value = style if selected else None
+        settle(self.design.window)
+        tile = next(tile for row in choices.rows for value, tile, _name in row.tiles if value == style)
+        if tile.tile_content is not None:
+            tile.tile_content.preview.setNeedsDisplay_(True)
+        if hide_pointer:
+            from core import effects
+            names = ("preview_scene", "preview_switch_scene")
+            with mock.patch.multiple(effects, **{
+                    name: (lambda original: lambda *args, **kwargs: dict(original(*args, **kwargs), pointer=None))(
+                        getattr(effects, name)) for name in names}):
+                return tile, self.capture(tile)
+        return tile, self.capture(tile)
+
+    def style_contact_sheet(self, rows, path):
+        A = self.A
+        cell_w, cell_h = 300, 240
+        view = A.NSView.alloc().initWithFrame_(((0, 0), (cell_w * 2, cell_h * len(rows))))
+        rep = self.capture(view)
+        context = A.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
+        A.NSGraphicsContext.saveGraphicsState()
+        A.NSGraphicsContext.setCurrentContext_(context)
+        import Quartz
+        Quartz.CGContextScaleCTM(context.CGContext(), self.scale, self.scale)
+        self.theme.colour("ground").setFill()
+        A.NSRectFill(view.bounds())
+        for index, (family, style, light, dark) in enumerate(rows):
+            top = len(rows) * cell_h - index * cell_h
+            A.NSString.stringWithString_(f"{family}: {style}").drawAtPoint_withAttributes_((8, top - 18), {
+                A.NSFontAttributeName: self.theme.font(12), A.NSForegroundColorAttributeName: self.theme.colour("ink")})
+            for column, (label, tile_image) in enumerate((("Light", light), ("Dark", dark))):
+                x = column * cell_w
+                A.NSString.stringWithString_(label).drawAtPoint_withAttributes_((x + 8, top - 38), {
+                    A.NSFontAttributeName: self.theme.font(11), A.NSForegroundColorAttributeName: self.theme.colour("ink_2")})
+                native = A.NSImage.alloc().initWithSize_(tile_image.size())
+                native.addRepresentation_(tile_image)
+                native.drawInRect_fromRect_operation_fraction_(((x + 8, top - 48 - tile_image.size().height), tile_image.size()),
+                                                               ((0, 0), tile_image.size()), A.NSCompositingOperationSourceOver, 1)
+        A.NSGraphicsContext.restoreGraphicsState()
+        self.save(rep, path)
+
     def colour_page(self):
         from mac_app.tests.test_window_geometry import offscreen_control_window
         from mac_app.tests.design_offscreen import settle
@@ -185,8 +236,11 @@ class QtRenderer:
 
     def capture(self, widget):
         from PySide6.QtCore import QPoint
-        image = self.image(widget.width(), widget.height())
+        image = self.QImage(math.ceil(widget.width() * self.scale), math.ceil(widget.height() * self.scale),
+                            self.QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(self.Qt.GlobalColor.transparent)
         painter = self.QPainter(image)
+        painter.scale(self.scale, self.scale)
         widget.render(painter, QPoint(0, 0))
         painter.end()
         return image
@@ -200,7 +254,7 @@ class QtRenderer:
         widget.resize(180, 84)
         image = self.image(180, 84)
         painter = self.QPainter(image)
-        widget._paint_still(painter, widget.STILL_AT)
+        widget._paint_still(painter, widget._still_time(), still=True)
         painter.end()
         widget.deleteLater()
         return image
@@ -215,6 +269,41 @@ class QtRenderer:
     def save(self, image, path):
         if not image.save(str(path)):
             raise RuntimeError(f"Could not save {path}")
+
+    def design_tile(self, family, style, selected=False, hide_pointer=False):
+        from PySide6.QtCore import QCoreApplication, QEvent
+        from win_app.tests.test_settings_layout_acceptance import SyntheticWindow, responder_harness, write_synthetic_settings
+        import tempfile
+        if not hasattr(self, "design"):
+            self._settings = tempfile.TemporaryDirectory()
+            with mock.patch.object(responder_harness, "free_port", return_value=24821):
+                self.design = SyntheticWindow(write_synthetic_settings(Path(self._settings.name)))
+            self.design.full_screen_timer.stop()
+            self.design.refresh_timer.stop()
+            self.design._select_page("design")
+            self.design.resize(1400, 1100)
+            self.design.show()
+        choice = self.design.glow_style_choice if family == "crossing" else self.design.switch_style_choice
+        self.app.setStyleSheet(self.theme.stylesheet())
+        choice.set_value(style if selected else None)
+        preview = choice.tile(style).layout().itemAt(0).widget()
+        preview._image = None
+        preview.update()
+        for _ in range(2):
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+            self.app.processEvents()
+        tile = choice.tile(style)
+        if hide_pointer:
+            from core import effects
+            names = ("preview_scene", "preview_switch_scene")
+            with mock.patch.multiple(effects, **{
+                    name: (lambda original: lambda *args, **kwargs: dict(original(*args, **kwargs), pointer=None))(
+                        getattr(effects, name)) for name in names}):
+                preview._image = None
+                self.app.processEvents()
+                return tile, self.capture(tile)
+        return tile, self.capture(tile)
+
 
     def colour_page(self):
         from PySide6.QtWidgets import QWidget, QVBoxLayout
@@ -261,6 +350,76 @@ class QtRenderer:
         painter.end()
         return image, samples
 
+    def style_contact_sheet(self, rows, path):
+        from PySide6.QtCore import QRect
+        cell_w, cell_h = 300, 280
+        image = self.image(cell_w * 2, cell_h * len(rows))
+        image.fill(self.QColor(self.theme.colour("ground")))
+        painter = self.QPainter(image)
+        painter.setPen(self.QColor(self.theme.colour("ink")))
+        for index, (family, style, light, dark) in enumerate(rows):
+            y = index * cell_h
+            painter.drawText(8, y + 18, f"{family}: {style}")
+            painter.drawText(8, y + 38, "Light")
+            painter.drawText(cell_w + 8, y + 38, "Dark")
+            target = QRect(8, y + 48, 275, 210)
+            painter.drawImage(target, light)
+            painter.drawImage(target.translated(cell_w, 0), dark)
+        painter.end()
+        self.save(image, path)
+
+
+def style_cases():
+    from core import effects
+    for style in ("glow", "beam", *effects.EFFECT_IDS):
+        yield "crossing", style
+    for style in effects.SWITCH_STYLES:
+        yield "switch", style
+
+
+def relative_luminance(rgb):
+    channels = [value / 255 for value in rgb]
+    linear = [value / 12.92 if value <= .04045 else ((value + .055) / 1.055) ** 2.4 for value in channels]
+    return sum(value * weight for value, weight in zip(linear, (.2126, .7152, .0722)))
+
+
+def style_metrics(renderer, family, style):
+    tile, image = renderer.design_tile(family, style, False, hide_pointer=True)
+    if renderer.__class__.__name__ == "QtRenderer":
+        from PySide6.QtCore import QPoint
+        preview = tile.layout().itemAt(0).widget()
+        origin = preview.mapTo(tile, QPoint())
+        rect = (origin.x(), origin.y(), preview.width(), preview.height())
+        converted = image.convertToFormat(renderer.QImage.Format.Format_RGBA8888)
+        get_pixel = lambda x, y: converted.pixelColor(x, y).getRgb()[:3]
+        image_width, image_height = image.width(), image.height()
+    else:
+        preview = tile.tile_content.preview
+        bounds = preview.frame()
+        rect = (round(bounds.origin.x), round(bounds.origin.y), round(bounds.size.width), round(bounds.size.height))
+        channels, data = image.samplesPerPixel(), bytes(image.bitmapData())
+        image_width, image_height = image.pixelsWide(), image.pixelsHigh()
+        def get_pixel(x, y):
+            offset = y * image.bytesPerRow() + x * channels
+            return tuple(data[offset:offset + 3])
+    ground = (14, 15, 13)
+    ground_lum = relative_luminance(ground)
+    x0, y0, width, height = rect
+    left, top = max(0, round(x0 * renderer.scale)), max(0, round(y0 * renderer.scale))
+    right = min(image_width, round((x0 + width) * renderer.scale))
+    bottom = min(image_height, round((y0 + height) * renderer.scale))
+    distances, marked = [], 0
+    for y in range(top, bottom):
+        for x in range(left, right):
+            rgb = get_pixel(x, y)
+            if max(abs(rgb[index] - ground[index]) for index in range(3)) > 3:
+                marked += 1
+                lum = relative_luminance(rgb)
+                distances.append((max(lum, ground_lum) + .05) / (min(lum, ground_lum) + .05))
+    distances.sort()
+    index = min(len(distances) - 1, math.ceil(.9 * len(distances)) - 1) if distances else 0
+    return (distances[index] if distances else 1.0), marked / max(1, (right - left) * (bottom - top))
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -268,9 +427,35 @@ def main():
     parser.add_argument("--scale", type=int, choices=(1, 2), default=1)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--contact-sheet", action="store_true")
+    parser.add_argument("--style-tiles", action="store_true", help="Render the native Design tile widgets")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     renderer = (MacRenderer if args.platform == "mac" else QtRenderer)(args.scale)
+    if args.style_tiles:
+        report = []
+        tile_images = {}
+        for dark in (False, True):
+            mode = "dark" if dark else "light"
+            renderer.set_dark(dark)
+            for family, style in style_cases():
+                contrast, coverage = style_metrics(renderer, family, style)
+                folder = args.output / family / mode / f"{args.scale}x"
+                folder.mkdir(parents=True, exist_ok=True)
+                for selected in (False, True):
+                    _tile, image = renderer.design_tile(family, style, selected)
+                    suffix = "selected" if selected else "unselected"
+                    renderer.save(image, folder / f"{style}-{suffix}.png")
+                    if not selected:
+                        tile_images.setdefault((family, style), {})[mode] = image
+                report.append((family, style, mode, args.scale, contrast, coverage))
+        sheet_rows = [(family, style, images["light"], images["dark"])
+                      for (family, style), images in tile_images.items()]
+        renderer.style_contact_sheet(sheet_rows, args.output / f"{args.platform}-{args.scale}x-style-contact.png")
+        print("| Style | Appearance | Scale | Contrast | Coverage |")
+        print("|---|---|---:|---:|---:|")
+        for family, style, mode, scale, contrast, coverage in report:
+            print(f"| {family}/{style} | {mode} | {scale}x | {contrast:.2f}:1 | {coverage:.2%} |")
+        return
     rows, records = colour_rows(args.platform), []
     for dark in (False, True):
         mode = "dark" if dark else "light"

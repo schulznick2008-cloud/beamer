@@ -11,6 +11,7 @@ import time
 import unittest
 from unittest import mock
 
+from core import return_edge
 from core import protocol, receiver
 from core.tests import pngs
 from core.receiver import ServerState
@@ -39,6 +40,11 @@ class Case(unittest.TestCase):
     caps = None
 
     def setUp(self):
+        # These tests cross the moment input lands; the arrival grace is test_arrival_grace's
+        # subject, not theirs.
+        grace = mock.patch.object(return_edge, "ARRIVAL_GRACE_SECONDS", 0.0)
+        grace.start()
+        self.addCleanup(grace.stop)
         self.machine = self.start()
 
     def start(self, unlock=None):
@@ -199,6 +205,18 @@ class TheClipboardOnLettingGo(Case):
     def test_empty_text_sends_nothing(self):
         link = self.link()
         self.visit(link, "")
+        self.nothing_was_sent(link)
+
+    def test_a_visit_begun_before_the_clipboard_could_be_read_sends_nothing_back(self):
+        # A Wayland machine whose remote control session is held up by the desktop's consent dialog.
+        link = self.link()
+        self.machine.clipboard.stamp = None
+        route = link.take()
+        self.assertEqual(link.answer(route)[0], ACCEPT)
+        self.assertTrue(wait_for(lambda: self.machine.responder.owner == B))
+        self.machine.clipboard.stamp = 1
+        link.let_go()
+        self.assertTrue(wait_for(lambda: self.machine.responder.owner is None))
         self.nothing_was_sent(link)
 
     def test_text_over_the_limit_is_not_sent(self):

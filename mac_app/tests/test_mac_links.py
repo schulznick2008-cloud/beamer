@@ -43,6 +43,37 @@ class Base(unittest.TestCase):
         return focuses[index]["data"]
 
 
+class AckStallRecoveryTests(Base):
+    def test_a_heartbeat_only_peer_stall_ends_the_visit_and_releases_the_cursor(self):
+        self.up()
+        self.assertTrue(self.controller.set_redirecting(True))
+
+        with self.assertLogs(self.controller.logger, level="WARNING") as said:
+            self.link.callbacks["state"](self.link, False, "Office PC stopped acknowledging input")
+
+        self.assertFalse(self.controller.redirecting)
+        self.assertFalse(self.controller.owner.away)
+        self.assertIn(True, FakeQuartz.associate_calls)
+        self.assertTrue(any("stopped acknowledging input" in line for line in said.output), said.output)
+
+    def test_a_peer_switch_is_logged_as_the_move_source(self):
+        self.up()
+        with self.controller.book.lock:
+            peers = self.controller.book.data["peers"]
+            peers.append({**peers[0], "id": protocol.id_text(OTHER_ID), "token": "second", "send": True})
+        self.controller._sync_links()
+        other = self.controller.links["second"]
+        other.up(self.controller, ident=OTHER_ID, name="Laptop", platform="macos")
+        self.assertTrue(self.controller.set_redirecting(True))
+        self.link.arrives(self.controller, protocol.accept_msg(1))
+
+        with self.assertLogs(self.controller.logger, level="INFO") as said:
+            self.link.arrives(self.controller, protocol.switch_v6(1, OTHER_ID))
+            other.arrives(self.controller, protocol.accept_msg(self.controller.owner.route))
+
+        self.assertTrue(any("move started by peer request" in line for line in said.output), said.output)
+
+
 class HardwareHookTests(unittest.TestCase):
     def controller(self, **kwargs):
         return KVMController(

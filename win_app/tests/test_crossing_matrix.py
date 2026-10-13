@@ -280,13 +280,28 @@ class ArrangementHeldByBothTests(unittest.TestCase):
         self.page = types.SimpleNamespace(
             _config=default_config(), config_path=self.path, _on_alert=lambda title, message: None,
             _pull_peer_fields=lambda: self.refreshed.append("pulled"),
-            sender=types.SimpleNamespace(refresh=lambda: self.refreshed.append("sender")),
-            server=types.SimpleNamespace(peers_changed=lambda: self.refreshed.append("server")),
+            sender=types.SimpleNamespace(refresh=lambda: self.refreshed.append("sender"),
+                                         update_config=lambda _: self.refreshed.append("updated")),
+            server=types.SimpleNamespace(peers_changed=lambda: self.refreshed.append("server"),
+                                         rearm=lambda: self.refreshed.append("rearmed")),
             _tell=lambda peer: self.refreshed.append("answered"),
             _live=lambda peer: True,
+            _gone=lambda peer: False,
+            _design_peer_caps=lambda: {},
+            _merge_layout_peers=lambda original, compiled: [
+                {entry.get("id"): entry for entry in compiled}.get(entry.get("id"), entry)
+                for entry in original
+            ],
             _read_crossing=lambda: None,
+            _send_same=lambda **_: None,
             _crossing_settings=lambda: app_config.load_settings(self.path),
         )
+        self.page._config.machine_id = self.own
+        self.page._crossing_event_args = lambda: dict(platform="pc", capable={self.own},
+                                                     live=self.page._live, gone=self.page._gone, now=1000)
+        self.page._carry_crossing = types.MethodType(kvm_bridge_win.WindowsApplication._carry_crossing, self.page)
+        self.page._reflect_ways = lambda: None
+        self.page._reflect_look = lambda: None
 
     def arrive(self, edge, stamp, by=None):
         kvm_bridge_win.WindowsApplication._on_arrangement(self.page, self.peer, edge, stamp, by or self.peer)
@@ -297,7 +312,7 @@ class ArrangementHeldByBothTests(unittest.TestCase):
     def test_a_newer_arrangement_is_applied_as_this_pcs_opposite_edge(self):
         self.arrive("top", 200)
         self.assertEqual(self.side(), "bottom")
-        self.assertEqual(self.refreshed, ["pulled", "sender", "server", "answered"])
+        self.assertEqual(self.refreshed, ["updated", "sender", "server", "rearmed", "answered"])
 
     def test_an_older_arrangement_is_ignored(self):
         self.arrive("top", 50)
@@ -310,19 +325,6 @@ class ArrangementHeldByBothTests(unittest.TestCase):
         with self.assertNoLogs(kvm_bridge_win.LOGGER, logging.INFO):
             self.arrive("top", 200)
         self.assertEqual(self.refreshed, [])
-
-    def test_a_change_made_here_is_stamped_and_sent_to_that_machine(self):
-        window = real_window(self.path)
-        self.addCleanup(window.server.stop)
-        told = []
-        window._send_to = lambda peer, message: told.append((peer, message)) or False
-        window._set_arrangement("top")
-        entry = json.loads(self.path.read_text(encoding="utf-8"))["peers"][0]
-        self.assertEqual((entry["side"], entry["side_by"]), ("top", self.own))
-        self.assertGreater(entry["side_set_at"], 100)
-        peer, message = told[0]
-        self.assertEqual(peer, harness.B)
-        self.assertEqual(message["data"], {"edge": "top", "set_at": entry["side_set_at"], "by": self.own, "way_back": True})
 
     def test_a_fresh_config_holds_no_edge_though_the_crossing_page_offers_right(self):
         # Pinned known gap (G3 in the report).
@@ -350,6 +352,5 @@ class WaysReachTheDesignPageTests(unittest.TestCase):
         looked = []
         window._reflect_look = lambda: looked.append(sorted(window._ways_in()))
         window._ways_changed("corner", True)
-        window._set_part("start", True)
-        self.assertEqual(len(looked), 2)
+        self.assertEqual(len(looked), 1)
         self.assertIn("corner", looked[0])

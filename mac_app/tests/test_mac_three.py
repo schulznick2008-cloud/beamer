@@ -228,10 +228,13 @@ class TheLinkInArrangement(Three):
     def test_a_machine_linked_in_is_told_whether_a_way_leads_to_it(self):
         self.data["zones"][1]["off"] = True
         self.input.server.caps_of = lambda _peer: frozenset()
-        told = {name: [m["data"] for m in self.input._announce(ident) if m["type"] == protocol.MSG_ARRANGEMENT]
-                for name, ident in (("bee", BEE), ("sea", SEA))}
-        self.assertIs(told["bee"][0]["way_back"], True)
-        self.assertIs(told["sea"][0]["way_back"], False)
+        sent = []
+        self.input.server.send = lambda peer, message: sent.append((peer, message)) or True
+        self.input._announce(BEE)
+        self.input._announce(SEA)
+        told = {peer: message["data"] for peer, message in sent if message["type"] == protocol.MSG_ARRANGEMENT}
+        self.assertIs(told[BEE]["way_back"], True)
+        self.assertIs(told[SEA]["way_back"], False)
 
     def test_a_side_sent_over_its_link_says_whether_a_way_leads_there_and_who_set_it(self):
         sent = []

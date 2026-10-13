@@ -93,7 +93,7 @@ class PhoneUiTests(unittest.TestCase):
         app = application("_crossing_machines", "_crossing_settings")
         app._peer_entries = entries()
         app._zone_entries = [dict(peer=PHONE), dict(peer=DESKTOP)]
-        app._config = SimpleNamespace(machine_id="own")
+        app._config = SimpleNamespace(machine_id="own", layout={}, layout_set_at=0, layout_by="")
         app._shown = lambda text: text
         self.assertEqual(app._crossing_machines(), [(DESKTOP, "Desktop")])
         self.assertEqual(app._crossing_settings()["peers"], [entries()[1]])
@@ -132,7 +132,7 @@ class PhoneUiTests(unittest.TestCase):
 
         app = application("_refresh_design_follow", "_lock_followed_design", QStandardItemModel=Model, QStandardItem=Item)
         app._peer_entries = entries()
-        app._config = SimpleNamespace(design_follow_peer="", same_on_both=False)
+        app._config = SimpleNamespace(design_follow_peer="", same_on_both=False, hide_addresses=False)
         app._design_states = {PHONE: {}, DESKTOP: {}}
         app._design_peer_caps = lambda: {PHONE: {"design_sync"}, DESKTOP: {"design_sync"}}
         app._shown = lambda text: text
@@ -199,13 +199,15 @@ class PhoneUiTests(unittest.TestCase):
 
     def test_phone_row_has_name_platform_remove_and_in_use_without_directions(self):
         row = load_methods("win_app/machines_win.py", "PeerRow", ["refresh", "_ask"],
-                           dict(KEEP_NOTE="kept"))()
+                           dict(KEEP_NOTE="kept", peerlist=peerlist))()
         for name in ("name", "word", "where", "detail", "confirm_text", "in_use", "send", "allow",
-                     "remove_button", "directions", "direction_group", "confirm"):
+                     "remove_button", "directions", "direction_group", "shortcut_cycle", "repair_button",
+                     "confirm", "left_out", "left_out_note"):
             setattr(row, name, Control())
         row.led = SimpleNamespace(set_tone=lambda tone: None)
         row.confirm.visible = False
-        row.refresh(entries()[0], "My phone", SimpleNamespace(tone="signal", word="Linked", detail="Connected"), "iPhone")
+        row.refresh(entries()[0], "My phone", SimpleNamespace(tone="signal", word="Linked", detail="Connected"),
+                    "iPhone", cycle_mode="last")
         self.assertEqual(row.name.text(), "My phone")
         self.assertEqual(row.where.text(), "iPhone")
         self.assertFalse(row.directions.visible)

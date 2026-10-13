@@ -1,4 +1,5 @@
 """Colour choices stay stable across platforms and mixed-version links."""
+import colorsys
 import unittest
 
 from core import effects, settings_sync
@@ -37,8 +38,12 @@ class ColourPacksTests(unittest.TestCase):
             self.assertEqual(effects.pack(value), expected)
         self.assertEqual(effects.legible(MONO['mono_graphite'][1], True),
                          ['#6d7278', '#6b727b', '#868c94'])
-        self.assertEqual(effects.legible(MONO['mono_ink'][1], True),
-                         ['#69717d', '#637082', '#69717c'])
+        # Ink stays a deep blue-black on dark: lifted like the rest it became a steel grey lighter
+        # than Graphite, which reads as white once added as light (06-10 and 10-10).
+        self.assertEqual(effects.legible(MONO['mono_ink'][1], True), ['#2c3e66', '#1f2d4d', '#3b5287'])
+        lightness = lambda colour: colorsys.rgb_to_hls(*effects.parse_colour(colour)[:3])[1]
+        ink, graphite = (effects.legible(MONO[value][1], True) for value in ('mono_ink', 'mono_graphite'))
+        self.assertLess(max(map(lightness, ink)), min(map(lightness, graphite)))
         self.assertEqual(effects.legible(MONO['mono'][1], False, effects.effect('aperture')),
                          ['#999999', '#969696', '#999999'])
 

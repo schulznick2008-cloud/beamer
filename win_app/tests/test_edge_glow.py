@@ -119,6 +119,7 @@ class PreviewLoopHoverTests(unittest.TestCase):
         self.loop.run(False)
 
     def test_every_tile_holds_a_still_until_one_is_hovered(self):
+        self.assertFalse(self.loop._timer.isActive())
         self.loop._tick()
         self.assertEqual([tile.state.pressure for tile in self.tiles], [edge_glow.PreviewLoop.HOLD] * 2)
         self.assertFalse(any(self.loop.playing(tile) for tile in self.tiles))
@@ -130,6 +131,7 @@ class PreviewLoopHoverTests(unittest.TestCase):
 
     def test_the_hovered_tile_plays_on_from_its_still_and_settles_back(self):
         self.loop.hover(self.tiles[1])
+        self.assertTrue(self.loop._timer.isActive())
         self.loop._hovered_at -= edge_glow.PreviewLoop.INTENT_S
         self.loop._tick()
         self.assertTrue(self.loop.playing(self.tiles[1]))

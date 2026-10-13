@@ -6,14 +6,23 @@ through the controller's event tap and the Mac's responder."""
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from bridge_fakes import FakeQuartz
-from core import protocol
+from core import protocol, return_edge
 from two_machines import PC_TEXT, Duo, wait_for
 
 A_KEYCODE, COMMAND_KEYCODE = 0x00, 0x37
+
+
+def setUpModule():
+    # These push home the moment input lands; the arrival grace is test_arrival_grace's subject,
+    # not theirs, as in test_way_home and core's loopback tests.
+    grace = mock.patch.object(return_edge, "ARRIVAL_GRACE_SECONDS", 0.0)
+    grace.start()
+    unittest.addModuleCleanup(grace.stop)
 
 
 def key_event(down, keycode, character=None):

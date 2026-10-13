@@ -24,6 +24,7 @@ import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+from PySide6.QtCore import QPointF, QRect
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -41,7 +42,7 @@ def _owner(edge_glow=True, glow_style="glow", glow_colour="signal", shortcut_arr
     config = SimpleNamespace(
         edge_glow=edge_glow, glow_style=glow_style, glow_colour=glow_colour,
         shortcut_arrival=shortcut_arrival, shortcut_arrival_style=shortcut_arrival_style, effect_length="normal",
-        effect_size=effect_size,
+        effect_size=effect_size, effect_pace=1.0, effect_size_fraction=0.045,
     )
     return SimpleNamespace(_closing=False, _config=config, effects=effects, glow=glow)
 
@@ -60,24 +61,31 @@ class PressureRoutingTest(unittest.TestCase):
         kvm_bridge_win.WindowsApplication._on_pressure(owner, "left", 0.4, False)
         overlay.push.assert_called_once_with("left", 0.4, False, part=None)
 
+    def test_sender_pressure_is_sent_to_effects_and_the_local_resistance_strip(self):
+        owner = SimpleNamespace(bridge=SimpleNamespace(
+            pressure=mock.Mock(), local_pressure=mock.Mock()))
+        kvm_bridge_win.WindowsApplication._relay_sender_pressure(owner, "top", 0.4, False, "start")
+        owner.bridge.pressure.emit.assert_called_once_with("top", 0.4, False, "start")
+        owner.bridge.local_pressure.emit.assert_called_once_with("top", 0.4, False, "start")
+
     def test_an_edge_push_reaches_edge_glow_when_the_style_is_glow(self):
         owner = _owner(glow_style="glow", glow_colour="ocean", glow=mock.Mock())
         owner._effect_overlay = mock.Mock(return_value=None)
         kvm_bridge_win.WindowsApplication._on_pressure(owner, "left", 0.4, False)
-        owner.glow.configure.assert_called_once_with("glow", "ocean", "normal", "medium")
+        owner.glow.configure.assert_called_once_with("glow", "ocean", "normal", "medium", 1.0, 0.045)
         owner.glow.set_pressure.assert_called_once_with("left", 0.4, False, None)
 
     def test_a_beam_style_push_configures_the_glow_as_beam(self):
         owner = _owner(glow_style="beam", glow=mock.Mock())
         owner._effect_overlay = mock.Mock(return_value=None)
         kvm_bridge_win.WindowsApplication._on_pressure(owner, "left", 0.4, False)
-        owner.glow.configure.assert_called_once_with("beam", "signal", "normal", "medium")
+        owner.glow.configure.assert_called_once_with("beam", "signal", "normal", "medium", 1.0, 0.045)
 
     def test_the_selected_size_reaches_the_glow_renderer(self):
         owner = _owner(glow_style="glow", glow=mock.Mock(), effect_size="large")
         owner._effect_overlay = mock.Mock(return_value=None)
         kvm_bridge_win.WindowsApplication._on_pressure(owner, "left", 0.4, False)
-        owner.glow.configure.assert_called_once_with("glow", "signal", "normal", "large")
+        owner.glow.configure.assert_called_once_with("glow", "signal", "normal", "large", 1.0, 0.045)
 
     def test_an_effect_that_failed_earlier_falls_back_to_plain_glow(self):
         """_on_pressure's own comment: an effect that failed earlier in the run falls back to
@@ -86,7 +94,7 @@ class PressureRoutingTest(unittest.TestCase):
         owner = _owner(glow_style="wormhole", glow_colour="mono", glow=mock.Mock())
         owner._effect_overlay = mock.Mock(return_value=None)
         kvm_bridge_win.WindowsApplication._on_pressure(owner, "left", 0.4, False)
-        owner.glow.configure.assert_called_once_with("glow", "mono", "normal", "medium")
+        owner.glow.configure.assert_called_once_with("glow", "mono", "normal", "medium", 1.0, 0.045)
 
     def test_a_part_of_the_edge_push_passes_the_part_through_to_the_overlay(self):
         owner = _owner(glow_style="rupture")
@@ -116,6 +124,31 @@ class PressureRoutingTest(unittest.TestCase):
         owner._effect_overlay = mock.Mock(return_value=overlay)
         kvm_bridge_win.WindowsApplication._on_pressure(owner, "left", 1.0, True)
         overlay.push.assert_called_once_with("left", 1.0, True, part=None)
+
+    @mock.patch.dict(os.environ, {"DISPLAY": ":0"})
+    def test_wayland_pressure_passes_the_authoritative_cursor_to_a_native_overlay(self):
+        owner = _owner(glow_style="rupture")
+        overlay = mock.Mock()
+        owner._effect_overlay = mock.Mock(return_value=overlay)
+        with mock.patch.object(kvm_bridge_win.platform_parts, "WAYLAND", True), \
+             mock.patch.object(kvm_bridge_win.platform_parts.desktop, "cursor_position", return_value=(7.5, 91.0)):
+            kvm_bridge_win.WindowsApplication._on_pressure(owner, "left", 0.4, False)
+
+        overlay.push.assert_called_once_with("left", 0.4, False, cursor=QPointF(7.5, 91.0), part=None)
+
+    @mock.patch.dict(os.environ, {"DISPLAY": ":0"})
+    def test_wayland_pressure_passes_cursor_and_desktop_bounds_to_the_proxy(self):
+        owner = _owner(glow_style="rupture")
+        overlay = kvm_bridge_win.EffectOverlayX11Proxy()
+        overlay.push = mock.Mock()
+        owner._effect_overlay = mock.Mock(return_value=overlay)
+        box = QRect(-1920, 0, 3840, 2160)
+        with mock.patch.object(kvm_bridge_win.platform_parts, "WAYLAND", True), \
+             mock.patch.object(kvm_bridge_win.platform_parts.desktop, "cursor_position", return_value=(7.5, 91.0)), \
+             mock.patch.object(kvm_bridge_win, "desktop_box", return_value=box):
+            kvm_bridge_win.WindowsApplication._on_pressure(owner, "left", 0.4, False)
+
+        overlay.push.assert_called_once_with("left", 0.4, False, cursor=QPointF(7.5, 91.0), part=None, desk=box)
 
     def test_a_crossing_carries_crossed_true_through_to_the_glow(self):
         owner = _owner(glow_style="glow", glow=mock.Mock())

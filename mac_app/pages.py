@@ -10,7 +10,7 @@ import re
 
 from core import effects
 from core import peerlist
-from core.ways import part_names, parts_phrase, toggle_part
+from core.ways import DIAGRAM_GAP, DIAGRAM_THIS, diagram_layout, part_names, parts_phrase, toggle_part
 
 # (key, name, SF Symbol, what the page is for), in sidebar order, which is the order a new Mac is
 # set up in after the Overview; Cmd+1 is the first.
@@ -21,7 +21,7 @@ PAGES = (
     ("permissions", "Permissions", "lock.shield",
      "macOS must allow Beamer to read this Mac's input and to move its pointer and type when another machine drives it."),
     ("crossing", "Crossing", "cursorarrow.motionlines",
-     "Choose how the pointer or a key moves input to each machine, and how hard the edge pushes back first."),
+     "Drag a machine on the map to where it sits. The ledger says how each one is reached; click a row to pick it on the map."),
     ("keyboard", "Keyboard", "keyboard",
      "How this Mac's modifier keys arrive on other machines, which keys and buttons stay on this Mac, "
      "and how fast another machine's pointer moves here. The switch key is on the Crossing page."),
@@ -59,13 +59,15 @@ def opening_page(last, accessibility, input_monitoring):
     return "overview" if accessibility and input_monitoring else "permissions"
 
 
-def dots(accessibility, input_monitoring, link_key):
-    """Page key to the tone of its sidebar dot, for the pages that need one."""
+def dots(accessibility, input_monitoring, link_key, dormant=False):
+    """Page key to dot tone; a dormant peer marks Overview and Crossing amber."""
     marks = {}
     if not (accessibility and input_monitoring):
         marks["permissions"] = "amber"
     if link_key == "token":
         marks["overview"] = "fault"
+    if dormant:
+        marks.update({"overview": "amber", "crossing": "amber"})
     return marks
 
 
@@ -120,7 +122,7 @@ SIMPLE = "Simple"
 def switch_style_groups(with_effects=True):
     """[(group, [(value, name, detail)])] for the style tiles in Switch mode: what a switch plays,
     effects.SWITCH_STYLES, with the effects grouped as the crossing's are."""
-    simple = [("match", "Same as crossing", "Plays the crossing style"), ("locator", "Ring", "Closes onto the pointer")]
+    simple = [("match", "Same as crossing", "Plays Glow"), ("locator", "Ring", "Closes onto the pointer")]
     with_effects = with_effects and effects_load_error() is None
     aperture = [(TODAY, [("aperture", effects.CLASSIC["aperture"].name,
                           effects.CLASSIC["aperture"].intensity.capitalize())])] if with_effects else []
@@ -161,16 +163,10 @@ def toggle_way(methods, way, on):
     return [name for name in WAYS if name in chosen]
 
 
-# The Crossing page's diagram: this Mac's screen at 16:10 and the other machine's at 16:9, a gap between.
-DIAGRAM_THIS = (120.0, 75.0)
-DIAGRAM_OTHER = (112.0, 63.0)
-DIAGRAM_GAP = 10.0
 MARK = 3.0
 CORNER_MARK = 12.0
 
 
-DIAGRAM_SPLIT_GAP = 6.0
-DIAGRAM_MARGIN = 12.0
 SIDES = ("left", "right", "top", "bottom")
 PART_ORDER = ("start", "middle", "end")
 
@@ -179,51 +175,6 @@ def arrangement(width, height, side):
     """Where the two screens sit with one machine paired: (this, other) as (x, y, w, h)."""
     this, (other,) = diagram_layout(width, height, [(side, None)])
     return this, other
-
-
-def diagram_layout(width, height, machines):
-    """Where this Mac and each machine sit in a drawing `width` by `height`, top left at the origin.
-    `machines` is (side, first third) per machine: side "" when it is not placed, first third the
-    index of its first third when it crosses by Part of the edge, else None. Returns (this, frames),
-    a frame (x, y, w, h) or None for each machine. Two or more on one side share it, each as much
-    shorter as there are of them, in the order of their thirds when all have some, else of the
-    list; the whole is centred, and shrinks to fit only when it must."""
-    tw, th = DIAGRAM_THIS
-    ow, oh = DIAGRAM_OTHER
-    placed = [None] * len(machines)
-    for side in SIDES:
-        at = [index for index, (where, _third) in enumerate(machines) if where == side]
-        if at and all(machines[index][1] is not None for index in at):
-            at.sort(key=lambda index: machines[index][1])
-        count = len(at)
-        if not count:
-            continue
-        w, h = ow / count, oh / count
-        upright = side in ("left", "right")
-        step = (h if upright else w) + DIAGRAM_SPLIT_GAP
-        start = ((th if upright else tw) - (step * count - DIAGRAM_SPLIT_GAP)) / 2
-        for order, index in enumerate(at):
-            along = start + order * step
-            placed[index] = {
-                "left": (-DIAGRAM_GAP - w, along), "right": (tw + DIAGRAM_GAP, along),
-                "top": (along, -DIAGRAM_GAP - h), "bottom": (along, th + DIAGRAM_GAP),
-            }[side] + (w, h)
-    frames = [(0.0, 0.0, tw, th)] + [frame for frame in placed if frame is not None]
-    left = min(x for x, _y, _w, _h in frames)
-    top = min(y for _x, y, _w, _h in frames)
-    span_w = max(x + w for x, _y, w, _h in frames) - left
-    span_h = max(y + h for _x, y, _w, h in frames) - top
-    scale = 1.0
-    if span_w > width or span_h > height:
-        scale = min((width - 2 * DIAGRAM_MARGIN) / span_w, (height - 2 * DIAGRAM_MARGIN) / span_h)
-    dx = (width - span_w * scale) / 2 - left * scale
-    dy = (height - span_h * scale) / 2 - top * scale
-
-    def fit(frame):
-        x, y, w, h = frame
-        return (dx + x * scale, dy + y * scale, w * scale, h * scale)
-
-    return fit(frames[0]), [None if frame is None else fit(frame) for frame in placed]
 
 
 def placement(machine):
@@ -420,17 +371,16 @@ def notch_or_corner_note(label):
 
 
 def crossing_rows(methods):
-    """Which of the Crossing page's rows and modules show for these ways. The rest are hidden, not
-    dimmed, and reappear the moment a way that uses them is chosen."""
+    """Which Crossing modules show for these ways; Corner and the drag guard stay in place."""
     chosen = set(methods)
     pointer = bool(chosen & {"edge", "part", "corner", "notch"})
     return {
         # Where the other machine sits, which every way in uses: a crossing arrives by it, and with
         # only the shortcut on it is still that machine's edge that leads back here.
         "edge": True,
-        "parts": "part" in chosen,
-        "corner": "corner" in chosen,
-        "dragging": pointer,
+        "parts": bool(chosen & {"edge", "part"}),
+        "corner": True,
+        "dragging": True,
         "resistance": pointer,
         "shortcut": "shortcut" in chosen,
     }

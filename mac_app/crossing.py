@@ -7,8 +7,8 @@ back; kvm_bridge_app.py reads pressure for the glow. Coordinates are Quartz glob
 union of every display as (left, top, right, bottom) with right and bottom exclusive.
 
 Pressure is measured in raw pointer delta units, the same "pixels of travel" the trackpad reports,
-and decays at a rate that empties a full push in DECAY_S once the outward movement stops. That one
-mechanism is what keeps a slow lean against the edge from ever building a switch.
+and decays at a fixed rate so Resistance changes required travel without scaling the sustained-speed
+threshold. That mechanism is what keeps a slow lean against the edge from ever building a switch.
 """
 
 from dataclasses import dataclass
@@ -28,6 +28,7 @@ OPPOSITE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 
 DEFAULT_CROSSING = {
     "methods": ["shortcut", "edge"],
+    "shortcut_goes_to": "last",
     "edge": "right",
     "corner": "top_right",
     "resistance_px": 120,
@@ -51,6 +52,8 @@ DEFAULT_CROSSING = {
     # How long an effect takes to play through once the pointer crosses: see effects.LENGTHS.
     "effect_length": "normal",
     "effect_size": "medium",
+    "effect_pace": 1.0,
+    "effect_size_fraction": 0.045,
     # Unix seconds at the moment this Mac last changed the arrangement -- which
     # edge leads to the PC. Either machine may change it, so when two ends meet
     # holding different answers the newer stamp wins. Never read by the engine;
@@ -59,6 +62,7 @@ DEFAULT_CROSSING = {
 }
 
 DECAY_S = 0.4
+DECAY_PX_PER_SECOND = 300.0
 CORNER_PX = 8.0
 # How close to the last pixel of the desktop counts as touching it. The cursor's reported
 # location at an edge is fractional on a Retina display, so an exact comparison misses.
@@ -97,6 +101,8 @@ class Step:
     region: tuple = None
     via: str = None
     peer: str = None
+    display: str = None
+    side: str = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +115,9 @@ class Ways:
     edge: str
     parts: frozenset
     corner: str
+    display: str = None
+    target_display: str = None
+    target_side: str = None
 
 
 class CrossingEngine:
@@ -127,7 +136,23 @@ class CrossingEngine:
         self.ways = list(ways)
         self.resistance_px = float(resistance_px)
         self.block_while_dragging = block_while_dragging
+        # Outside reset(): a click while the pointer lands must not end the grace (keep_grace for a rebuild).
+        self._grace_inward = dict.fromkeys(EDGES, 0.0)
+        self._grace_at = None
         self.reset()
+
+    def start_grace(self, now):
+        """The pointer has just landed here from another machine: for ARRIVAL_GRACE_SECONDS no zone
+        builds pressure until the pointer has moved ARRIVAL_GRACE_PX back from its edge, as on the PC.
+        The hand still moving from the push that brought it here otherwise crossed the zone beside the
+        landing, 14 ms after it (rc14, 10-10-2026)."""
+        self._grace_inward = dict.fromkeys(EDGES, 0.0)
+        self._grace_at = now
+
+    def keep_grace(self, previous):
+        """An engine built to replace `previous` (a link up, a settings save) keeps its grace."""
+        self._grace_inward = dict(previous._grace_inward)
+        self._grace_at = previous._grace_at
 
     @classmethod
     def from_config(cls, crossing):
@@ -152,9 +177,14 @@ class CrossingEngine:
             peer = zone.get("peer")
             if zone.get("off") is True or peer not in sides:
                 continue
-            held = found.setdefault(peer, {"methods": set(), "parts": ("middle",), "corner": "top_right"})
+            display = zone.get("display")
+            edge = zone.get("side", sides[peer])
+            key = (peer, display, edge)
+            held = found.setdefault(key, {"methods": set(), "parts": ("middle",), "corner": "top_right",
+                                          "target_display": zone.get("target_display"),
+                                          "target_side": zone.get("target_side")})
             kind = zone.get("kind")
-            if kind in ("edge", "part") and sides[peer] not in EDGES:
+            if kind in ("edge", "part") and edge not in EDGES:
                 continue
             if kind == "part":
                 held["parts"] = tuple(part for part in zone.get("parts") or () if part in return_edge.PARTS)
@@ -165,9 +195,10 @@ class CrossingEngine:
             elif kind not in ("edge", "notch"):
                 continue
             held["methods"].add(kind)
-        ways = [Ways(peer, frozenset(held["methods"]), sides[peer] if sides[peer] in EDGES else "right",
-                     frozenset(held["parts"]), held["corner"])
-                for peer, held in found.items() if held["methods"]]
+        ways = [Ways(peer, frozenset(held["methods"]), edge if edge in EDGES else "right",
+                     frozenset(held["parts"]), held["corner"], display, held["target_display"],
+                     held["target_side"])
+                for (peer, display, edge), held in found.items() if held["methods"]]
         return cls(resistance_px=crossing["resistance_px"], block_while_dragging=crossing["block_while_dragging"],
                    ways=ways)
 
@@ -205,6 +236,7 @@ class CrossingEngine:
         self.region = None
         self._quarter_reached = 0
         self._peer = None
+        self._selected_way = None
         self._last_at = None
         self._last_x = None
         self._last_y = None
@@ -226,6 +258,13 @@ class CrossingEngine:
         self._last_at = now
         previous_x, previous_y = self._last_x, self._last_y
         self._last_x, self._last_y = x, y
+        if self._grace_at is not None:
+            if now - self._grace_at >= return_edge.ARRIVAL_GRACE_SECONDS:
+                self._grace_at = None
+            else:
+                for edge, inward in (("left", dx), ("right", -dx), ("top", dy), ("bottom", -dy)):
+                    if inward > 0:
+                        self._grace_inward[edge] += inward
         if dragging and self.block_while_dragging:
             self.touching = False
             return self._release()
@@ -244,6 +283,8 @@ class CrossingEngine:
             if edge_target is not None:
                 mac_edge, region, diagonal, via, peer = edge_target
                 outward, inward = self._push(mac_edge, diagonal, x, y, dx, dy, previous_x, previous_y, self._push_box)
+        if self._grace_at is not None and self._grace_inward.get(mac_edge, 0.0) < return_edge.ARRIVAL_GRACE_PX:
+            return self._release()
         if self._peer is not None and peer != self._peer:
             # Pressure built against one machine's zone is not a push on another's beside it.
             self.pressure = 0.0
@@ -270,6 +311,9 @@ class CrossingEngine:
                 region=region,
                 via=via,
                 peer=peer,
+                display=self._selected_way.target_display if self._selected_way else None,
+                side=(self._selected_way.target_side or OPPOSITE[mac_edge])
+                     if self._selected_way and self._selected_way.target_display else None,
             )
             self.reset()
             return step
@@ -291,28 +335,48 @@ class CrossingEngine:
         )
 
     @staticmethod
-    def arrival_point(edge, offset, bounds, inset=2.0, displays=None):
+    def arrival_point(edge, offset, bounds, inset=2.0, displays=None, display=None, side=None):
         """Where the pointer lands when input comes home through a Mac `edge`, `offset` of the
         way along it, a couple of points inside so the arrival itself is not already a push. With
         `displays`, on the display return_edge.landing_monitor picks, so a staggered or stacked
         arrangement never lands it in a gap or on the wrong display."""
         left, top, right, bottom = bounds
         offset = max(0.0, min(1.0, float(offset)))
-        side = edge in ("left", "right")
-        along = top + offset * (bottom - 1 - top) if side else left + offset * (right - 1 - left)
+        along_side = edge in ("left", "right")
         if displays:
             rects = [return_edge.Rect(d[0], d[1], d[2] - d[0], d[3] - d[1]) for d in displays]
-            owner = displays[rects.index(return_edge.landing_monitor(rects, edge, along))]
-            left, top, right, bottom = owner
-            along = min(max(along, top if side else left), (bottom if side else right) - 1)
-        if side:
+            if isinstance(display, str) and display.isdigit() and int(display) < len(displays) and side in EDGES:
+                owner = displays[int(display)]
+                edge = side
+                left, top, right, bottom = owner
+                along = top + offset * (bottom - 1 - top) if edge in ("left", "right") else left + offset * (right - 1 - left)
+            else:
+                # The fraction is of the whole edge, as on the PC (return_edge.arrival_position): laid
+                # across the one display it lands on, it put the pointer up to a display's width off.
+                along = top + offset * (bottom - 1 - top) if along_side else left + offset * (right - 1 - left)
+                owner = displays[rects.index(return_edge.landing_monitor(rects, edge, along))]
+                left, top, right, bottom = owner
+        else:
+            along = top + offset * (bottom - 1 - top) if along_side else left + offset * (right - 1 - left)
+        # Clear of both ends, as on the PC (return_edge.LANDING_CLEAR_PX): at an end the pointer sat on
+        # the edge beside it, and the hand still moving crossed that edge to its machine.
+        low, high = (top, bottom - 1) if edge in ("left", "right") else (left, right - 1)
+        clear = return_edge.LANDING_CLEAR_PX if high - low > 2 * return_edge.LANDING_CLEAR_PX else 0
+        cleared = min(max(along, low + clear), high - clear)
+        beyond = {"left": (left - 1, cleared), "right": (right, cleared),
+                  "top": (cleared, top - 1), "bottom": (cleared, bottom)}[edge]
+        if displays and any(d[0] <= beyond[0] < d[2] and d[1] <= beyond[1] < d[3] for d in displays):
+            # Moved in along a staggered neighbour's seam: the wall is the exposed end itself.
+            cleared = min(max(along, low), high)
+        along = cleared
+        if edge in ("left", "right"):
             return (left + inset if edge == "left" else right - 1 - inset, along)
         return (along, top + inset if edge == "top" else bottom - 1 - inset)
 
     def _decay(self, elapsed):
         if elapsed <= 0 or self.resistance_px <= 0:
             return 0.0
-        return self.resistance_px * elapsed / DECAY_S
+        return DECAY_PX_PER_SECOND * elapsed
 
     def _release(self):
         self.pressure = 0.0
@@ -321,6 +385,7 @@ class CrossingEngine:
         self.region = None
         self._quarter_reached = 0
         self._peer = None
+        self._selected_way = None
         return Step()
 
     def _fraction(self, pressure):
@@ -339,6 +404,7 @@ class CrossingEngine:
         section 8): a corner wins over the edge it sits on, since its box is inside that edge's strip.
         `ready(peer)`, when given, leaves out the zones of machines that cannot take input now."""
         ways = [way for way in self.ways if ready is None or ready(way.peer)]
+        display_frames = {str(index): frame for index, frame in enumerate(displays or ())}
         left, top, right, bottom = bounds
         x_max, y_max = right - 1, bottom - 1
         at = {
@@ -367,19 +433,43 @@ class CrossingEngine:
             if near_x and near_y and (at[horizontal] or at[vertical]):
                 box_x = left if horizontal == "left" else x_max - CORNER_PX + 1
                 box_y = top if vertical == "top" else y_max - CORNER_PX + 1
+                self._selected_way = way
                 return horizontal, (box_x, box_y, CORNER_PX, CORNER_PX), vertical, "corner", way.peer
         for way in ways:
-            if "edge" in way.methods and at[way.edge]:
-                self._push_box = edge_box[way.edge]
-                return way.edge, self._strip(way.edge, edge_box[way.edge]), None, "edge", way.peer
+            screen = display_frames.get(way.display) if way.display is not None else None
+            edge_at = at[way.edge]
+            if screen is not None:
+                sx, sy, sr, sb = screen
+                edge_at = (sx <= x < sr and sy <= y < sb and {
+                    "left": x <= sx + EDGE_TOLERANCE,
+                    "right": x >= sr - 1 - EDGE_TOLERANCE,
+                    "top": y <= sy + EDGE_TOLERANCE,
+                    "bottom": y >= sb - 1 - EDGE_TOLERANCE,
+                }[way.edge])
+            if "edge" in way.methods and edge_at:
+                self._push_box = screen or edge_box[way.edge]
+                self._selected_way = way
+                return way.edge, self._strip(way.edge, self._push_box), None, "edge", way.peer
         for way in ways:
-            if "part" in way.methods and at[way.edge]:
+            screen = display_frames.get(way.display) if way.display is not None else None
+            edge_at = at[way.edge]
+            if screen is not None:
+                sx, sy, sr, sb = screen
+                edge_at = (sx <= x < sr and sy <= y < sb and {
+                    "left": x <= sx + EDGE_TOLERANCE,
+                    "right": x >= sr - 1 - EDGE_TOLERANCE,
+                    "top": y <= sy + EDGE_TOLERANCE,
+                    "bottom": y >= sb - 1 - EDGE_TOLERANCE,
+                }[way.edge])
+            if "part" in way.methods and edge_at:
                 # The thirds are the pointer's own display's, as the PC measures them: along the whole
                 # desktop, a short display beside a tall one could hold none of the middle third.
-                part = return_edge.part_of(self._offset(way.edge, (x, y), own or bounds))
+                local_bounds = screen or own or bounds
+                part = return_edge.part_of(self._offset(way.edge, (x, y), local_bounds))
                 if part in way.parts:
-                    self._push_box = edge_box[way.edge]
-                    return way.edge, self._part_strip(way.edge, own or bounds, part), None, "edge", way.peer
+                    self._push_box = local_bounds
+                    self._selected_way = way
+                    return way.edge, self._part_strip(way.edge, local_bounds, part), None, "edge", way.peer
         for way in ways:
             if "notch" in way.methods and notch_range is not None and at["top"]:
                 notch_left, notch_right = notch_range

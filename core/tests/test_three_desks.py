@@ -6,6 +6,7 @@ a driven pointer crosses by the responder's zones and a `switch`, all core/owner
 
 import time
 import unittest
+from unittest import mock
 
 from core import owner as owner_module
 from core import protocol
@@ -44,6 +45,11 @@ class Desks(unittest.TestCase):
     LAYOUT = {}
 
     def setUp(self):
+        # These tests cross the moment input lands; the arrival grace is test_arrival_grace's
+        # subject, not theirs.
+        grace = mock.patch.object(return_edge, "ARRIVAL_GRACE_SECONDS", 0.0)
+        grace.start()
+        self.addCleanup(grace.stop)
         self.desks = {own: Desk(self, own, sides, zones) for own, (sides, zones) in self.LAYOUT.items()}
         for own, desk in self.desks.items():
             desk.connect(self, [other for ident_, other in self.desks.items() if ident_ != own])
@@ -226,13 +232,10 @@ class AMachinePairedLate(Desks):
         self.assertEqual(self.arrives(A, C, "left", 1_790_000_100), (True, []))
         self.walk(A, [("right", C), ("left", A), ("left", B), ("right", A)])
 
-    def test_a_side_arriving_onto_another_machines_edge_is_refused_out_loud_and_the_thirds_share_it(self):
+    def test_an_old_side_arriving_onto_another_edge_has_no_way_until_the_map_shares_it(self):
         changed, notices = self.arrives(A, C, "right", 1_790_000_100)
         self.assertTrue(changed)
-        # The harness's handshakes name every machine "Peer", so the sentences are held by their shape.
-        self.assertEqual(len(notices), 1)
-        self.assertIn("now lead from the same part of this PC's screen", notices[0])
-        self.assertTrue(notices[0].endswith("edge is off."))
+        self.assertEqual(notices, [])
         settings = self.desks[A].machine.settings.data
         self.assertIn("has no way in", ways.blocked_sentence(settings, text(C), "this PC"))
         self.assertFalse(ways.has_way(settings, text(C)))
@@ -241,7 +244,15 @@ class AMachinePairedLate(Desks):
         self.assertEqual(self.answers(A, C), (True, []))
         self.assertIn("has no way back", ways.no_way_back_sentence(on_sea, text(A)))
         self.assertEqual(self.answers(A, C), (False, []))
-        # What the Crossing page then offers: each its own thirds of the left edge.
+        # The map gives each machine a contact, then the page narrows its own thirds.
+        layout = {
+            text(A): dict(x=0, y=0, w=160, h=100),
+            text(B): dict(x=-160, y=-50, w=160, h=100),
+            text(C): dict(x=-160, y=51, w=160, h=100),
+        }
+        result = ways.compile_layout(settings, layout, capable={text(A), text(B), text(C)}, now=time.time())
+        settings.clear()
+        settings.update(result["settings"])
         ways.edit(settings, text(B), side="left", methods=["part"], parts=["start"], corner="top_left",
                   kinds=("edge", "part", "corner"), corner_edge=lambda corner, side: side, now=time.time())
         ways.edit(settings, text(C), side="left", methods=["part"], parts=["end"], corner="top_left",

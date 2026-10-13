@@ -22,7 +22,7 @@ class QtPolishTests(unittest.TestCase):
     set_size = acceptance.SettingsLayoutAcceptance.set_size
     page_scroll = acceptance.SettingsLayoutAcceptance.page_scroll
 
-    def test_01_selected_segment_has_dark_text_on_light_with_contrast(self):
+    def test_01_selected_segment_ink_contrasts_in_both_appearances(self):
         self.set_size(900)
         for dark in (False, True):
             theme.set_dark(dark)
@@ -36,18 +36,21 @@ class QtPolishTests(unittest.TestCase):
             image = image.copy(round(point.x() * dpr), round(point.y() * dpr),
                                round(button.width() * dpr), round(button.height() * dpr))
             bg = image.pixelColor(image.width() // 2, round(5 * image.devicePixelRatio()))
-            self.assertGreater(bg.lightnessF(), .7)
             # Measure actual painted glyph ink, rather than merely the stylesheet palette.
             centre = image.copy(round(12 * image.devicePixelRatio()), round(10 * image.devicePixelRatio()),
                                 image.width() - round(24 * image.devicePixelRatio()),
                                 image.height() - round(20 * image.devicePixelRatio()))
-            ink = min((centre.pixelColor(x, y) for x in range(centre.width())
-                       for y in range(centre.height())), key=lambda c: c.lightnessF())
             def luminance(colour):
                 values = [v / 12.92 if v <= .04045 else ((v + .055) / 1.055) ** 2.4
                           for v in colour.getRgbF()[:3]]
                 return sum(v * w for v, w in zip(values, (.2126, .7152, .0722)))
-            self.assertGreaterEqual((luminance(bg) + .05) / (luminance(ink) + .05), 4.5)
+            bg_luminance = luminance(bg)
+            ink = (max if bg_luminance < .5 else min)(
+                (centre.pixelColor(x, y) for x in range(centre.width()) for y in range(centre.height())),
+                key=luminance,
+            )
+            ratio = (max(bg_luminance, luminance(ink)) + .05) / (min(bg_luminance, luminance(ink)) + .05)
+            self.assertGreaterEqual(ratio, 4.5)
 
     def test_02_segments_measure_longest_label_and_never_wrap(self):
         for width in (320, 640, 900, 1440, 1920):
@@ -105,32 +108,34 @@ class QtPolishTests(unittest.TestCase):
             self.assertLessEqual(row.directions.x() - (row.in_use.x() + row.in_use.width()), 16)
             self.assertAlmostEqual(row.remove_button.x() + row.remove_button.width(), row.width(), delta=1)
 
-    def test_07_parts_are_segmented_and_corners_use_two_columns(self):
-        self.assertIsInstance(self.window.crossing_rows["parts"].holder.layout().itemAt(0).widget(), widgets._SegmentedView)
+    def test_07_atlas_canvas_and_ledger_replace_the_inspector(self):
+        self.assertIsInstance(self.window.atlas_canvas, diagram.AtlasCanvas)
         self.set_size(1440)
         self.page_scroll("crossing")
-        view = self.window.corner_choice.view
-        view.show()
-        self.settle()
-        self.assertLessEqual(len({button.y() for button in view.buttons}), 2)
+        self.assertFalse(self.window.crossing_ledger.isHidden())
+        for row in self.window.crossing_ledger.rows.values():
+            self.assertEqual(len(row.edge_glyph.buttons), 3)
+            self.assertEqual(len(row.corner_glyph.buttons), 4)
+        self.assertFalse(hasattr(self.window, "way_boxes"))
 
     def test_08_every_legend_way_has_a_description(self):
         self.assertTrue(all(description for _, _, description in pages_win.WAY_ROWS))
 
     def test_09_headers_and_diagram_labels_wrap(self):
         self.assertTrue(self.window.ways_module.eyebrow.wordWrap())
-        self.assertTrue(self.window.jump_heading.wordWrap())
+        self.assertFalse(hasattr(self.window, "selected_machine_header"))
+        for row in self.window.crossing_ledger.rows.values():
+            self.assertTrue(row.status.wordWrap())
+            self.assertTrue(row.edge_detail.wordWrap())
         strip = self.window.resistance_strip
-        strip.resize(400, 44)
+        strip.resize(400, 72)
         strip.set_other_name("Other machine")
-        metrics = QFontMetrics(theme.font(theme.TYPE["small"], 600))
-        width = strip.target_width() if hasattr(strip, "target_width") else strip.MAC
-        self.assertGreaterEqual(width, metrics.horizontalAdvance("Other machine") + 12)
+        metrics = QFontMetrics(theme.font(theme.TYPE["eyebrow"], 600))
+        self.assertEqual(strip.accessibleName(), "Resistance")
+        self.assertEqual(strip.height(), 72)
         strip.set_other_name("Synthetic workstation with a long machine name")
-        strip.resize(160, 44)
-        needed = metrics.boundingRect(QRect(0, 0, round(strip.target_width() - 8), 10000),
-                                      int(Qt.TextFlag.TextWrapAnywhere), strip._other)
-        self.assertGreaterEqual(strip.heightForWidth(160), needed.height() + 4)
+        strip.resize(320, 72)
+        self.assertLessEqual(metrics.horizontalAdvance(strip.peer_label_text()), 144)
 
     def test_10_status_uses_hanken_with_normal_tracking(self):
         self.page_scroll("overview")
@@ -148,20 +153,28 @@ class QtPolishTests(unittest.TestCase):
                 self.assertGreaterEqual(button.width(), button.fontMetrics().horizontalAdvance(button.text()) + 16)
                 self.assertGreaterEqual(button.height(), 30)
         self.page_scroll("crossing")
-        drawing = self.window.arrangement_diagram
-        self.assertFalse(self.window.ways_pair.beside())
-        self.assertGreaterEqual(drawing.width(), 120)
-        pc, screens, _ = drawing._drawing(drawing.width())
-        for rect in [pc, *screens.values()]:
-            self.assertGreaterEqual(rect[0], 0)
-            self.assertLessEqual(rect[0] + rect[2], drawing.width() + 1)
-        metrics = QFontMetrics(theme.font(theme.TYPE["small"], 600))
-        for key, rect in screens.items():
-            needed = metrics.boundingRect(QRect(0, 0, max(1, round(rect[2] - 8)), 10000),
-                                          int(Qt.TextFlag.TextWrapAnywhere), drawing._labels[key])
-            self.assertLessEqual(needed.height(), rect[3] - 4)
-            self.assertLessEqual(needed.width(), rect[2] - 8 + 1)
-        self.assertGreaterEqual(self.window.jump_recorder.height(), self.window.jump_recorder.heightForWidth(self.window.jump_recorder.width()))
+        canvas = self.window.atlas_canvas
+        self.assertGreaterEqual(canvas.width(), 120)
+        for peer in canvas.tiles:
+            rect = canvas.tile_rect(peer)
+            with self.subTest(peer=peer):
+                self.assertGreaterEqual(rect.left(), 0)
+                self.assertGreaterEqual(rect.top(), 0)
+                self.assertLessEqual(rect.right(), canvas.width())
+                self.assertLessEqual(rect.bottom(), canvas.height())
+        self.set_size(900)
+        self.page_scroll("crossing")
+        canvas = self.window.atlas_canvas
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QMouseEvent
+        for peer in canvas.tiles:
+            point = canvas.tile_rect(peer).center()
+            self.app.sendEvent(canvas, QMouseEvent(QEvent.Type.MouseMove, point, point,
+                               Qt.MouseButton.NoButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+            self.assertIn(canvas.labels[peer], canvas.toolTip())
+            self.assertIn(canvas.labels[peer], canvas.accessibleDescription())
+        for row in self.window.crossing_ledger.rows.values():
+            self.assertGreaterEqual(row.jump.height(), row.jump.heightForWidth(row.jump.width()))
 
     def test_12_rail_ends_above_footer_at_minimum_height(self):
         self.set_size(320, 300)

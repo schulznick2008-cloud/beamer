@@ -103,6 +103,11 @@ class PlanKeyInputsChordTests(unittest.TestCase):
         self.assertEqual(down_plan, [(0x45, 0x12, 0)])
         self.assertEqual(char_vk_down, {"e": 0x45})
 
+    def test_native_media_keys_use_the_windows_virtual_key_table(self):
+        for name, vk in (("volume_up", 0xAF), ("volume_down", 0xAE), ("volume_mute", 0xAD),
+                         ("media_play_pause", 0xB3), ("media_next", 0xB0), ("media_prev", 0xB1)):
+            self.assertEqual(input_injector.VK_MAP[name], vk)
+
     def test_keyup_mirrors_vk_even_if_modifier_released_first(self):
         mods_down = {"ctrl"}
         char_vk_down = {}

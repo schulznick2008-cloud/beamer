@@ -16,6 +16,7 @@ import rumps
 import notices
 from kvm_bridge_app import TrayApp, _set_tray_title, _tray_item
 from core import locale
+from core import peerlist
 
 
 class FakeContent:
@@ -157,12 +158,15 @@ class NoticesTest(unittest.TestCase):
 
 class _FakeTrayApp:
     _notify_user_main = TrayApp._notify_user_main
+    _drive_status = TrayApp._drive_status
 
     def __init__(self):
         self.logger = logging.getLogger("test-notices-tray")
         self.controller = mock.Mock()
         self.controller.cfg.hide_addresses = True
         self.notices = mock.Mock()
+        self._refusal_notices = peerlist.RefusalThrottle()
+        self._refresh_tray_state = mock.Mock()
 
 
 class TrayNoticeTest(unittest.TestCase):
@@ -181,6 +185,28 @@ class TrayNoticeTest(unittest.TestCase):
         title, body = fake.notices.post.call_args.args
         self.assertEqual(title, "Can't cross to Bee")
         self.assertNotIn("192.0.2.30", body)
+
+    def test_repeated_refusals_update_the_tray_but_post_one_notice(self):
+        fake = _FakeTrayApp()
+        with mock.patch.object(rumps, "notification") as old, mock.patch("AppKit.NSBeep"):
+            fake._notify_user_main("Beamer", "Can't cross to Bee: it is driving Sea.")
+            fake._notify_user_main("Beamer", "Can't cross to Bee: it is driving Sea.")
+        old.assert_not_called()
+        self.assertEqual(fake.notices.post.call_count, 1)
+        self.assertEqual(fake._refresh_tray_state.call_count, 2)
+
+    def test_tray_state_names_the_current_input_owner(self):
+        fake = _FakeTrayApp()
+        fake.controller.redirecting = True
+        fake.controller.on_label = "Sea"
+        fake.controller.driver = None
+        self.assertEqual(fake._drive_status(), "Driving Sea")
+        fake.controller.redirecting = False
+        fake.controller.driver = object()
+        fake.controller.driver_label = "Bee"
+        self.assertEqual(fake._drive_status(), "Driven by Bee")
+        fake.controller.driver = None
+        self.assertEqual(fake._drive_status(), "Idle")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ the state directory; v1 asks at every start."""
 import logging
 import math
 import os
+import linux_desktop
 import select
 import threading
 import time
@@ -108,9 +109,11 @@ _NORMAL = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}
 NO_PORTAL = ("This desktop does not let apps capture the keyboard and mouse (it has no InputCapture "
              "portal), so this machine cannot drive another one. It can still be driven if the "
              "desktop allows remote control.")
-REFUSED = ("Beamer was not allowed to capture the keyboard and mouse, so this machine cannot drive "
-           "another one. Turn sending off and on again to be asked again.")
+REFUSED = ("The desktop did not allow Beamer to capture the keyboard and mouse. Choose Ask again and allow the "
+           "requested keyboard and pointer access in the desktop prompt.")
 ENDED = "The desktop stopped letting Beamer capture the keyboard and mouse: {detail}"
+SESSION_CLOSED = ENDED.format(detail="the session was closed")
+MISSING_CAPABILITIES = "InputCapture did not grant both keyboard and pointer capabilities, so this machine cannot send input."
 
 
 class CaptureUnavailable(RuntimeError):
@@ -176,7 +179,7 @@ def _thirds(monitor: crossing.Rect, edge: str) -> List[Tuple[int, int]]:
     return [(cuts[i], cuts[i + 1]) for i in range(3)]
 
 
-def barriers(models: list, monitors: List[crossing.Rect]) -> List[Tuple[str, Tuple[int, int, int, int]]]:
+def barriers(models: list, monitors: List[crossing.Rect], whole_edges=False) -> List[Tuple[str, Tuple[int, int, int, int]]]:
     """(wall, position) for every barrier the sender's zone models need on these displays, in the
     portal's coordinates, each once: a whole edge, the chosen thirds of it, or a corner's two walls
     of CORNER_PX + 1 pixels. A notch stretch (SpanEdge) is the Mac's and has none here."""
@@ -190,6 +193,14 @@ def barriers(models: list, monitors: List[crossing.Rect]) -> List[Tuple[str, Tup
         if isinstance(model, crossing.SpanEdge):
             continue
         for monitor in monitors:
+            if whole_edges:
+                walls = (model.vertical, model.horizontal) if isinstance(model, crossing.CornerPush) else (model.edge,)
+                for wall in walls:
+                    start, length = (monitor.y, monitor.height) if wall in ("left", "right") else (monitor.x, monitor.width)
+                    # KDE's portal rejects partial edges, including exposed pieces beside a staggered screen.
+                    if _outer(monitors, monitor, wall) == [(start, start + length)]:
+                        add(wall, _segment(monitor, wall, start, start + length))
+                continue
             if isinstance(model, crossing.CornerPush):
                 for wall in (model.vertical, model.horizontal):
                     along_far = wall in ("left", "right")
@@ -294,6 +305,9 @@ class _Session:
                     options["restore_token"] = ("s", token)
                 started = self.portal.request(INTERFACE, "Start", "osa{sv}", lambda handle_token: (
                     self.handle, "", dict(options, handle_token=("s", handle_token))))
+                if started.get("capabilities", 0) & (CAP_KEYBOARD | CAP_POINTER) != CAP_KEYBOARD | CAP_POINTER:
+                    self._tokens.write("")
+                    raise CaptureUnavailable(MISSING_CAPABILITIES)
                 if started.get("restore_token"):
                     self._tokens.write(started["restore_token"])
             else:
@@ -306,6 +320,9 @@ class _Session:
                 except portal.PortalError as exc:
                     raise CaptureUnavailable(f"{NO_PORTAL} ({exc})") from exc
                 self.handle = results["session_handle"]
+                if results.get("capabilities", 0) & (CAP_KEYBOARD | CAP_POINTER) != CAP_KEYBOARD | CAP_POINTER:
+                    self._tokens.write("")
+                    raise CaptureUnavailable(MISSING_CAPABILITIES)
         except portal.Refused:
             self._tokens.write("")
             raise CaptureUnavailable(REFUSED) from None
@@ -323,9 +340,16 @@ class _Session:
         return [crossing.Rect(x, y, width, height) for width, height, x, y in results.get("zones", [])]
 
     def set_barriers(self, positions: List[Tuple[int, int, int, int]]) -> List[int]:
-        """Barrier i + 1 for each position; the ids the desktop refused. Setting them suspends
-        the session, so it is enabled again after, when there are any."""
-        self.enabled = False
+        """Barrier i + 1 for each position; the ids the desktop refused. An enabled session is
+        disabled first and enabled again after, when there are any: GNOME refuses every barrier
+        and a second Enable on an enabled session, and an explicit Disable sends no Disabled signal.
+        A session the desktop already disabled is not sent another Disable, which GNOME refuses."""
+        if self.enabled:
+            self.enabled = False
+            try:
+                self.portal.call(INTERFACE, "Disable", "oa{sv}", (self.handle, {}))
+            except portal.PortalError as exc:
+                LOGGER.warning("Could not disable the capture session before setting its barriers (%s)", exc)
         listed = [{"barrier_id": ("u", index + 1), "position": ("(iiii)", tuple(position))}
                   for index, position in enumerate(positions)]
         results = self.portal.request(INTERFACE, "SetPointerBarriers", "oa{sv}aa{sv}u", lambda token: (
@@ -370,6 +394,7 @@ class Hooks:
         self._ei_factory = ei or _ei_receiver
         self._tokens = tokens or portal.TokenStore("input-capture")
         self._clock = clock
+        self._whole_edges = linux_desktop.desktop() == "kde"
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
         self._stopping = threading.Event()
@@ -378,6 +403,7 @@ class Hooks:
         self._models: Callable[[], list] = lambda: []
         self.on_home: Optional[Callable[[], None]] = None
         self.on_failure: Optional[Callable[[BaseException], None]] = None
+        self.on_permission: Optional[Callable[[str, str, bool], None]] = None
         self._session: Optional[_Session] = None
         self._beat = clock()
         self._reset()
@@ -391,6 +417,9 @@ class Hooks:
         self._early_at = 0.0
         self._walls: Dict[int, str] = {}
         self._placed: List[Tuple[str, Tuple[int, int, int, int]]] = []
+        self._selected: List[Tuple[str, Tuple[int, int, int, int]]] = []
+        self._rejected = set()
+        self._reject_unannounced = False
         self._sequences: Dict[object, int] = {}  # libei device: the sequence it emulates under
         self._disabled_at: Optional[float] = None
         self._sent_home_at: Optional[float] = None
@@ -435,6 +464,21 @@ class Hooks:
         if self._failure is not None:
             raise self._failure
 
+    def request_again(self) -> None:
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                raise RuntimeError("The last capture session has not stopped yet")
+        self.start()
+
+    def _report_permission(self, status: str, detail: str = "", retryable: bool = False) -> None:
+        if self.on_permission is not None:
+            try:
+                self.on_permission(status, detail, retryable)
+            except Exception:
+                LOGGER.exception("Could not report InputCapture permission state")
+
     def stop(self) -> None:
         self._stopping.set()
         thread = self._thread
@@ -467,6 +511,7 @@ class Hooks:
             self._ready.set()
             session.open()
             self._set_zones(session.zones())
+            self._report_permission("ready")
             while not self._stopping.is_set():
                 self._beat = self._clock()
                 self._wait(session)
@@ -475,7 +520,7 @@ class Hooks:
                     if interface == INTERFACE and body and body[0] == session.handle:
                         self._signal(member, body[1] if len(body) > 1 else {})
                     elif interface == portal.SESSION and member == "Closed" and path == session.handle:
-                        raise CaptureUnavailable(ENDED.format(detail="the session was closed"))
+                        raise CaptureUnavailable(SESSION_CLOSED)
                 events = session.ei.events()
                 for event in events:
                     self._beat = self._clock()
@@ -489,6 +534,10 @@ class Hooks:
         except Exception as exc:
             if not self._stopping.is_set():
                 LOGGER.exception("Keyboard and mouse capture stopped")
+                refused = getattr(exc, "sentence", None) in (REFUSED, MISSING_CAPABILITIES)
+                status = "refused" if refused else "unavailable"
+                self._report_permission(status, getattr(exc, "sentence", str(exc)),
+                                        refused or getattr(exc, "sentence", None) == SESSION_CLOSED)
             started = self._ready.is_set()
             self._failure = exc if not started else None
             self._ready.set()
@@ -563,9 +612,12 @@ class Hooks:
                 LOGGER.info("The desktop ended the capture while input was away; bringing it home")
                 self._home()
         elif member == "ZonesChanged":
+            # Mutter and KWin disable the session on a monitor change; mutter says only this.
+            self._session.enabled = False
             self._set_zones(self._session.zones())
 
     def _activated(self, options: dict) -> None:
+        self._reject_unannounced = False
         activation = options.get("activation_id", NO_ID)
         point = options.get("cursor_position") or desktop_portal.cursor_position()
         barrier = options.get("barrier_id")
@@ -578,12 +630,33 @@ class Hooks:
             LOGGER.info("Captured at a barrier Beamer does not know; letting go")
             self._let_go(desktop_portal.clamp_to(self._zones, *point))
             return
+        if self._whole_edges and not self._selected_at(wall, point):
+            self._reject_unannounced = activation == NO_ID
+            rejected = {activation} if activation != NO_ID else set(self._sequences.values())
+            self._rejected.update(rejected)
+            self._early = [(event, sequence) for event, sequence in self._early if sequence not in rejected]
+            self._let_go(desktop_portal.clamp_to(self._zones, *point))
+            return
         self._press = Press(wall, point, self._zones, self._clock)
         desktop_portal.note_position(*self._press.point)
         early, self._early = self._early, []
         for event, sequence in early:
             if self._current(sequence):
                 self._ei_event(event)
+
+    def _selected_at(self, wall, point) -> bool:
+        vertical = wall in ("left", "right")
+        x, y = point
+        candidates = [position for index, (edge, position) in enumerate(self._placed)
+                      if edge == wall and index + 1 in self._walls]
+        if not candidates:
+            return False
+        actual = min(candidates, key=lambda p: max(p[0] - x, 0, x - p[2]) + max(p[1] - y, 0, y - p[3]))
+        line = actual[0] if vertical else actual[1]
+        along = y if vertical else x
+        return any(edge == wall and (p[0] if vertical else p[1]) == line
+                   and (p[1] if vertical else p[0]) <= along <= (p[3] if vertical else p[2])
+                   for edge, p in self._selected)
 
     def _wall_at(self, point) -> Optional[str]:
         """The wall of the placed barrier nearest the pointer, within WALL_PX: the desktop reports
@@ -594,7 +667,9 @@ class Hooks:
             if index + 1 not in self._walls:
                 continue
             distance = max(x1 - x, 0, x - x2) + max(y1 - y, 0, y - y2)
-            if distance <= WALL_PX and (best is None or distance < best[0]):
+            # KWin omits barrier_id and may report a fast push far beyond the barrier line.
+            along_edge = y1 <= y <= y2 if wall in ("left", "right") else x1 <= x <= x2
+            if (distance <= WALL_PX or self._whole_edges and along_edge) and (best is None or distance < best[0]):
                 best = (distance, wall)
         return best[1] if best else None
 
@@ -705,7 +780,8 @@ class Hooks:
                 session.enable()
             return
         self._key = key
-        placed = self._placed = barriers(models, self._zones)
+        self._selected = barriers(models, self._zones)
+        placed = self._placed = barriers(models, self._zones, whole_edges=self._whole_edges)
         failed = session.set_barriers([position for _wall, position in placed])
         self._walls = {index + 1: wall for index, (wall, _position) in enumerate(placed) if index + 1 not in failed}
         if failed:
@@ -733,16 +809,22 @@ class Hooks:
             return
         if kind == "start":
             self._sequences[event[1]] = event[2]
+            if self._reject_unannounced:
+                self._rejected.add(event[2])
             return
         if kind == "stop":
             # What arrives between a let-go and the desktop ending the capture belongs to nobody.
-            self._sequences.pop(event[1], None)
+            ended = self._sequences.pop(event[1], None)
+            if ended not in self._sequences.values():
+                self._rejected.discard(ended)
             if not self._sequences:
                 self._early = []
             return
         if kind not in ("motion", "button", "key", "scroll", "scroll_discrete", "frame"):
             return
         sequence = self._sequences.get(event[1]) if len(event) > 1 else None
+        if sequence in self._rejected:
+            return
         if self._activation is None:
             # Ahead of the Activated signal that says which barrier.
             if sequence is not None and len(self._early) < EARLY_MAX:

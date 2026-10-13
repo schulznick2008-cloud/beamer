@@ -346,11 +346,12 @@ def main():
     kvm.hardware_win.hardware_address_towards = lambda *_: ""
     kvm.autostart_win.is_enabled = lambda: False
     kvm.autostart_win.installed_exe = lambda: str(settings_path.parent / "Beamer-audit.exe")
+    kvm.autostart_win.can_run_for_current_user = lambda: True
     kvm.platform_parts.injector.stop = lambda: None
     theme.watch_system = lambda *_: None
     motion.fade_from = lambda *_args, **_kw: None
     motion.snapshot = lambda *_: None
-    motion.set_shown = lambda w, shown: w.setVisible(shown)
+    motion.set_shown = lambda w, shown, **_options: w.setVisible(shown)
     motion.should_animate = lambda *_: False
     effects_log = []
     kvm.autostart_win.set_enabled = lambda *a: effects_log.append(["autostart", bool(a[0])])
@@ -554,13 +555,6 @@ def main():
                                 screen_is_offscreen=True, menu_items=menu_items, flags=menu_flags))
             if state == "five-shared-edge":
                 window._select_page("crossing")
-                for part, button in window.share_tiles.items():
-                    if window.share_module.isVisibleTo(window):
-                        button.click()
-                        capture(window, f"share-{part}", size, state)
-                if window.share_module.isVisibleTo(window) and window.share_button.isEnabled():
-                    window.share_button.click()
-                    capture(window, "share-apply", size, state)
             if state == "none":
                 window._select_page("connection")
                 original_save = kvm.app_config.write_settings

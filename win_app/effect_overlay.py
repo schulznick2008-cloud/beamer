@@ -4,7 +4,8 @@ click-through window, sized each frame to what the effect drew.
 effects.py records every effect as operations in desktop points; `replay` turns them into Qt paths,
 brushes and pens. The window is today's EdgeGlow pattern: frameless, translucent, input passes
 through it, a tool window (so no taskbar button and no Alt-Tab entry), above everything, the
-taskbar included, never activated. It repaints at 60Hz only while the Player is busy and hides as soon as it is not.
+taskbar included, never activated. Its frame timer follows the screen refresh rate while the Player
+is busy, and it hides as soon as it is not.
 
 Any exception from an effect or the replay is logged once with the effect's id and turns the new
 effects off for the rest of the run; the app then falls back to today's glow.
@@ -25,7 +26,7 @@ import time
 if sys.platform == "win32":
     os.environ["QT_NO_GUI_THREADPOOL"] = "1"
 
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -44,10 +45,10 @@ import app_config
 import edge_glow
 from core import effects
 from core import return_edge as crossing
+from frame_clock import frame_timer, start_paced
 
 LOGGER = logging.getLogger(__name__)
 
-FRAME_MS = 16
 # How long without a pressure update before the push is taken to have stopped and drains on its
 # own clock, as EdgeGlow's does.
 STALE_SECONDS = 0.08
@@ -254,7 +255,7 @@ def edge_region(edge: str, rects, origin, pointer=None, part=None) -> dict:
 class EffectOverlay(QWidget):
     """One window for every effect on this PC, departures and arrivals alike."""
 
-    def __init__(self, on_failure=None) -> None:
+    def __init__(self, on_failure=None, fixed_geometry: bool = False) -> None:
         super().__init__(
             None,
             Qt.WindowType.Tool
@@ -268,6 +269,10 @@ class EffectOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.failed = False
         self._on_failure = on_failure
+        self._fixed_geometry = fixed_geometry
+        self._fixed_geometry_ready = False
+        self._dirty_rect = QRect()
+        self._hide_after_paint = False
         self.player = effects.Player()
         self._style = None
         self._fx = None
@@ -280,11 +285,10 @@ class EffectOverlay(QWidget):
         self._offset = (0.0, 0.0)
         self._push = None
         self._ticked_at = 0.0
-        self._timer = QTimer(self)
-        self._timer.setInterval(FRAME_MS)
-        self._timer.timeout.connect(self._tick)
+        self._timer = frame_timer(self, self._tick, self)
 
-    def configure(self, style: str, colour: str, length: str = "normal", size: str = "medium") -> None:
+    def configure(self, style: str, colour: str, length: str = "normal", size: str = "medium",
+                  effect_pace: float | None = None, size_fraction: float | None = None) -> None:
         if style != self._style:
             self._style = style
             self.player = effects.Player()
@@ -299,8 +303,9 @@ class EffectOverlay(QWidget):
                 return
         # Read each time, like the colours; a Player already playing keeps the pace it started with.
         if not self.player.busy:
-            self.player.pace = effects.pace(length)
+            self.player.pace = effect_pace if effect_pace is not None else effects.pace(length)
             self.player.effect_size = size
+            self.player.effect_size_fraction = size_fraction
         try:
             self._palette = app_config.palette_colours(colour)
         except Exception:
@@ -375,6 +380,10 @@ class EffectOverlay(QWidget):
         self.player = effects.Player()
         self._push = None
         self._pens = []
+        self._hide_after_paint = False
+        if self._fixed_geometry and not self._dirty_rect.isNull():
+            self.update(self._dirty_rect)
+        self._dirty_rect = QRect()
         self.hide()
 
     def _start(self, now: float) -> bool:
@@ -389,7 +398,8 @@ class EffectOverlay(QWidget):
         self._displays = [(g.x() - self._desk.x(), g.y() - self._desk.y(), g.width(), g.height())
                           for g in (screen.geometry() for screen in QGuiApplication.screens())]
         self._ticked_at = now
-        self._timer.start()
+        self._fixed_geometry_ready = False
+        start_paced(self._timer)
         return True
 
     def _display(self, at):
@@ -415,6 +425,18 @@ class EffectOverlay(QWidget):
                 self.player.release()
                 self._push = None
 
+    def _clear_fixed(self) -> None:
+        """Nothing to draw this frame: repaint the last frame's area clear, and once the player is
+        done hide the window after that paint lands."""
+        dirty, self._dirty_rect = self._dirty_rect, QRect()
+        if not dirty.isNull():
+            self.update(dirty)
+        if not self.player.busy:
+            self._timer.stop()
+            self._hide_after_paint = not dirty.isNull()
+            if dirty.isNull():
+                self.hide()
+
     def _tick(self) -> None:
         now = time.monotonic()
         try:
@@ -427,6 +449,9 @@ class EffectOverlay(QWidget):
         box = union_bounds(pens, MARGIN)
         if box is None:
             self._pens = []
+            if self._fixed_geometry:
+                self._clear_fixed()
+                return
             if not self.player.busy:
                 self._timer.stop()
             self.hide()
@@ -437,11 +462,29 @@ class EffectOverlay(QWidget):
         y1 = min(self._desk.height(), math.ceil(box[3]))
         if x1 <= x0 or y1 <= y0:
             self._pens = []
+            if self._fixed_geometry:
+                self._clear_fixed()
+                return
             self.hide()
             return
         self._pens = pens
-        self._offset = (float(x0), float(y0))
         frame = QRect(self._desk.x() + x0, self._desk.y() + y0, x1 - x0, y1 - y0)
+        if self._fixed_geometry:
+            current = QRect(x0, y0, x1 - x0, y1 - y0)
+            dirty = current.united(self._dirty_rect)
+            self._dirty_rect = current
+            self._offset = (0.0, 0.0)
+            if not self._fixed_geometry_ready:
+                # Resizing an ARGB XWayland window exposes uninitialised black pixels.
+                self.setGeometry(self._desk)
+                self._fixed_geometry_ready = True
+            if self.isHidden():
+                self.show()
+            self._hide_after_paint = False
+            edge_glow.keep_on_top(self)
+            self.update(dirty)
+            return
+        self._offset = (float(x0), float(y0))
         if frame != self.geometry():
             self.setGeometry(frame)
         if self.isHidden():
@@ -449,19 +492,27 @@ class EffectOverlay(QWidget):
         edge_glow.keep_on_top(self)
         self.update()
 
-    def paintEvent(self, _event) -> None:
-        if not self._pens:
+    def paintEvent(self, event) -> None:
+        if not self._pens and not self._fixed_geometry:
             return
         painter = QPainter(self)
         try:
+            if self._fixed_geometry:
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+                painter.fillRect(event.rect(), QColor(0, 0, 0, 0))
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             painter.translate(-self._offset[0], -self._offset[1])
-            replay(painter, self._pens)
+            if self._pens:
+                replay(painter, self._pens)
         except Exception:
             painter.end()
             self._fail("replaying")
             return
         painter.end()
+        if self._hide_after_paint:
+            self._hide_after_paint = False
+            self.hide()
 
     def _fail(self, doing: str) -> None:
         if not self.failed:

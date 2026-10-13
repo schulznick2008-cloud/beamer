@@ -502,6 +502,19 @@ class HelloAndWelcome(unittest.TestCase):
         self.assertIsNone(read["hw"])
         self.assertNotIn("port", welcome["data"])
 
+    def test_ping_metadata_is_optional_bounded_and_one_way(self):
+        self.assertEqual(protocol.ping_msg(), {"type": "ping", "data": {}})
+        probe = protocol.ping_msg(probe=7)
+        echo = protocol.ping_msg(echo=7)
+        self.assertEqual(protocol.read_ping(probe), {"probe": 7})
+        self.assertEqual(protocol.read_ping(echo), {"echo": 7})
+        for data in (
+            {"probe": True}, {"probe": 0}, {"probe": 2**31},
+            {"echo": "7"}, {"probe": 7, "echo": 8},
+        ):
+            with self.subTest(data=data):
+                self.assertIsNone(protocol.read_ping({"type": "ping", "data": data}))
+
     def test_invalid_hellos(self):
         cases = {
             "version 5": _hello(version=5),
@@ -563,6 +576,13 @@ class Focus(unittest.TestCase):
         self.assertEqual((read["edge"], read["offset"], read["resistance_px"], read["reach"], read["stay"]),
                          ("left", 0.25, 90, [ID_C], False))
 
+    def test_take_can_name_a_display_edge_without_breaking_legacy_landing(self):
+        message = protocol.focus_v6(7, ID_B, edge="left", offset=0.25, display="panel-right", side="bottom")
+        read = protocol.read_focus(message, ID_B)
+        self.assertEqual((read["display"], read["side"], read["edge"], read["offset"]),
+                         ("panel-right", "bottom", "left", 0.25))
+        self.assertFalse(read["malformed"])
+
     def test_defaults_and_clamping(self):
         read = protocol.read_focus({"type": "focus", "data": {"route": 1, "target": protocol.id_text(ID_B),
                                                               "edge": "top", "offset": 1.5}}, ID_B)
@@ -608,6 +628,14 @@ class Focus(unittest.TestCase):
                 self.assertEqual(read["route"], 4)
                 self.assertTrue(read["malformed"])
 
+    def test_display_and_side_must_be_a_valid_pair(self):
+        target = protocol.id_text(ID_B)
+        for extra in ({"display": "panel-right"}, {"side": "bottom"},
+                      {"display": "", "side": "bottom"}, {"display": "panel-right", "side": "diagonal"}):
+            with self.subTest(extra=extra):
+                read = protocol.read_focus({"type": "focus", "data": dict({"route": 4, "target": target}, **extra)}, ID_B)
+                self.assertTrue(read["malformed"])
+
     def test_strictness_marks_a_take_malformed(self):
         initiator, responder, _, _ = _pair()
         plain = ('{"type":"focus","data":{"route":4,"target":"%s","offset":NaN,"edge":"left"}}' % protocol.id_text(ID_B)).encode()
@@ -649,9 +677,13 @@ class Answers(unittest.TestCase):
 
     def test_switch(self):
         read = protocol.read_switch(protocol.switch_v6(3, ID_A, edge="right", offset=0.5))
-        self.assertEqual(read, {"route": 3, "next": ID_A, "edge": "right", "offset": 0.5})
+        self.assertEqual(read, {"route": 3, "next": ID_A, "edge": "right", "offset": 0.5,
+                               "display": None, "side": None})
         read = protocol.read_switch(protocol.switch_v6(3, ID_A))
-        self.assertEqual(read, {"route": 3, "next": ID_A, "edge": None, "offset": None})
+        self.assertEqual(read, {"route": 3, "next": ID_A, "edge": None, "offset": None,
+                               "display": None, "side": None})
+        read = protocol.read_switch(protocol.switch_v6(3, ID_A, display="panel-left", side="right"))
+        self.assertEqual((read["display"], read["side"]), ("panel-left", "right"))
         for data in ({"route": 3, "next": protocol.id_text(ID_A), "edge": "right"},
                      {"route": 3, "next": protocol.id_text(ID_A), "offset": 0.5},
                      {"route": 3, "next": "x"}, {"route": 0, "next": protocol.id_text(ID_A)}):

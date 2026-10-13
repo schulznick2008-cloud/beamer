@@ -17,6 +17,68 @@ import widgets
 
 
 class WidthTests(unittest.TestCase):
+    def test_idle_design_lock_does_not_redraw_unchanged_choices(self):
+        import objc
+
+        for choice in (widgets.ChoiceTiles([("one", "One", "Detail", widgets.box())]),
+                       widgets.Swatches([("one", "One", ["#112233", "#445566"])])):
+            choice.value = "one"
+            with mock.patch.object(choice.ring, "show", wraps=choice.ring.show) as show:
+                for _ in range(500):
+                    with objc.autorelease_pool():
+                        choice.set_enabled(True)
+                self.assertEqual(show.call_count, 0)
+                choice.set_enabled(False)
+                self.assertEqual(show.call_count, 1)
+                choice.set_enabled(False)
+                self.assertEqual(show.call_count, 1)
+                choice.set_enabled(True)
+                self.assertEqual(show.call_count, 2)
+
+    def test_menu_choices_update_without_replacing_the_popup(self):
+        choice = widgets.MenuChoice([("", "None"), ("peer", "Peer")])
+        popup = choice.popup
+        item = choice.items[1][1]
+        choice.value = "peer"
+        choice.set_choices([("", "None"), ("peer", "Peer")])
+        self.assertEqual(choice.items[1][1], item)
+        choice.set_choices([("", "None"), ("peer", "Renamed"), ("other", "Other")])
+        self.assertIs(choice.popup, popup)
+        self.assertEqual(choice.value, "peer")
+        self.assertEqual(choice.popup.titleOfSelectedItem(), "Renamed")
+        choice.set_choices([("", "None")])
+        self.assertEqual(choice.value, "")
+
+    def test_replaced_menu_choices_release_their_native_targets(self):
+        import objc
+
+        host = widgets.stack()
+        owners = []
+        for _ in range(500):
+            with objc.autorelease_pool():
+                for view in host.arrangedSubviews():
+                    host.removeArrangedSubview_(view)
+                    view.removeFromSuperview()
+                choice = widgets.MenuChoice([("", "None"), ("peer", "Peer")])
+                owners.append(weakref.ref(choice))
+                widgets.add(host, choice.view, full_width=False)
+        gc.collect()
+        self.assertEqual(sum(owner() is not None for owner in owners), 1)
+
+    def test_menu_choice_action_still_reaches_its_live_owner(self):
+        calls = []
+        choice = widgets.MenuChoice([("", "None"), ("peer", "Peer")], calls.append)
+        choice.value = "peer"
+        choice.target.fire_(choice.popup)
+        self.assertEqual(calls, ["peer"])
+        target = choice.target
+        owner = weakref.ref(choice)
+        del choice
+        gc.collect()
+        self.assertIsNone(owner())
+        target.fire_(None)
+        self.assertEqual(calls, ["peer"])
+
     def test_figure_renders_its_unit_once(self):
         figure = widgets.Figure('120', theme.TYPE['numeral'], 'px')
         self.assertEqual(figure.view.attributedStringValue().string(), '120 px')

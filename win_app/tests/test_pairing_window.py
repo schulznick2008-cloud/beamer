@@ -12,11 +12,12 @@ from types import SimpleNamespace
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from core import pairing, peerlist, protocol
+from core import pairing, peerlist, protocol, ways
 from core.tests import responder_harness as harness
 
 try:
     from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
 
     import app_config
@@ -87,6 +88,39 @@ class MachinesWindowTest(unittest.TestCase):
         self.assertEqual(row.word.text(), "Waiting")
         self.assertIn("Studio Mac", row.detail.text())
 
+    def test_renaming_a_machine_saves_on_return_and_escape_cancels(self):
+        window = self.open(peer(ID_A, "Studio Mac", TOKEN_A, "192.0.2.10"))
+        row = next(iter(window.machines.rows.values()))
+        row.rename_button.click()
+        self.assertFalse(row.rename_edit.isHidden())
+        self.assertEqual(row.rename_note.text(), "Only on this computer" if sys.platform.startswith("linux") else "Only on this PC")
+        row.rename_edit.setText("  Work Mac  ")
+        QTest.keyClick(row.rename_edit, Qt.Key.Key_Return)
+        self.assertEqual(window.machines.rows[TOKEN_A].name.text(), "Work Mac")
+        self.assertEqual(self.settings()["peers"][0]["label"], "Work Mac")
+
+        row = window.machines.rows[TOKEN_A]
+        row.rename_button.click()
+        row.rename_edit.setText("Discard this")
+        QTest.keyClick(row.rename_edit, Qt.Key.Key_Escape)
+        self.assertEqual(self.settings()["peers"][0]["label"], "Work Mac")
+        self.assertTrue(row.rename_edit.isHidden())
+        self.assertFalse(row.name.isHidden())
+
+    def test_a_left_out_row_can_be_put_back_and_names_the_shortcut(self):
+        entry = peer(ID_A, "Studio Mac", TOKEN_A, "192.0.2.10")
+        entry.update(left_out=True, left_out_ways=["edge"])
+        window = self.open(entry)
+        row = next(iter(window.machines.rows.values()))
+
+        self.assertEqual(row.left_out.text(), "Put back")
+        self.assertEqual(row.left_out_note.text(), "Left out of the layout. The shortcut and the menu still reach it.")
+        row.left_out.click()
+
+        self.assertNotIn("left_out", self.settings()["peers"][0])
+        self.assertNotIn("left_out_ways", self.settings()["peers"][0])
+        self.assertEqual(row.left_out.text(), "Leave out")
+
     def test_the_direction_switches_start_under_a_closed_disclosure(self):
         window = self.open(peer(ID_A, "Studio Mac", TOKEN_A, "192.0.2.10"))
         row = next(iter(window.machines.rows.values()))
@@ -132,7 +166,7 @@ class MachinesWindowTest(unittest.TestCase):
         self.assertFalse(self.window.machines.empty.isHidden())
         self.assertEqual(self.window.machines.empty.text(), "No machines paired yet.")
         self.assertFalse(self.window._paired)
-        self.assertFalse(self.window.same_switch.isEnabled())
+        self.assertFalse(self.window.same_checks["everything"].isEnabled())
 
     def test_with_nothing_paired_appearance_and_speed_still_save(self):
         self.window = kvm_bridge_win.WindowsApplication(self.path)
@@ -183,12 +217,13 @@ class MachinesWindowTest(unittest.TestCase):
     def test_removing_a_machine_takes_its_entry_and_zones_and_keeps_the_rest(self):
         window = self.open(peer(ID_A, "Studio", TOKEN_A, "192.0.2.10"), peer(ID_B, "Laptop", TOKEN_B, "192.0.2.11"))
         settings = self.settings()
-        settings["zones"] = [{"peer": protocol.id_text(ID_A), "kind": "edge"}, {"peer": protocol.id_text(ID_B), "kind": "edge", "off": True}]
+        settings["peers"][1]["ways"]["edge"] = False
         app_config.write_settings(self.path, settings)
         window._remove_peer(TOKEN_A)
         after = self.settings()
         self.assertEqual([entry["name"] for entry in after["peers"]], ["Laptop"])
-        self.assertEqual([zone["peer"] for zone in after["zones"]], [protocol.id_text(ID_B)])
+        self.assertFalse(after["peers"][0]["ways"]["edge"])
+        self.assertEqual(after["zones"], [])
         self.assertEqual(list(window.machines.rows), [TOKEN_B])
         self.assertEqual(window._config.auth_token, TOKEN_B)
 
@@ -197,7 +232,7 @@ class MachinesWindowTest(unittest.TestCase):
         window._remove_peer(TOKEN_A)
         self.assertEqual(self.settings()["peers"], [])
         self.assertFalse(window._paired)
-        self.assertFalse(window.same_switch.isEnabled())
+        self.assertFalse(window.same_checks["everything"].isEnabled())
         self.assertFalse(window.machines.empty.isHidden())
         window._refresh_window()
 
@@ -234,7 +269,8 @@ class MachinesWindowTest(unittest.TestCase):
 
     def input_on(self, window, peer):
         homes = []
-        window.sender._owner = SimpleNamespace(on=peer, away=peer is not None)
+        window.sender._owner = SimpleNamespace(on=peer, away=peer is not None,
+                                              reach_for=lambda target: [])
         window.sender.set_redirecting = lambda value, came_home=True: homes.append(value)
         return homes
 
@@ -334,6 +370,24 @@ class MachinesWindowTest(unittest.TestCase):
         self.assertEqual([entry["token"] for entry in self.settings()["peers"]], [TOKEN_A, TOKEN_B])
         self.assertTrue(self.settings()["peers"][0]["linked"])
 
+    def test_re_pairing_same_identity_keeps_intent_cycle_and_jump(self):
+        window = self.open(peer(ID_A, "Studio", TOKEN_A, "192.0.2.10"))
+        settings = self.settings()
+        intent = {"edge": False, "thirds": ["start", "end"], "corner": True,
+                  "corner_at": "top_right", "notch": False}
+        settings["peers"][0].update(ways=intent, shortcut_cycle=False, jump_key="ctrl+shift+2")
+        app_config.write_settings(self.path, settings)
+        replaced = window.book.peers()[0]
+        fresh = peer(ID_A, "Studio", TOKEN_B, "192.0.2.12")
+
+        window._store_peer(fresh, replaced)
+
+        saved = self.settings()["peers"][0]
+        self.assertEqual(saved["token"], TOKEN_B)
+        self.assertEqual(saved["ways"], intent)
+        self.assertFalse(saved["shortcut_cycle"])
+        self.assertEqual(saved["jump_key"], "ctrl+shift+2")
+
     def test_a_pairing_does_not_replace_a_machine_that_was_removed_since_it_was_read(self):
         window = self.open(peer(ID_A, "Studio", TOKEN_A, "192.0.2.10"), peer(ID_B, "Laptop", TOKEN_B, "192.0.2.11"))
         replaced = window.book.peers()[0]
@@ -343,30 +397,47 @@ class MachinesWindowTest(unittest.TestCase):
             window._store_peer(fresh, replaced)
         self.assertEqual([entry["token"] for entry in self.settings()["peers"]], [TOKEN_B])
 
-    def test_pairing_the_mac_at_the_1_4_entrys_address_again_keeps_its_side_and_zones(self):
+    def test_pairing_the_mac_at_the_1_4_entrys_address_again_keeps_its_side_and_intent(self):
         # Every 1.4.x upgrader pairs again (no token migrates since 1.5.0), on purpose and at the
         # screen: where that Mac sits is not theirs to set a second time.
         migrated = {**peer(ID_A, "Studio Mac", TOKEN_A, "192.0.2.10"), "id": "", "from_1_4": True, "linked": False,
-                    "paired_at": 0, "side": "top", "side_set_at": 1_790_000_000}
+                    "paired_at": 0, "side": "top", "side_set_at": 1_790_000_000,
+                    "shortcut_cycle": False, "jump_key": "ctrl+shift+2"}
         window = self.open(migrated, zones=[{"peer": "", "kind": "edge"}, {"peer": "", "kind": "corner",
                                                                            "corner": "top_left", "edge": "top", "off": True}])
         fresh = peer(b"\x0c" * 16, "Studio Mac", protocol.id_text(bytes(range(2, 34))), "192.0.2.10")
         window._store_peer(fresh, window.book.peers()[0])
         after = self.settings()
         new_id = protocol.id_text(b"\x0c" * 16)
-        self.assertEqual([zone["peer"] for zone in after["zones"]], [new_id, new_id])
+        from display_map_fixture import display_fields
+        self.assertEqual(after["zones"], [{"peer": new_id, "kind": "edge", "side": "top",
+                                          **display_fields(window)}])
+        self.assertEqual(after["peers"][0]["ways"],
+                         {"edge": True, "thirds": list(ways.PARTS), "corner": False,
+                          "corner_at": "top_left", "notch": False})
         self.assertEqual((after["peers"][0]["side"], after["peers"][0]["side_set_at"]), ("top", 1_790_000_000))
+        self.assertFalse(after["peers"][0]["shortcut_cycle"])
+        self.assertEqual(after["peers"][0]["jump_key"], "ctrl+shift+2")
 
     def test_pairing_another_platform_at_that_address_keeps_nothing_of_it(self):
         migrated = {**peer(ID_A, "Studio Mac", TOKEN_A, "192.0.2.10"), "id": "", "from_1_4": True, "linked": False,
-                    "paired_at": 0, "side": "top", "side_set_at": 1_790_000_000}
+                    "paired_at": 0, "side": "top", "side_set_at": 1_790_000_000,
+                    "shortcut_cycle": False, "jump_key": "ctrl+shift+2"}
         window = self.open(migrated, zones=[{"peer": "", "kind": "edge"}])
         fresh = peer(b"\x0c" * 16, "Studio PC", protocol.id_text(bytes(range(2, 34))), "192.0.2.10", platform="windows")
         window._store_peer(fresh, window.book.peers()[0])
         after = self.settings()
-        # Only its own whole edge, which every machine paired starts with.
-        self.assertEqual(after["zones"], [{"peer": protocol.id_text(b"\x0c" * 16), "kind": "edge"}])
-        self.assertEqual(after["peers"][0]["side"], "")
+        new_id = protocol.id_text(b"\x0c" * 16)
+        side = ways._rect_contact(after["layout"][after["machine_id"]], after["layout"][new_id])[0]
+        from display_map_fixture import display_fields
+        self.assertEqual(after["zones"], [{"peer": new_id, "kind": "edge", "side": side,
+                                          **display_fields(window)}])
+        self.assertEqual(after["peers"][0]["side"], side)
+        self.assertNotEqual(side, "top")
+        self.assertTrue(after["peers"][0]["ways"]["edge"])
+        self.assertFalse(after["peers"][0]["ways"]["corner"])
+        self.assertTrue(after["peers"][0].get("shortcut_cycle", True))
+        self.assertFalse(after["peers"][0].get("jump_key"))
 
 
 @unittest.skipIf(kvm_bridge_win is None, "needs PySide6")
