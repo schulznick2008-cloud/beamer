@@ -883,7 +883,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                         x: (lp.0 as i32 & 0xffff) as i16 as i32,
                         y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
                     };
-                    let _ = ScreenToClient(hwnd, &mut pt);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::ScreenToClient(hwnd, &mut pt);
                     if client_y_is_title_bar(pt.y, dpi) {
                         return LRESULT(HTCAPTION as isize);
                     }
