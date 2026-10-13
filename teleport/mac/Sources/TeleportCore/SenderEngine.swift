@@ -48,7 +48,7 @@ public final class SenderEngine: TeleportBackend {
     public let sleepGuard = SleepGuard()
     /// Oberer Rand des virtuellen Monitors, den die Menueleiste belegt: das Fenster sitzt darunter (Punkte).
     public static let menuBarAllowance = 40
-    private lazy var injector = Injector(sink: eventSink, layout: { [unowned self] in self.keyLayout })
+    private lazy var injector = Injector(sink: eventSink, layout: { [unowned self] in self.keyLayout }, repeatTiming: SystemKeyRepeat.timing)
 
     /// Wie lange `send.start` auf die Quelle wartet, bevor es mit `busy` scheitert (Sekunden).
     public var startTimeout: TimeInterval = 12

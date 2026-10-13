@@ -111,6 +111,13 @@ Ohne Bedienungshilfen-Freigabe antworten `inject`, `send.activate`, `send.resize
   Die Tabellen kommen aus `mac_app/key_codes.py` und `mac_app/input_injector_mac.py`: `tools/teleport/gen_swift_keycodes.py`
   erzeugt `KeyTables.swift`, und ein Test vergleicht sie mit dem Python-Quelltext. Zeichentasten folgen der aktuellen
   Tastaturbelegung (aus Tastenereignissen gelesen, alle 10 s erneuert), Zeichen ohne Taste gehen als Text raus.
+- **Tastenwiederholung (Vertrag v1.4 §3):** Der Proxy meldet nur ein `down`; der Helfer wiederholt selbst, bis das `up`
+  kommt: nach `NSEvent.keyRepeatDelay`, dann alle `keyRepeatInterval` (Systemeinstellung), als `keyDown` mit
+  `kCGKeyboardEventAutorepeat = 1`. Nur die zuletzt gedrueckte Zeichentaste wiederholt, Modifier nie (aktuelle Flags
+  fliessen ein). Das Wiederholungs-`down` traegt das Zeichen als Unicode-Text (ohne den Text fuegt ein Cocoa-Textfeld
+  nichts ein; Rueckschritt und Pfeile brauchen ihn nicht). Ein weiteres `down` derselben Taste waehrend der Wiederholung
+  (aelterer Weg) wird verworfen. Ende bei `up`, `send.stop`, EOF, `shutdown` und Signalen (`releaseAll`); bei einem
+  Absturz stirbt der Zeitgeber mit dem Prozess. Test: `KeyRepeatTests` (Fake-Uhr), live `tools/teleport/live_repeat.py`.
 - **Aktivierung:** vor `down`, `key` und `text` (hoechstens alle 0,5 s geprueft) und bei `send.activate`: AXFrontmost an
   der App, `NSRunningApplication.activate()`, `AXRaise` auf genau dieses Fenster (gefunden ueber `_AXUIElementGetWindow`,
   Rueckfall ueber den Rahmen).

@@ -21,6 +21,13 @@ enum AccessibilityPermission {
     }
 }
 
+/// Wiederholverzoegerung und -rate des Systems (Systemeinstellungen > Tastatur), wie `NSEvent` sie liefert.
+public enum SystemKeyRepeat {
+    public static func timing() -> (delay: TimeInterval, interval: TimeInterval) {
+        (NSEvent.keyRepeatDelay, NSEvent.keyRepeatInterval)
+    }
+}
+
 /// Postet echte CGEvents in den HID-Strom.
 public final class CGEventSink: EventSink {
     public init() {}
@@ -66,6 +73,17 @@ public final class CGEventSink: EventSink {
     public func key(code: UInt16, down: Bool, flags: UInt64) {
         guard let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: down) else { return }
         e.flags = CGEventFlags(rawValue: flags)
+        post(e)
+    }
+
+    public func repeatKey(code: UInt16, flags: UInt64, chars: String?) {
+        guard let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: true) else { return }
+        e.flags = CGEventFlags(rawValue: flags)
+        if let c = chars {
+            var units = Array(c.utf16)
+            e.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
+        }
+        e.setIntegerValueField(.keyboardEventAutorepeat, value: 1)
         post(e)
     }
 
