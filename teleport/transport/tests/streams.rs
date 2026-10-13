@@ -242,7 +242,7 @@ fn lost_frame_drops_dependents_and_requests_keyframe_at_most_every_300ms() {
     assert!(got.is_empty());
 
     // Nach der Frist: Frame 2 verworfen, keyframe_req raus, Frame 3 (abhaengig) bleibt weg.
-    p.advance(40);
+    p.advance(70);
     let (out, got) = p.tick_rx();
     assert!(got.is_empty());
     assert_eq!(
@@ -511,7 +511,7 @@ fn drop_causes_incomplete_gap_and_late_packets_are_counted() {
     p.feed_rx(&f2[..1]);
     let f3 = p.send(&blob(2000), 0);
     p.feed_rx(&f3);
-    p.advance(40);
+    p.advance(70);
     p.tick_rx();
     assert_eq!(p.rx.c.dropped_incomplete, 1);
     assert_eq!(p.rx.c.gaps_incomplete, 1);
@@ -538,7 +538,7 @@ fn missing_whole_frame_counts_as_blocked_gap() {
     let _f2_lost_completely = p.send(&blob(3000), 0);
     let f3 = p.send(&blob(2000), 0);
     p.feed_rx(&f3);
-    p.advance(40);
+    p.advance(70);
     p.tick_rx();
     assert_eq!(p.rx.c.gaps_blocked, 1);
     assert_eq!(p.rx.c.dropped_incomplete, 0);
@@ -693,5 +693,229 @@ fn bitrate_drops_at_20_percent_loss() {
             at <= 3000,
             "Seed {seed}: mindestens 30 % Absenkung innerhalb von 3 s erwartet, erreicht nach {at} ms"
         );
+    }
+}
+
+// ---- Frame-Frist nach Vertrag v1.2, §4.1 (2 x RTT + 4 x Jitter, 60..250 ms, ab dem letzten Paket) ----
+
+/// Empfaenger mit vorgegebener RTT-/Jitter-Schaetzung (die Uhr steht still, nur `advance` bewegt sie).
+fn pair_with_link(rtt_ms: f64, jitter_ms: f64) -> Pair {
+    let mut p = pair(false);
+    p.rx.set_link_estimate(rtt_ms, jitter_ms);
+    p
+}
+
+/// Keyframe 1 kommt an, danach Frame 2 mit drei Paketen; vom letzten Paket an laeuft die Frist.
+/// Gibt die Pakete von Frame 2 zurueck (erste zwei sind schon beim Empfaenger).
+fn start_partial_frame(p: &mut Pair) -> Vec<Vec<u8>> {
+    let k = p.send(&blob(3000), 1);
+    let (_, got) = p.feed_rx(&k);
+    assert_eq!(got, vec![1]);
+    let f2 = p.send(&blob(3000), 0);
+    assert!(f2.len() >= 3, "Frame 2 braucht mindestens drei Pakete");
+    p.feed_rx(&f2[..2]);
+    f2
+}
+
+/// Zeit in ms (Schritte von 1 ms) ab dem letzten Paket, bis der Empfaenger den unvollstaendigen Frame verwirft
+/// und einen keyframe_req schickt. NACK-Antworten gibt es nie (echter Verlust).
+fn drop_time_ms(p: &mut Pair) -> (u64, bool) {
+    let mut kf_req = false;
+    for t in 1..=400u64 {
+        p.advance(1);
+        let (out, _) = p.tick_rx();
+        kf_req |= ptypes(&out).contains(&T_KEYFRAME_REQ);
+        if p.rx.c.dropped_incomplete > 0 {
+            return (t, kf_req);
+        }
+    }
+    panic!("Frame wurde nie verworfen");
+}
+
+#[test]
+fn deadline_formula_and_bounds() {
+    // (c) Grenzen: unter 60 ms wird auf 60 angehoben, ueber 250 ms auf 250 gekappt.
+    for (rtt, jit, want) in [
+        (0.0, 0.0, 60.0),
+        (5.0, 1.0, 60.0),  // 14 ms
+        (20.0, 8.0, 72.0), // 2*20 + 4*8
+        (10.0, 8.0, 60.0), // 52 ms -> 60
+        (30.0, 10.0, 100.0),
+        (100.0, 20.0, 250.0), // 280 ms -> 250
+        (500.0, 100.0, 250.0),
+    ] {
+        let p = pair_with_link(rtt, jit);
+        assert!(
+            (p.rx.deadline_ms() - want).abs() < 1e-6,
+            "RTT {rtt} ms, Jitter {jit} ms: Frist {} ms, erwartet {want}",
+            p.rx.deadline_ms()
+        );
+    }
+    // Ohne Messung (noch kein Pong): Untergrenze.
+    assert_eq!(pair(false).rx.deadline_ms(), 60.0);
+}
+
+#[test]
+fn outage_shorter_than_deadline_does_not_drop_the_frame() {
+    // (a) RTT 20 ms, Jitter 8 ms -> Frist 72 ms. Ein Aussetzer von 50 ms mitten im Frame:
+    let mut p = pair_with_link(20.0, 8.0);
+    let f2 = start_partial_frame(&mut p);
+    p.advance(50);
+    p.tick_rx();
+    assert_eq!(p.rx.c.dropped_incomplete, 0, "nach 50 ms noch kein Verwurf");
+    let (_, got) = p.feed_rx(&f2[2..]);
+    assert_eq!(got, vec![2], "der Frame wird vollstaendig ausgeliefert");
+    assert_eq!(p.rx.c.frames_dropped, 0);
+    assert_eq!(p.rx.c.late_packets, 0, "kein Paket kam zu spaet");
+
+    // Gegenprobe mit der alten Frist (2 x RTT = 40 ms, ohne Jitter): derselbe Aussetzer verwirft den Frame,
+    // der Rest kommt als spaetes Paket (`late_packets` > 0).
+    let mut q = pair_with_link(20.0, 0.0);
+    q.rx.min_deadline_ms = 30.0;
+    assert_eq!(q.rx.deadline_ms(), 40.0);
+    let f2 = start_partial_frame(&mut q);
+    q.advance(50);
+    q.tick_rx();
+    assert_eq!(q.rx.c.dropped_incomplete, 1);
+    q.feed_rx(&f2[2..]);
+    assert!(q.rx.c.late_packets > 0);
+}
+
+#[test]
+fn real_loss_without_nack_reply_drops_by_the_deadline_and_asks_for_a_keyframe() {
+    // (b) Das dritte Paket kommt nie (NACK bleibt unbeantwortet).
+    for (rtt, jit, nominal) in [(20.0, 8.0, 72.0), (0.0, 0.0, 60.0), (200.0, 50.0, 250.0)] {
+        let mut p = pair_with_link(rtt, jit);
+        let _ = start_partial_frame(&mut p);
+        // Die Jitter-Schaetzung bewegt sich beim Empfang der ersten Pakete etwas: Soll ist die Frist danach.
+        let want = p.rx.deadline_ms();
+        assert!(
+            (want - nominal).abs() <= 4.0,
+            "Frist {want} ms weicht von {nominal} ab"
+        );
+        let (t, kf_req) = drop_time_ms(&mut p);
+        assert!(
+            (t as f64) >= want.floor() && (t as f64) <= want.ceil() + 1.0,
+            "RTT {rtt}, Jitter {jit}: verworfen nach {t} ms, Frist {want} ms"
+        );
+        assert!(t <= 250 + 1, "hoechstens 250 ms");
+        assert!(kf_req, "keyframe_req nach dem Verwurf");
+        assert_eq!(p.rx.c.gaps_incomplete, 1);
+    }
+}
+
+// ---- WLAN-Nachbildung (aus 03a): 10 ms Verzoegerung je Richtung, 0..8 ms Jitter, etwa jede Sekunde ein Aussetzer
+// von 50 ms (alle Pakete beider Richtungen werden festgehalten und danach gesammelt freigegeben). ----
+
+struct WifiRun {
+    sent: u64,
+    dropped_incomplete: u64,
+    dropped_total: u64,
+    late: u64,
+}
+
+fn wifi_run(fec: bool, seed: u64, total_ms: u64, stall_ms: u64) -> WifiRun {
+    use beamer_transport::netem::Rng;
+    use beamer_transport::stream::TickInfo;
+    let mut p = pair(fec);
+    let t0 = p.now;
+    let mut rng = Rng::new(seed);
+    let info = TickInfo::default();
+    // (faellig, laufende Nummer, Datagramm)
+    let mut to_rx: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+    let mut to_tx: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+    let mut order = 0u64;
+    let mut frame = 0u64;
+    let mut force_key = false;
+    // Aussetzer vorab festlegen: im Mittel alle Sekunde (0,5..1,5-fach), je `stall_ms` lang.
+    let mut windows: Vec<(u64, u64)> = Vec::new();
+    let mut at = 500 + (rng.next_f64() * 1000.0) as u64;
+    while stall_ms > 0 && at < total_ms {
+        windows.push((at, at + stall_ms));
+        at += stall_ms + (500.0 + rng.next_f64() * 1000.0) as u64;
+    }
+    // Ein Paket, das im Aussetzer ankommen wuerde, wird bis zu dessen Ende festgehalten.
+    let stalled = |due: u64| {
+        windows
+            .iter()
+            .find(|(a, b)| due >= *a && due < *b)
+            .map_or(due, |(_, b)| *b)
+    };
+    for ms in 0..total_ms {
+        let now = t0 + Duration::from_millis(ms);
+        let mut io = Io::default();
+        if ms % 16 == 0 {
+            let key = frame.is_multiple_of(120) || force_key;
+            force_key = false;
+            let _ =
+                p.tx.send_frame(now, 1, &blob(5000), ms * 1000, key as u8, &mut io);
+            frame += 1;
+        }
+        p.tx.tick(now, &info, &mut io);
+        let due_tx: Vec<_> = {
+            let n = to_tx.iter().filter(|(d, _, _)| *d <= ms).count();
+            to_tx.sort_by_key(|(d, o, _)| (*d, *o));
+            to_tx.drain(..n).collect()
+        };
+        for (_, _, d) in due_tx {
+            let h = decode_header(&d).unwrap();
+            p.tx.receive(now, &d, &h, &mut io);
+        }
+        for e in &io.events {
+            if let Event::Control { ptype, .. } = e {
+                if *ptype == T_KEYFRAME_REQ {
+                    force_key = true;
+                }
+            }
+        }
+        for d in io.out.drain(..) {
+            order += 1;
+            let due = ms + 10 + (rng.next_f64() * 8.0) as u64;
+            to_rx.push((stalled(due), order, d));
+        }
+        let n = to_rx.iter().filter(|(d, _, _)| *d <= ms).count();
+        to_rx.sort_by_key(|(d, o, _)| (*d, *o));
+        let mut rio = Io::default();
+        for (_, _, d) in to_rx.drain(..n) {
+            let h = decode_header(&d).unwrap();
+            p.rx.receive(now, &d, &h, &mut rio);
+        }
+        p.rx.tick(now, &info, &mut rio);
+        for d in rio.out.drain(..) {
+            order += 1;
+            let due = ms + 10;
+            to_tx.push((stalled(due), order, d));
+        }
+    }
+    WifiRun {
+        sent: p.tx.c.frames_sent,
+        dropped_incomplete: p.rx.c.dropped_incomplete,
+        dropped_total: p.rx.c.frames_dropped,
+        late: p.rx.c.late_packets,
+    }
+}
+
+#[test]
+fn wifi_replica_drops_few_frames() {
+    let mut results = Vec::new();
+    for fec in [true, false] {
+        let (mut sent, mut inc, mut tot, mut late) = (0, 0, 0, 0);
+        for seed in 1..=6 {
+            let r = wifi_run(fec, seed, 60_000, 50);
+            sent += r.sent;
+            inc += r.dropped_incomplete;
+            tot += r.dropped_total;
+            late += r.late;
+        }
+        let pct = |n: u64| 100.0 * n as f64 / sent as f64;
+        eprintln!(
+            "WLAN-Nachbildung FEC {fec}: {sent} Frames, unvollstaendig verworfen {inc} ({:.3} %), alle verworfenen {tot} ({:.3} %), zu spaete Pakete {late}",
+            pct(inc),
+            pct(tot)
+        );
+        results.push((fec, pct(tot)));
+    }
+    for (fec, pct) in results {
+        assert!(pct < 0.5, "FEC {fec}: {pct:.3} % verworfen");
     }
 }

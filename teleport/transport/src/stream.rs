@@ -23,6 +23,13 @@ const NACK_PER_PACKET: usize = (MAX_PLAINTEXT - 2) / 8;
 /// Ab dieser Wartezeit zaehlt ein noch fehlendes Paket vorlaeufig als verloren (Rohverlust/Restverlust).
 const PROVISIONAL_LOSS: Duration = Duration::from_millis(50);
 const ASM_MAX_AGE: Duration = Duration::from_millis(250);
+/// Frist fuer unvollstaendige Frames nach Vertrag v1.2, SCHNITTSTELLEN.md §4.1: verworfen wird nach
+/// `2 x RTT + 4 x Jitter`, gerechnet ab dem letzten Paket des Frames, mindestens 60 ms, hoechstens 250 ms.
+/// Jitter ist derselbe Wert, der als `jitter_us` im `feedback` an die Gegenstelle geht.
+const DEADLINE_RTT_FACTOR: f64 = 2.0;
+const DEADLINE_JITTER_FACTOR: f64 = 4.0;
+pub const DEADLINE_MIN_MS: f64 = 60.0;
+pub const DEADLINE_MAX_MS: f64 = 250.0;
 /// Pacing des Senders: Token-Bucket mit 1,5 x Zielbitrate, Burst hoechstens 64 KB.
 const PACE_BURST: f64 = 64.0 * 1024.0;
 const PACE_FACTOR: f64 = 1.5;
@@ -96,7 +103,7 @@ pub struct Counters {
     pub frames_delivered: u64,
     pub frames_dropped: u64,
     /// Aufschluesselung von `frames_dropped` (Summe = frames_dropped):
-    /// Video-Frame nach der Frist (2 x RTT bzw. 250 ms Hoechstalter) noch unvollstaendig.
+    /// Video-Frame nach der Frist (2 x RTT + 4 x Jitter, 60..250 ms, bzw. 250 ms Hoechstalter) noch unvollstaendig.
     pub dropped_incomplete: u64,
     /// Zu viele offene bzw. fertige, aber blockierte Frames (MAX_OPEN_FRAMES).
     pub dropped_overflow: u64,
@@ -292,7 +299,7 @@ impl Stream {
             replay: ReplayWindow::new(),
             max_kbps,
             fec_enabled: true,
-            min_deadline_ms: 30.0,
+            min_deadline_ms: DEADLINE_MIN_MS,
             t0: now,
             c: Counters::default(),
             win: Window::default(),
@@ -421,8 +428,22 @@ impl Stream {
     }
 
     fn deadline(&self) -> Duration {
+        Duration::from_secs_f64(self.deadline_ms() / 1000.0)
+    }
+
+    /// Aktuelle Frist fuer unvollstaendige Frames in ms (§4.1): `2 x RTT + 4 x Jitter`, begrenzt auf 60..250 ms.
+    pub fn deadline_ms(&self) -> f64 {
         let rtt = self.srtt_ms.unwrap_or(0.0);
-        Duration::from_secs_f64((2.0 * rtt).clamp(self.min_deadline_ms.min(250.0), 250.0) / 1000.0)
+        let jitter = self.jitter_us / 1000.0;
+        let ms = DEADLINE_RTT_FACTOR * rtt + DEADLINE_JITTER_FACTOR * jitter;
+        ms.clamp(self.min_deadline_ms.min(DEADLINE_MAX_MS), DEADLINE_MAX_MS)
+    }
+
+    /// Nur fuer Tests: RTT- und Jitter-Schaetzung von Hand setzen.
+    #[doc(hidden)]
+    pub fn set_link_estimate(&mut self, rtt_ms: f64, jitter_ms: f64) {
+        self.srtt_ms = Some(rtt_ms);
+        self.jitter_us = jitter_ms * 1000.0;
     }
 
     fn now_us(&self, now: Instant) -> u64 {
@@ -1144,7 +1165,7 @@ impl Stream {
 
     fn tick_receiver(&mut self, now: Instant, io: &mut Io) {
         let deadline = self.deadline();
-        // Unvollstaendige Frames nach 2 x RTT (mindestens 30 ms) verwerfen.
+        // Unvollstaendige Frames nach 2 x RTT + 4 x Jitter (60..250 ms, §4.1) verwerfen.
         let expired: Vec<u32> = self
             .video
             .iter()

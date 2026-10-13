@@ -12,7 +12,7 @@ Spezifikation: `docs/teleport/SCHNITTSTELLEN.md` §4 (Strom) und §5 (C-ABI). Cr
   `bt_set_max_kbps` für Pfadwechsel.
 - Ein UDP-Socket (IPv4) und ein Transport-Thread je Session, beliebig viele Streams. Callbacks laufen im Transport-Thread,
   nie unter einem Lock, damit sie `bt_send_frame` aufrufen dürfen.
-- Video wird in Reihenfolge ausgeliefert. Geht ein Frame verloren (Frist 2 × RTT, mindestens 30 ms, höchstens 250 ms, ab dem letzten Paket
+- Video wird in Reihenfolge ausgeliefert. Geht ein Frame verloren (Frist 2 × RTT + 4 × Jitter, mindestens 60 ms, höchstens 250 ms, ab dem letzten Paket
   des Frames), gibt es `keyframe_req`, und bis zum nächsten Keyframe werden keine abhängigen Frames geliefert.
 
 ## Benutzen

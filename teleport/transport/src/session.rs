@@ -453,13 +453,18 @@ impl Session {
             .ok_or_else(|| format!("stream {stream_id} unbekannt"))
     }
 
-    /// Untergrenze der Frist fuer unvollstaendige Frames (Standard 30 ms nach dem Vertrag, hoechstens
+    /// Untergrenze der Frist fuer unvollstaendige Frames (Standard 60 ms nach dem Vertrag v1.2, hoechstens
     /// 250 ms). Nur fuer Tests auf langsamen Rechnern gedacht.
     pub fn set_min_deadline_ms(&self, stream_id: u32, ms: f64) -> Result<(), String> {
         lock(&self.inner.state)
             .streams
             .get_mut(&stream_id)
-            .map(|s| s.min_deadline_ms = ms.clamp(30.0, 250.0))
+            .map(|s| {
+                s.min_deadline_ms = ms.clamp(
+                    crate::stream::DEADLINE_MIN_MS,
+                    crate::stream::DEADLINE_MAX_MS,
+                )
+            })
             .ok_or_else(|| format!("stream {stream_id} unbekannt"))
     }
 
