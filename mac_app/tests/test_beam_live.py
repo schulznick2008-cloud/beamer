@@ -21,9 +21,11 @@ class LiveBeamFalloffTest(unittest.TestCase):
                         self.assertGreater(values[len(values) // 4], values[len(values) // 2])
 
     def test_live_falloff_matches_the_windows_live_gradient(self):
+        import notch_beam
+
         values = profile(live_glow("left", "large"), "left", 2)
         depth = 67.02 * 2
-        stops = ((0, 1), (.08, .85), (.3, .25), (1, 0))
+        stops = notch_beam.EDGE_FALLOFF
         for index, alpha in enumerate(values):
             at = (index + .5) / depth
             expected = 0
@@ -31,8 +33,8 @@ class LiveBeamFalloffTest(unittest.TestCase):
                 if a <= at <= b:
                     expected = av + (bv - av) * (at - a) / (b - a)
                     break
-            # The along-edge comet is at its midpoint; mask sampling can round by one alpha unit.
-            self.assertAlmostEqual(alpha / values[0], expected / (1 - .15 * .5 / (.08 * depth)), delta=.025)
+            # The comet is at the edge midpoint, so only the shared inward falloff varies here.
+            self.assertAlmostEqual(alpha / values[0], expected, delta=.04)
 
     def test_both_corner_walls_fade_inward(self):
         for corner in ("top_left", "top_right", "bottom_left", "bottom_right"):

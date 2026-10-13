@@ -9,7 +9,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import app_config
-from core import protocol
+from core import protocol, ways
+from core.tests import responder_harness as h
 from dataclasses import replace
 
 from app_config import ConfigError, config_from_dict, config_to_dict, default_config
@@ -28,6 +29,41 @@ class EdgeGlowConfigTests(unittest.TestCase):
     def test_rejects_a_non_boolean(self):
         with self.assertRaises(ConfigError):
             config_from_dict({**BASE, "edge_glow": "yes"})
+
+
+class OverlappingZonesTests(unittest.TestCase):
+    def _legacy_contacts(self):
+        own, a, b = (protocol.id_text(peer) for peer in (h.HERE, h.B, h.C))
+        settings = app_config.migrate(None, machine_id=own)
+        settings["peers"] = [h.entry(h.B, "Studio", side="right"), h.entry(h.C, "Laptop", side="right")]
+        settings["zones"] = [{"peer": a, "kind": "edge"}, {"peer": b, "kind": "edge"}]
+        settings["layout"] = {own: dict(x=0, y=0, w=100, h=100),
+                              a: dict(x=100, y=0, w=100, h=50),
+                              b: dict(x=100, y=50, w=100, h=50)}
+        return settings
+
+    def test_overlapping_legacy_choices_load_as_intent_and_contact_zones(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            app_config.write_settings(path, self._legacy_contacts())
+            saved = app_config.load_settings(path)
+        self.assertTrue(all(peer["ways"]["edge"] for peer in saved["peers"]))
+        self.assertIsNone(ways._clashing(saved))
+        self.assertEqual({zone["peer"] for zone in saved["zones"]},
+                         {protocol.id_text(h.B), protocol.id_text(h.C)})
+
+    def test_inactive_peer_zones_do_not_refuse_the_settings_file(self):
+        for inactive in ({"in_use": False}, {"left_out": True}):
+            with self.subTest(inactive=inactive):
+                settings = self._legacy_contacts()
+                settings["peers"][0].update(inactive)
+                with tempfile.TemporaryDirectory() as folder:
+                    path = Path(folder) / "settings.json"
+                    app_config.write_settings(path, settings)
+                    saved = app_config.load_settings(path)
+                self.assertTrue(saved["peers"][0]["ways"]["edge"])
+                self.assertFalse(any(zone["peer"] == protocol.id_text(h.B) for zone in saved["zones"]))
+                self.assertIsNone(ways._clashing(saved))
 
     def test_showing_where_the_pointer_lands_is_on_for_an_old_config_and_round_trips_off(self):
         self.assertTrue(config_from_dict(dict(BASE)).shortcut_arrival)

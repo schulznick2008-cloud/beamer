@@ -2,19 +2,23 @@
 
 import colorsys
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF
-    from PySide6.QtGui import QColor, QEnterEvent, QPalette
+    from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRectF
+    from PySide6.QtGui import QColor, QEnterEvent, QImage, QPainter, QPalette
     from PySide6.QtWidgets import QApplication, QWidget
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import kvm_bridge_win
     import theme
-    from test_settings_layout_acceptance import SyntheticWindow, write_synthetic_settings
+    import tokens
+    from test_settings_layout_acceptance import SyntheticWindow, responder_harness, write_synthetic_settings
 except ImportError:
     kvm_bridge_win = None
 
@@ -53,11 +57,10 @@ class DesignTilesTest(unittest.TestCase):
         self.app = QApplication.instance() or QApplication([])
         theme.init_fonts()
         self.app.setFont(theme.font(theme.TYPE["body"]))
-        scratch = Path(__file__).resolve().parents[2] / "renders" / "test-working"
-        scratch.mkdir(parents=True, exist_ok=True)
-        self.folder = tempfile.TemporaryDirectory(dir=scratch)
+        self.folder = tempfile.TemporaryDirectory()
         folder = Path(self.folder.name)
-        self.window = SyntheticWindow(write_synthetic_settings(folder))
+        with mock.patch.object(responder_harness, "free_port", return_value=24820):
+            self.window = SyntheticWindow(write_synthetic_settings(folder))
         self.window.full_screen_timer.stop()
         self.window.refresh_timer.stop()
         self.window._select_page("design")
@@ -99,7 +102,7 @@ class DesignTilesTest(unittest.TestCase):
                         tile.mapTo(self.choice.view, QPoint()).y(), tile.width(), tile.height())
                 for group in self.choice.groups.values() for value, tile in group._tiles.items()}
 
-    def test_hover_is_neutral_and_selected_has_accent_and_an_extra_cue(self):
+    def test_hover_is_neutral_and_selected_has_a_circle_badge_before_its_name(self):
         self.window.resize(1200, 900)
         self.choice.set_value("beam")
         self.settle()
@@ -112,14 +115,11 @@ class DesignTilesTest(unittest.TestCase):
                          "hover's border contains the selection accent")
         self.assertGreater(accent_pixels(selected, border_points(selected)), 20)
         scale = selected.devicePixelRatio()
-        badge = [(x, y) for x in range(selected.width() - round(26 * scale),
-                                      selected.width() - round(4 * scale))
-                 for y in range(round(4 * scale), round(26 * scale))]
-        badge_extra = accent_pixels(selected, badge) - accent_pixels(unselected, badge)
-        middle = selected.width() // 2
-        thicker_ring = accent_pixels(selected, [(middle, y) for y in range(round(4 * scale))])
-        self.assertTrue(badge_extra >= 20 * scale * scale or thicker_ring >= round(3 * scale),
-                        f"selection has no extra cue: badge delta {badge_extra}, ring pixels {thicker_ring}")
+        name = self.choice.tile("glow").name_label.geometry()
+        check = [(x, y) for x in range(round(name.x() * scale), round((name.x() + 16) * scale))
+                 for y in range(round(name.y() * scale), round(name.bottom() * scale))]
+        badge_extra = accent_pixels(selected, check) - accent_pixels(unselected, check)
+        self.assertGreaterEqual(badge_extra, 100 * scale * scale, "selection has no filled badge before its name")
 
     def test_hover_background_brightens_in_both_appearances(self):
         previous = theme.is_dark()

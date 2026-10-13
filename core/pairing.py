@@ -336,6 +336,10 @@ def peer_entry(identity: bytes, name: str, platform: str, port: int, token: str,
     }
 
 
+def _dormant_repairable(entry: dict) -> bool:
+    return entry.get("dormant") is True
+
+
 def _find_known(peers: list, own: bytes, theirs: bytes, name: str, platform: str, now: float) -> tuple:
     """(refused, replaced) for a pairing that proved `theirs`, `name` and `platform`. `refused` is
     True when the id is this machine's own and otherwise the entry already holding it, None when
@@ -348,6 +352,8 @@ def _find_known(peers: list, own: bytes, theirs: bytes, name: str, platform: str
     for known in peers:
         if known.get("id") != wanted:
             continue
+        if _dormant_repairable(known):
+            return None, known
         if known.get("from_1_4") is True:
             return None, known
         paired_at = known.get("paired_at")
@@ -544,8 +550,8 @@ class PairingHost:
         return self.version == PAIRING_V3
 
     def begin(self) -> str:
-        if self.v3 and len(self._peers()) >= MAX_PEERS:
-            # A host with 32 peers shows no code: the pairing could not be kept.
+        peers = self._peers()
+        if self.v3 and len(peers) >= MAX_PEERS and not any(_dormant_repairable(peer) for peer in peers):
             raise PairingError(ERROR_FULL)
         self.code = new_code()
         self.pair_id = self._entropy(16).hex()
@@ -616,7 +622,8 @@ class PairingHost:
         version = message.get("v")
         if not _is_int(version) or version != self.version:
             return self._end(MSG_PAIR_ANSWER, sent, pair_id, ERROR_VERSION, "version")
-        if self.v3 and len(self._peers()) >= MAX_PEERS:
+        peers = self._peers()
+        if self.v3 and len(peers) >= MAX_PEERS and not any(_dormant_repairable(peer) for peer in peers):
             return self._end(MSG_PAIR_ANSWER, sent, pair_id, ERROR_FULL, "full")
         try:
             nonce = _unb64(message.get("nonce"))
@@ -766,8 +773,8 @@ class PairingClient:
     yields the token once the host says it has stored it.
 
     Version 3 also takes this machine's platform and link port, `peers` (a callable giving the
-    peer entries), `wall` for `paired_at`, and `qr_secret` when the code was read from a QR. It
-    raises PairingError(ERROR_FULL) at once when this machine already has MAX_PEERS peers."""
+    peer entries), `wall` for `paired_at`, and `qr_secret` when the code was read from a QR. Capacity
+    is checked once the host identity is known, so a repair can replace a saved entry."""
 
     def __init__(self, pair_id: str, code: str, name: str, identity: bytes = b"", entropy=secrets.token_bytes,
                  *, version: int = PAIRING_VERSION, platform: str = "", port: int = 0, qr_secret: bytes = None, peers=None, wall=time.time):
@@ -778,7 +785,8 @@ class PairingClient:
             _check_own(identity, platform, port)
             if qr_secret is not None and len(qr_secret) != QR_SECRET_BYTES:
                 raise ValueError("a QR secret is 16 bytes")
-            if len(self._peers()) >= MAX_PEERS:
+            peers = self._peers()
+            if len(peers) >= MAX_PEERS and not any(_dormant_repairable(peer) for peer in peers):
                 raise PairingError(ERROR_FULL)
         self.pair_id = pair_id
         self.name = name[:MAX_NAME_CHARS]
@@ -869,10 +877,13 @@ class PairingClient:
         return {"type": MSG_PAIR_CONFIRM, "pair": self.pair_id, "tag": _b64(requester_tag)}
 
     def _check_host(self, identity: bytes, name: str, platform: str) -> None:
-        known, self.replaces = _find_known(self._peers(), self.identity, identity, name, platform, self.wall())
+        peers = self._peers()
+        known, self.replaces = _find_known(peers, self.identity, identity, name, platform, self.wall())
         if known is not None:
             self._known = True
             raise AlreadyPaired(None if known is True else known)
+        if self.replaces is None and len(peers) >= MAX_PEERS:
+            raise PairingError(ERROR_FULL)
 
     def abort(self) -> dict:
         """What to send a host whose answer failed: a confirmation that cannot pass, so the host
@@ -1822,7 +1833,7 @@ class PairingService(Discovery):
     # The host's side.
 
     def begin_pairing(self) -> str:
-        """Shows a new code, raising PairingError(ERROR_FULL) when this machine has 32 peers."""
+        """Shows a new code; capacity is checked when the requester identity is known."""
         with self._host_lock:
             self.host.port = self.port_getter()
             code = self.host.begin()
@@ -2179,7 +2190,8 @@ class PairingService(Discovery):
 
     def _pair_tcp(self, address: str, port: int, code: str, secret) -> dict:
         with self._attempt(code):
-            if len(self._peer_entries()) >= MAX_PEERS:
+            peers = self._peer_entries()
+            if len(peers) >= MAX_PEERS and not any(_dormant_repairable(peer) for peer in peers):
                 raise PairingError(ERROR_FULL)
             try:
                 sock = socket.create_connection((address, port), timeout=TCP_CONNECT_SECONDS)
@@ -2221,7 +2233,8 @@ class PairingService(Discovery):
             raise AlreadyPaired(None)
         for known in self._peer_entries():
             if known.get("id") == identity:
-                raise AlreadyPaired(known)
+                if not _dormant_repairable(known):
+                    raise AlreadyPaired(known)
 
     def _keep(self, client: PairingClient, address: str) -> dict:
         """The requester writes its entry once Td has checked out. The checks are made again,

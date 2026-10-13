@@ -27,6 +27,7 @@ PALETTE = {
     "signal": "#5fd4f4",
     "signal_dim": "#1f4a55",
     "amber": "#f2b544",
+    "resistance_flash": "#b77a00",
     "fault": "#ff7a66",
     "off": "#4a4b44",
 }
@@ -53,6 +54,7 @@ PALETTE_LIGHT = {
     "signal": "#006a88",
     "signal_dim": "#bfe0ea",
     "amber": "#8f5c00",
+    "resistance_flash": "#b55f00",
     "fault": "#b53522",
     "off": "#aeada3",
 }

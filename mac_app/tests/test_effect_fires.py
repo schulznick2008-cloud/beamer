@@ -210,7 +210,7 @@ class HomeArrivalTest(unittest.TestCase):
 
 
 class GestureOverlayOnReturnTest(unittest.TestCase):
-    """Toby 06-10: after the shortcut a grey box sat round the pointer and went only after the
+    """A report, 06-10: after the shortcut a grey box sat round the pointer and went only after the
     landing animation. The gesture panel takes clicks, so it has to go as input comes home."""
 
     def test_input_coming_home_takes_the_gesture_panel_down_at_once(self):

@@ -71,6 +71,9 @@ DOUBLE_CLICK_SLOP_PX = 5
 # notch a line, so this is 1; it is named rather than inlined because it is
 # the knob to turn if a mouse wheel feels wrong on the Mac.
 LINES_PER_NOTCH = 1.0
+# A PC scrolls three lines a notch by default, so its notch posted as one line here moved a page a
+# third as far as on the PC.
+PC_LINES_PER_NOTCH = 3.0
 
 # Media keys are not key events on a Mac: they arrive as NSSystemDefined events of subtype 8, the
 # reverse of media_keys.decode. The NX key codes are IOKit's ev_keymap.h. There is no stop key on
@@ -84,6 +87,8 @@ MEDIA_NX_KEYS = {
     "media_play_pause": 16,
     "media_next": 17,
     "media_prev": 18,
+    "brightness_up": 2,
+    "brightness_down": 3,
 }
 _MEDIA_STATE_DOWN = 0x0A
 _MEDIA_STATE_UP = 0x0B
@@ -241,7 +246,7 @@ def plan_key_event(name: str, down: bool, mods_down: Set[str], held: Optional[Di
 def handles_key(name: str) -> bool:
     """Whether `name` is a key this module posts by some route other than a key code."""
     lowered = name.lower()
-    return lowered in MEDIA_NX_KEYS or lowered in BROWSER_KEY_CHORDS
+    return lowered in MEDIA_NX_KEYS or lowered in BROWSER_KEY_CHORDS or lowered in ("search", "spotlight", "dictation")
 
 
 def _inject_media_key(nx_key: int, down: bool) -> None:
@@ -279,6 +284,22 @@ def _inject_browser_key(character: str) -> None:
         _post(event)
 
 
+def _inject_shortcut(modifier: str, key: str) -> None:
+    quartz = _require()
+    modifier_code = KEY_NAME_TO_CODE[modifier]
+    key_code = KEY_NAME_TO_CODE[key]
+    held = current_flags(_mods_down)
+    held_with_modifier = held | quartz.kCGEventFlagMaskCommand
+    steps = ((modifier_code, True, held_with_modifier), (key_code, True, held_with_modifier),
+             (key_code, False, held_with_modifier), (modifier_code, False, held))
+    for code, down, flags in steps:
+        event = quartz.CGEventCreateKeyboardEvent(None, code, down)
+        if event is None:
+            raise RuntimeError(f"CGEventCreateKeyboardEvent failed for {key!r}")
+        quartz.CGEventSetFlags(event, flags)
+        _post(event)
+
+
 @_locked
 def inject_key(name: str, down: bool, us: Optional[str] = None) -> None:
     quartz = _require()
@@ -291,6 +312,12 @@ def inject_key(name: str, down: bool, us: Optional[str] = None) -> None:
         if down:
             _inject_browser_key(BROWSER_KEY_CHORDS[lowered])
         return
+    if lowered in ("search", "spotlight"):
+        if down:
+            _inject_shortcut("cmd", "space")
+        return
+    if lowered == "dictation":
+        name = lowered = "f5"
     plan = plan_key_event(name, down, _mods_down, _held_codes, us)
     if plan is None:
         return
@@ -467,7 +494,9 @@ def inject_mouse_button(button: str, down: bool) -> None:
     _post(event)
 
 
-def plan_scroll_units(dy, dx, mode: str, remainders: Dict[str, List[float]]) -> Tuple[int, int, int]:
+def plan_scroll_units(
+    dy, dx, mode: str, remainders: Dict[str, List[float]], lines_per_notch=LINES_PER_NOTCH
+) -> Tuple[int, int, int]:
     """Pure planning: (unit, whole vertical steps, whole horizontal steps) for one scroll, the
     fraction not yet whole kept in `remainders` for the next. The same arithmetic the PC's
     plan_scroll_units does, truncating toward zero so a remainder never reverses direction."""
@@ -475,7 +504,7 @@ def plan_scroll_units(dy, dx, mode: str, remainders: Dict[str, List[float]]) -> 
     if mode == "pixel":
         unit, key, scale = quartz.kCGScrollEventUnitPixel, "pixel", 1.0
     else:
-        unit, key, scale = quartz.kCGScrollEventUnitLine, "line", LINES_PER_NOTCH
+        unit, key, scale = quartz.kCGScrollEventUnitLine, "line", lines_per_notch
     accum = remainders[key]
     accum[0] += float(dy) * scale
     accum[1] += float(dx) * scale
@@ -485,10 +514,9 @@ def plan_scroll_units(dy, dx, mode: str, remainders: Dict[str, List[float]]) -> 
     return unit, whole_y, whole_x
 
 
-@_locked
-def inject_scroll(dy, dx=0.0, mode: str = "line") -> None:
+def _inject_scroll(dy, dx, mode, lines_per_notch) -> None:
     quartz = _require()
-    unit, wheel_y, wheel_x = plan_scroll_units(dy, dx, mode, _scroll_remainders)
+    unit, wheel_y, wheel_x = plan_scroll_units(dy, dx, mode, _scroll_remainders, lines_per_notch)
     if not wheel_y and not wheel_x:
         return
     event = quartz.CGEventCreateScrollWheelEvent(None, unit, 2, wheel_y, wheel_x)
@@ -496,6 +524,17 @@ def inject_scroll(dy, dx=0.0, mode: str = "line") -> None:
         raise RuntimeError("CGEventCreateScrollWheelEvent failed")
     quartz.CGEventSetFlags(event, current_flags(_mods_down))
     _post(event)
+
+
+@_locked
+def inject_scroll(dy, dx=0.0, mode: str = "line") -> None:
+    _inject_scroll(dy, dx, mode, LINES_PER_NOTCH)
+
+
+@_locked
+def inject_scroll_from_peer(dy, dx=0.0, mode: str = "line", peer_platform="") -> None:
+    lines_per_notch = PC_LINES_PER_NOTCH if peer_platform in ("windows", "linux") else LINES_PER_NOTCH
+    _inject_scroll(dy, dx, mode, lines_per_notch)
 
 
 def reset_scroll_remainders() -> None:

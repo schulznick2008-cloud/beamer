@@ -60,7 +60,7 @@ class WindowsPageWidthTest(unittest.TestCase):
         self.app = QApplication.instance() or QApplication([])
         theme.init_fonts()
         self.app.setFont(theme.font(theme.TYPE["body"]))
-        scratch = Path(__file__).resolve().parents[2] / "renders" / "test-working"
+        scratch = Path(__file__).resolve().parents[1] / "renders" / "test-working"
         scratch.mkdir(parents=True, exist_ok=True)
         directory = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(directory.cleanup)
@@ -109,30 +109,24 @@ class WindowsPageWidthTest(unittest.TestCase):
                         self.assertAlmostEqual(section.width(), column.width(), delta=1)
                     self.assertLessEqual(page.width(), scroll.viewport().width() + 1)
 
-    def test_the_crossing_diagram_sits_beside_its_ways_once_the_column_holds_both(self):
-        # Both blocks at their minimums, with the gap, must fit before they sit beside each other.
+    def test_the_atlas_canvas_fills_the_crossing_column_at_wide_sizes(self):
         for (width, height) in ((1366, 900), (1920, 1000), (2560, 1440), (1440, 3440)):
             with self.subTest(window=(width, height)):
                 self.window.resize(width, height)
                 self.window.show()
                 self.column_width("crossing")
-                pair = self.window.ways_pair
-                self.assertGreaterEqual(pair.width(), pair.needed())
-                self.assertTrue(pair.beside())
-                self.assertEqual(pair.first.y(), pair.second.y())
-                self.assertLess(pair.first.x(), pair.second.x())
-                self.assertIs(pair.first.parentWidget(), pair)
-                self.assertIs(pair.second.parentWidget(), pair)
-                self.assertTrue(pair.first.isVisible() and pair.second.isVisible())
+                canvas = self.window.atlas_canvas
+                self.assertGreater(canvas.width(), 0)
+                self.assertLessEqual(canvas.width(), self.window.ways_module.width())
+                self.assertGreater(canvas.height(), 0)
 
-    def test_the_crossing_pair_stacks_below_the_width_both_need(self):
+    def test_the_atlas_canvas_stays_inside_the_crossing_column_on_a_narrow_window(self):
         self.window.resize(320, 900)
         self.window.show()
         self.column_width("crossing")
-        pair = self.window.ways_pair
-        self.assertLess(pair.width(), pair.needed())
-        self.assertFalse(pair.beside())
-        self.assertLess(pair.first.y(), pair.second.y())
+        canvas = self.window.atlas_canvas
+        self.assertGreater(canvas.width(), 0)
+        self.assertLessEqual(canvas.width(), self.window.ways_module.width())
 
     def test_style_families_form_horizontal_equal_tile_rows_at_each_breakpoint(self):
         for width in self.WIDTHS:

@@ -59,10 +59,13 @@ class InterfaceTests(unittest.TestCase):
             network = ipaddress.IPv4Network(f"{address}/{netmask}", strict=False)
             self.assertFalse(ipaddress.IPv4Address(address).is_loopback, address)
             self.assertLess(network.prefixlen, 31, (address, netmask))
-        # Checked against the routing table, which knows nothing of how the list was read.
-        routed = pairing.pairing_address()
-        if routed is not None:
-            self.assertIn(routed, [address for address, _netmask in found])
+            # The default route can use a VPN excluded from this broadcast-interface list.
+            self.assertTrue(_can_bind(address), address)
+
+    def test_pairing_address_prefers_a_private_default_route_outside_broadcast_interfaces(self):
+        with mock.patch.object(pairing, "local_address_towards", return_value="10.8.0.4"), \
+                mock.patch.object(pairing, "_local_ipv4_addresses", return_value=["192.168.50.22"]):
+            self.assertEqual(pairing.pairing_address(), "10.8.0.4")
 
     def test_a_platform_that_will_not_say_gives_none(self):
         failing = mock.patch.object(pairing, "_posix_interfaces" if pairing.sys.platform != "win32" else "_windows_interfaces",

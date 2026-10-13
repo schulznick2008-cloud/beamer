@@ -40,6 +40,11 @@ def installed_exe() -> Optional[str]:
     return sys.executable if getattr(sys, "frozen", False) else None
 
 
+def can_run_for_current_user() -> bool:
+    """autostart_win's question; a desktop entry always starts for the user whose it is."""
+    return True
+
+
 def _exec_argument(arg: str) -> str:
     """One argument as the spec's Exec key wants it: %% for a literal percent, double quotes when
     a reserved character is present (with " ` $ and \\ backslash-escaped inside), then the whole

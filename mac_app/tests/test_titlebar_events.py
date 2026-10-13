@@ -2,7 +2,7 @@ import unittest
 from unittest import mock
 
 from mac_app.tests.test_window_geometry import offscreen_control_window, kvm_bridge_app
-from mac_app.tests.test_window_resize import settle
+from mac_app.tests.design_offscreen import settle
 
 AppKit = kvm_bridge_app.AppKit
 
@@ -77,7 +77,7 @@ class TitlebarEventTests(unittest.TestCase):
                     point = (80, content_height - 30)
                 hit = window.contentView().superview().hitTest_(point)
                 print(f"{region} double-click hit={type(hit).__name__}, point={point}", flush=True)
-                # No default is changed on Toby's Mac.
+                # No default is changed on the test Mac.
                 with mock.patch.object(kvm_bridge_app, "titlebar_action", return_value="fill"):
                     double_click(window, point)
                     print(f"{region} frame={window.frame()}", flush=True)

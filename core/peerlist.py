@@ -5,10 +5,34 @@ settings layer calls `add_peer` from `PairingService`'s `store` and `remove_peer
 button, each under its own settings lock; neither touches a file.
 """
 
+import copy
 import time
 from typing import Optional
 
-from core import pairing
+from core import pairing, protocol
+
+
+class RefusalThrottle:
+    """One native notice per identical refusal during a sustained crossing attempt."""
+
+    interval = 30.0
+
+    def __init__(self):
+        self._last: dict[str, float] = {}
+
+    def allow(self, message: str, now: Optional[float] = None) -> bool:
+        if not message:
+            return False
+        now = time.monotonic() if now is None else now
+        previous = self._last.get(message)
+        self._last = {text: stamp for text, stamp in self._last.items() if now - stamp < self.interval}
+        if previous is not None and now - previous < self.interval:
+            return False
+        self._last[message] = now
+        return True
+
+    def reset(self) -> None:
+        self._last.clear()
 
 UNNAMED = "Unnamed machine"
 TAIL = 4
@@ -54,7 +78,10 @@ def normalise_phones(settings: dict) -> bool:
 
 
 def _name(entry: dict) -> str:
-    return (entry.get("name") or "").strip()
+    label = entry.get("label")
+    label = label.strip()[:64] if isinstance(label, str) else ""
+    name = entry.get("name")
+    return label or (name.strip() if isinstance(name, str) else "")
 
 
 def labels(peers: list) -> dict:
@@ -90,14 +117,42 @@ def label_for(peers: list, *, token: Optional[str] = None, peer_id: Optional[str
     """`labels()` for one machine, found by its token, its id (`b64`) or its address, in that order of
     preference; "" when none matches. What a status or a notice calls a machine, so two of one name
     are told apart there as they are in the list."""
-    peers = [entry for entry in peers if isinstance(entry, dict) and "token" in entry]
+    peers = [entry for entry in peers if isinstance(entry, dict)]
     shown = labels(peers)
     for key, value in (("token", token), ("id", peer_id), ("host", host)):
         if value:
             found = next((entry for entry in peers if entry.get(key) == value), None)
             if found is not None:
-                return shown[found["token"]]
+                if found.get("port") == 0:
+                    return ""
+                return shown.get(found.get("token")) or _name(found) or found.get("host") or ""
     return ""
+
+
+def dormant_reason(entry: dict) -> Optional[str]:
+    """Why a saved peer needs pairing again, or None when the link has not proved that it is stale."""
+    if entry.get("dormant") is not True:
+        return None
+    reason = entry.get("dormant_reason")
+    return {
+        "wrong_id": "The saved pairing now identifies a different machine.",
+        "forgotten": "The other machine no longer has this pairing.",
+    }.get(reason, "This pairing needs to be set up again.")
+
+
+def paired_ids(peers: list, exclude: Optional[str] = None) -> list:
+    """The valid, live desktop ids listed in a `paired` message, less its receiver."""
+    ids = []
+    for entry in peers:
+        if (not isinstance(entry, dict) or entry.get("port") == 0
+                or entry.get("in_use", True) is False or dormant_reason(entry) is not None):
+            continue
+        ident = entry.get("id")
+        if ident != exclude and protocol.read_id(ident) is not None:
+            ids.append(ident)
+            if len(ids) == protocol.MAX_PEERS:
+                break
+    return ids
 
 
 def add_peer(settings: dict, entry: dict, replaced: Optional[dict] = None) -> None:
@@ -113,7 +168,12 @@ def add_peer(settings: dict, entry: dict, replaced: Optional[dict] = None) -> No
     if at is None:
         peers.append(entry)
     else:
+        old = peers[at]
         peers[at] = entry
+        if old.get("id") and old.get("id") == entry.get("id"):
+            for field in ("label", "left_out", "left_out_ways", "side", "side_set_at", "side_by"):
+                if field in old:
+                    entry[field] = copy.deepcopy(old[field])
     if (replaced is not None and replaced.get("from_1_4") is True and replaced.get("id") == "" and entry.get("id")
             and replaced.get("host") and replaced.get("host") == entry.get("host")
             and replaced.get("platform") == entry.get("platform")):
@@ -137,6 +197,10 @@ def remove_peer(settings: dict, token: str) -> Optional[dict]:
         return None
     removed = peers.pop(at)
     _drop_orphan_zones(settings)
+    layout = settings.get("layout")
+    if isinstance(layout, dict):
+        from core import ways
+        ways.prune_layout(settings)
     return removed
 
 

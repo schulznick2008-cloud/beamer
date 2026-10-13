@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class PageAuditRegressions(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        output = ROOT / "renders" / "regressions"
+        output = ROOT / "win_app" / "renders" / "regressions"
         output.mkdir(parents=True, exist_ok=True)
         cls.directory = tempfile.TemporaryDirectory(dir=output)
         cls.addClassCleanup(cls.directory.cleanup)

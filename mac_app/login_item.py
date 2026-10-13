@@ -5,6 +5,8 @@ ServiceManagement is loaded from the system framework rather than through
 pyobjc-framework-ServiceManagement, which would be a new dependency for four calls.
 """
 
+from pathlib import Path
+
 import objc
 
 objc.loadBundle(
@@ -17,10 +19,36 @@ for _selector in (b"registerAndReturnError:", b"unregisterAndReturnError:"):
 SMAppService = objc.lookUpClass("SMAppService")
 
 NOT_REGISTERED, ENABLED, REQUIRES_APPROVAL, NOT_FOUND = 0, 1, 2, 3
+STATUS_TEXT = {
+    NOT_REGISTERED: "Not registered",
+    ENABLED: "Enabled",
+    REQUIRES_APPROVAL: "Requires approval",
+    NOT_FOUND: "Not found",
+}
 
 
 def status():
     return SMAppService.mainAppService().status()
+
+
+def status_text(value):
+    return STATUS_TEXT.get(value, "Unknown")
+
+
+def installed_in_applications(bundle_path):
+    path = Path(bundle_path).resolve()
+    if "/AppTranslocation/" in str(path):
+        return False
+    roots = (Path("/Applications"), Path.home() / "Applications")
+    return any(path == root or root in path.parents for root in roots)
+
+
+def can_toggle(status_value, bundle_path):
+    return installed_in_applications(bundle_path) or status_value in (ENABLED, REQUIRES_APPROVAL)
+
+
+def is_background_launch(is_default_launch):
+    return is_default_launch is not None and not bool(is_default_launch)
 
 
 def is_enabled():
@@ -39,3 +67,7 @@ def set_enabled(enabled):
         ok, error = service.unregisterAndReturnError_(None)
     if not ok:
         raise OSError(error.localizedDescription() if error is not None else "macOS refused")
+
+
+def open_system_settings():
+    SMAppService.openSystemSettingsLoginItems()

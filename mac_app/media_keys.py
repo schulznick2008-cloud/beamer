@@ -18,6 +18,8 @@ NX_SUBTYPE_AUX_CONTROL_BUTTONS = 8
 NX_KEY_NAMES = {
     0: "volume_up",
     1: "volume_down",
+    2: "brightness_up",
+    3: "brightness_down",
     7: "volume_mute",
     16: "media_play_pause",
     17: "media_next",

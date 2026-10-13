@@ -78,6 +78,18 @@ class OwnerCase(unittest.TestCase):
     def switch(self, frm, nxt, route=None, **where):
         return self.o.switch(frm, {"route": self.o.route if route is None else route, "next": nxt, **where})
 
+    def test_the_active_chain_keeps_every_machine_in_an_onward_crossing(self):
+        self.o.go("B")
+        self.assertEqual(self.o.chain, ("A", "B"))
+        self.o.switch("B", {"route": self.o.route, "next": "C"})
+        self.o.accept("C", {"route": self.o.route})
+        self.assertEqual(self.o.chain, ("A", "B", "C"))
+
+    def test_a_busy_refusal_keeps_the_machine_in_the_way_in_the_chain(self):
+        self.o.go("B")
+        self.o.refuse("B", {"route": self.o.route, "why": "busy", "other": "C"})
+        self.assertEqual(self.o.chain, ("A", "B", "C"))
+
 
 class TakeFromHomeTests(OwnerCase):
     def test_a_take_by_a_zone_carries_the_route_the_landing_the_resistance_and_the_reach(self):
@@ -87,6 +99,12 @@ class TakeFromHomeTests(OwnerCase):
         self.assertEqual(moved(actions), Moved("B", None, "asked", "left", 0.5))
         self.assertEqual(self.o.on, "B")
         self.assertEqual(self.o.reach_sent, ["C", "D"])
+
+    def test_a_take_carries_the_receiving_display_and_side(self):
+        self.assertEqual(focuses(self.o.go("B", "left", 0.5, display="panel-right", side="bottom")),
+                         [{"route": 1, "target": "B", "edge": "left", "offset": 0.5,
+                           "display": "panel-right", "side": "bottom",
+                           "resistance_px": 120, "reach": ["C", "D"]}])
 
     def test_a_take_by_the_shortcut_has_no_landing(self):
         self.assertEqual(focuses(self.o.go("B")), [{"route": 1, "target": "B", "resistance_px": 120, "reach": ["C", "D"]}])

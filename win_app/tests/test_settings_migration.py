@@ -19,6 +19,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 
 import app_config
 from app_config import ConfigError
+from core import ways
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -73,6 +74,12 @@ class Folder(unittest.TestCase):
     def put(self, settings):
         self.path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
 
+    def learned(self):
+        settings = app_config.load_settings(self.path)
+        app_config.learn_peer_id(settings, 0, PEER_ID)
+        self.put(settings)
+        return app_config.load_settings(self.path)
+
 
 class MigrationTests(Folder):
     def test_the_paths_are_settings_json_and_the_old_file_beside_it(self):
@@ -88,7 +95,10 @@ class MigrationTests(Folder):
         self.assertIs(settings["shortcut"], True)
         self.assertEqual(settings["migrated_token_sha256"], hashlib.sha256(PAIRED.encode()).hexdigest())
         self.assertEqual(len(settings["peers"]), 1)
-        self.assertEqual(settings["peers"][0], {**MIGRATED_PEER, "token": PAIRED, "side_by": settings["machine_id"]})
+        expected_peer = {**MIGRATED_PEER, "token": PAIRED, "side_by": settings["machine_id"]}
+        self.assertEqual({k: settings["peers"][0][k] for k in expected_peer}, expected_peer)
+        self.assertEqual(settings["peers"][0]["ways"],
+                         dict(edge=True, thirds=list(ways.PARTS), corner=True, corner_at="top_right", notch=False))
         for key in MOVED_OR_DROPPED:
             self.assertNotIn(key, settings)
         for key, value in LEGACY.items():
@@ -356,11 +366,11 @@ class ReadingAnOddFileTests(Folder):
         settings = app_config.load_settings(self.path)
         settings["later"] = {"a": 1}
         settings["peers"][0]["later"] = 2
-        settings["zones"][0]["later"] = 3
+        settings["peers"][0]["ways"] = {"edge": False, "thirds": ["middle"], "later": 3}
         self.put(settings)
         app_config.save_config(self.path, replace(app_config.load_config(self.path), pointer_speed=2.0))
         again = self.settings()
-        self.assertEqual((again["later"], again["peers"][0]["later"], again["zones"][0]["later"]), ({"a": 1}, 2, 3))
+        self.assertEqual((again["later"], again["peers"][0]["later"], again["peers"][0]["ways"]["later"]), ({"a": 1}, 2, 3))
 
     def test_the_machine_name_is_saved(self):
         app_config.load_settings(self.path)
@@ -369,98 +379,107 @@ class ReadingAnOddFileTests(Folder):
 
 
 class OverlapTests(Folder):
-    """Two zones in use never cover one stretch (WIRE.md section 8), as on the Mac; a corner inside an edge is fine."""
+    """Legacy overlaps become intent and one canonical allocation when the file is loaded."""
 
-    def refused(self, change):
-        settings = app_config.load_settings(self.path)
-        change(settings)
+    def recompile(self, zones, extra=False):
+        settings = self.learned()
+        settings["peers"][0].pop("ways", None)
+        if extra:
+            settings["peers"].append({**settings["peers"][0], "id": OTHER_ID, "token": OTHER,
+                                      "from_1_4": False})
+        settings["zones"] = [{"peer": PEER_ID, **zone} for zone in zones]
         self.put(settings)
-        raw = self.path.read_bytes()
-        with self.assertRaises(app_config.SettingsFileError):
-            app_config.load_config(self.path)
-        with self.assertRaises(app_config.SettingsFileError):
-            app_config.save_config(self.path, replace(app_config.default_config(), auth_token=PAIRED))
-        self.assertEqual(self.path.read_bytes(), raw)
+        return app_config.load_settings(self.path)
 
-    def zone(self, settings, kind):
-        return next(zone for zone in settings["zones"] if zone["kind"] == kind)
+    def test_legacy_whole_edge_takes_precedence_over_active_or_off_thirds(self):
+        for off in (False, True):
+            with self.subTest(part_off=off):
+                self.path.unlink(missing_ok=True)
+                saved = self.recompile([{"kind": "edge"}, {"kind": "part", "parts": ["middle"], "off": off}])
+                self.assertEqual(saved["zones"], [{"peer": PEER_ID, "kind": "edge"}])
+                self.assertEqual(saved["peers"][0]["ways"]["thirds"], list(ways.PARTS))
+                self.assertEqual(self.settings()["peers"][0]["ways"]["thirds"], list(ways.PARTS))
 
-    def test_the_edge_and_its_thirds_in_use_together_are_refused(self):
-        self.refused(lambda s: self.zone(s, "part").pop("off", None) or self.zone(s, "edge").pop("off", None))
+    def test_an_off_legacy_edge_does_not_override_active_thirds(self):
+        for mark in ("off", "page_off"):
+            with self.subTest(mark=mark):
+                self.path.unlink(missing_ok=True)
+                saved = self.recompile([{"kind": "edge", mark: True},
+                                        {"kind": "part", "parts": ["middle"]}])
+                self.assertEqual(saved["peers"][0]["ways"]["thirds"], ["middle"])
 
-    def test_two_part_zones_sharing_a_third_are_refused_and_disjoint_ones_are_not(self):
-        def two_parts(s, second):
-            self.zone(s, "edge")["off"] = True
-            self.zone(s, "part").pop("off", None)
-            self.zone(s, "part")["parts"] = ["start"]
-            s["zones"].append({"peer": "", "kind": "part", "parts": second})
-        self.refused(lambda s: two_parts(s, ["start", "end"]))
-        self.path.unlink()
-        settings = app_config.load_settings(self.path)
-        two_parts(settings, ["end"])
-        self.put(settings)
-        app_config.load_config(self.path)
+    def test_incomplete_legacy_zones_still_normalise_without_a_key_error(self):
+        saved = self.recompile([{}, {"kind": "edge"}])
+        self.assertEqual(saved["zones"], [{"peer": PEER_ID, "kind": "edge"}])
+
+    def test_overlapping_and_disjoint_legacy_parts_compile_to_their_union(self):
+        for second in (["start", "end"], ["end"]):
+            self.path.unlink(missing_ok=True)
+            saved = self.recompile([{"kind": "part", "parts": ["start"]},
+                                    {"kind": "part", "parts": second}])
+            self.assertEqual(saved["zones"], [{"peer": PEER_ID, "kind": "part", "parts": ["start", "end"]}])
 
     def test_zones_turned_off_cover_nothing(self):
-        settings = app_config.load_settings(self.path)
-        settings["zones"].append({"peer": "", "kind": "edge", "off": True})
-        self.put(settings)
-        app_config.load_config(self.path)
+        saved = self.recompile([{"kind": "edge", "off": True}])
+        self.assertEqual(saved["zones"], [])
+        self.assertFalse(saved["peers"][0]["ways"]["edge"])
 
-    def test_two_peers_whose_edges_face_the_same_side_cannot_both_have_the_edge_zone_on(self):
-        def second_peer(s):
-            s["peers"][0]["id"] = PEER_ID
-            s["zones"] = [{**zone, "peer": PEER_ID} for zone in s["zones"]]
-            self.zone(s, "edge").pop("off", None)
-            self.zone(s, "part")["off"] = True
-            s["peers"].append({**s["peers"][0], "id": OTHER_ID, "token": OTHER, "from_1_4": False})
-            s["zones"].append({"peer": OTHER_ID, "kind": "edge"})
-        self.refused(second_peer)
+    def test_legacy_shared_side_compiles_only_one_allocation_and_keeps_both_intents(self):
+        saved = self.recompile([{"kind": "edge"}, {"peer": OTHER_ID, "kind": "edge"}], extra=True)
+        self.assertEqual(saved["zones"], [{"peer": PEER_ID, "kind": "edge"}])
+        self.assertTrue(saved["peers"][1]["ways"]["edge"])
 
-    def test_a_corner_inside_the_edge_is_fine_and_two_of_one_corner_are_not(self):
-        settings = app_config.load_settings(self.path)
-        self.zone(settings, "edge").pop("off", None)
-        self.zone(settings, "corner").pop("off", None)
-        self.put(settings)
-        app_config.load_config(self.path)
-        self.refused(lambda s: s["zones"].append({**self.zone(s, "corner")}))
+    def test_legacy_duplicate_corners_compile_once_alongside_the_edge(self):
+        saved = self.recompile([{"kind": "edge"}, {"kind": "corner", "corner": "top_left"},
+                                {"kind": "corner", "corner": "top_left"}])
+        self.assertEqual([zone["kind"] for zone in saved["zones"]], ["edge", "corner"])
 
 
 class ZonesFromMethodsTests(Folder):
     def migrated(self, **fields):
         self.path.unlink(missing_ok=True)
         self.write_legacy({**LEGACY, **fields})
+        settings = app_config.migrate({**LEGACY, **fields})
+        app_config.learn_peer_id(settings, 0, PEER_ID)
+        settings["peers"][0]["caps"] = []
+        app_config.write_settings(self.path, settings)
         return app_config.load_settings(self.path)
 
-    def test_every_combination_of_methods_gives_its_zones_and_off_flags(self):
+    def test_legacy_method_combinations_become_intent_and_active_canonical_zones(self):
         for count in range(5):
             for methods in itertools.combinations(app_config.METHODS, count):
                 with self.subTest(methods=methods):
                     settings = self.migrated(crossing_methods=list(methods), crossing_corner="top_left",
                                              crossing_edge_parts=["middle", "end"], mac_return_edge="left")
                     self.assertIs(settings["shortcut"], "shortcut" in methods)
-                    self.assertEqual([zone["kind"] for zone in settings["zones"]], ["edge", "part", "corner"])
-                    # The whole edge covers its thirds, so with both on the thirds stand down (WIRE.md section 8).
-                    in_use = [m for m in methods if not (m == "part" and "edge" in methods)]
+                    expected = (["edge"] if "edge" in methods else ["part"] if "part" in methods else [])
+                    expected += ["corner"] if "corner" in methods else []
+                    self.assertEqual([zone["kind"] for zone in settings["zones"]], expected)
                     for zone in settings["zones"]:
-                        self.assertEqual(zone["peer"], "")
-                        self.assertEqual(zone.get("off", False), zone["kind"] not in in_use, zone)
-                    self.assertEqual(settings["zones"][1]["parts"], ["middle", "end"])
-                    self.assertEqual(settings["zones"][2]["corner"], "top_left")
+                        self.assertEqual(zone["peer"], PEER_ID)
+                        self.assertNotIn("off", zone)
+                    intent = settings["peers"][0]["ways"]
+                    self.assertEqual(intent["thirds"], list(ways.PARTS) if "edge" in methods else ["middle", "end"])
+                    self.assertEqual(intent["corner_at"], "top_left")
 
-    def test_a_corner_crosses_the_side_as_1_4_x_did_whichever_edges_it_touches(self):
-        # 1.4.x built the PC's corner push with the return edge (sender.py: CornerPush(corner, self._edge)).
-        for corner, side in (("top_left", "left"), ("top_left", "top"), ("bottom_right", "bottom"),
-                             ("top_right", "left"), ("bottom_left", "right"), ("top_left", "bottom"),
-                             ("bottom_right", "top")):
+    def test_a_corner_crosses_the_side_when_it_touches_it_and_its_own_horizontal_edge_otherwise(self):
+        # 1.4.x built the PC's corner push with the return edge (sender.py: CornerPush(corner, self._edge)),
+        # but a corner push only arms through one of its own two edges (receiver.zone_models): one held
+        # along an edge it does not touch would pin the pointer to that edge. So a corner away from the
+        # side crosses by its own horizontal edge, as the Mac's does (core.ways.corner_edge, 10-10-2026).
+        for corner, side, edge in (("top_left", "left", "left"), ("top_left", "top", "top"),
+                                   ("bottom_right", "bottom", "bottom"), ("top_right", "left", "right"),
+                                   ("bottom_left", "right", "left"), ("top_left", "bottom", "left"),
+                                   ("bottom_right", "top", "right")):
             with self.subTest(corner=corner, side=side):
                 settings = self.migrated(crossing_corner=corner, mac_return_edge=side)
-                self.assertEqual(settings["zones"][2]["edge"], side)
+                self.assertEqual(next(z for z in settings["zones"] if z["kind"] == "corner")["edge"], edge)
 
     def test_a_corner_with_no_side_yet_crosses_its_own_left_or_right_edge(self):
         for corner, edge in (("top_left", "left"), ("bottom_right", "right")):
             with self.subTest(corner=corner):
-                self.assertEqual(self.migrated(crossing_corner=corner, mac_return_edge="")["zones"][2]["edge"], edge)
+                saved = self.migrated(crossing_corner=corner, mac_return_edge="")
+                self.assertEqual(next(z for z in saved["zones"] if z["kind"] == "corner")["edge"], edge)
 
     def test_there_is_no_notch_zone_on_windows(self):
         self.assertNotIn("notch", [zone["kind"] for zone in self.migrated()["zones"]])
@@ -470,7 +489,8 @@ class ConfigViewTests(Folder):
     def test_the_app_sees_the_same_config_as_before_but_for_what_the_spec_drops(self):
         config = app_config.load_config(self.path)
         expected = app_config.config_from_dict(dict(LEGACY))
-        skipped = {"host", "mac_resistance_px", "machine_id", "name"}
+        skipped = {"host", "mac_resistance_px", "machine_id", "name", "crossing_methods",
+                   "crossing_edge_parts", "crossing_corner", "layout", "layout_set_at", "layout_by"}
         self.assertEqual({k: v for k, v in asdict(config).items() if k not in skipped},
                          {k: v for k, v in asdict(expected).items() if k not in skipped})
 
@@ -533,12 +553,15 @@ class SavingTests(Folder):
         self.assertIs(settings["shortcut"], False)
         self.assertEqual(settings["zones"], before)
 
-    def test_turning_a_way_off_keeps_its_zone_and_its_setting(self):
-        app_config.set_ways(self.path, "", methods=["edge"], parts=["start", "end"], corner="top_right")
-        app_config.set_ways(self.path, "", methods=["part"], parts=["start", "end"], corner="top_right")
+    def test_turning_ways_off_removes_zones_and_keeps_choices_for_turning_on(self):
+        self.learned()
+        app_config.set_ways(self.path, PEER_ID, methods=["part", "corner"], parts=["start", "end"], corner="top_right")
+        app_config.set_ways(self.path, PEER_ID, methods=[], parts=["start", "end"], corner="top_right")
         settings = self.settings()
-        self.assertEqual([(zone["kind"], zone.get("off", False)) for zone in settings["zones"]],
-                         [("edge", True), ("part", False), ("corner", True)])
+        self.assertEqual(settings["zones"], [])
+        self.assertEqual(settings["peers"][0]["ways"]["thirds"], ["start", "end"])
+        self.assertEqual(settings["peers"][0]["ways"]["corner_at"], "top_right")
+        app_config.set_ways(self.path, PEER_ID, methods=["part"], parts=["start", "end"], corner="top_right")
         again = app_config.load_config(self.path)
         self.assertEqual((again.crossing_methods, again.crossing_edge_parts), (["part", "shortcut"], ["start", "end"]))
 
@@ -557,16 +580,16 @@ class SavingTests(Folder):
         self.assertNotIn("host", settings)
         self.assertNotIn("mac_resistance_px", settings)
 
-    def test_a_side_is_stamped_by_this_machine_only_when_set_here_never_by_a_save(self):
-        settings = self.settings()
+    def test_way_edits_and_flat_saves_keep_the_held_side_and_author(self):
+        settings = self.learned()
         settings["peers"][0]["side_by"] = OTHER_ID
         self.put(settings)
         app_config.save_config(self.path, replace(self.config, pointer_speed=2.0, mac_return_edge="top",
                                                   arrangement_set_at=1790000005))
         self.assertEqual((self.settings()["peers"][0]["side"], self.settings()["peers"][0]["side_by"]), ("left", OTHER_ID))
-        app_config.set_ways(self.path, "", side="top", methods=["edge"], parts=["middle"], corner="top_left")
+        app_config.set_ways(self.path, PEER_ID, side="top", methods=["edge"], parts=["middle"], corner="top_left")
         self.assertEqual((self.settings()["peers"][0]["side"], self.settings()["peers"][0]["side_by"]),
-                         ("top", settings["machine_id"]))
+                         ("left", OTHER_ID))
 
     def test_a_changed_port_moves_this_machines_and_the_one_peers_together(self):
         app_config.save_config(self.path, replace(self.config, port=25000))
@@ -580,7 +603,7 @@ class SavingTests(Folder):
         app_config.save_config(self.path, replace(app_config.load_config(self.path), pointer_speed=2.0))
         self.assertEqual(self.settings()["peers"][0]["port"], 24900)
 
-    def test_a_new_pairing_replaces_the_first_peer_and_points_its_zones_at_the_empty_id(self):
+    def test_a_new_pairing_waits_for_a_learned_id_before_compiling_zones(self):
         settings = self.settings()
         app_config.learn_peer_id(settings, 0, PEER_ID)
         self.put(settings)
@@ -589,7 +612,7 @@ class SavingTests(Folder):
         peer = self.settings()["peers"][0]
         self.assertEqual((peer["token"], peer["name"], peer["host"], peer["id"]), (OTHER, "Other", "192.0.2.30", ""))
         self.assertEqual((peer["linked"], peer["from_1_4"], peer["paired_at"], peer["paired_with"]), (False, True, 0, []))
-        self.assertEqual({zone["peer"] for zone in self.settings()["zones"]}, {""})
+        self.assertEqual(self.settings()["zones"], [])
 
     def test_other_peers_and_their_zones_survive_every_save(self):
         settings = self.settings()
@@ -602,7 +625,7 @@ class SavingTests(Folder):
         app_config.save_config(self.path, replace(config, crossing_methods=[], glow_style="glow"))
         app_config.save_config(self.path, replace(config, auth_token=OTHER))
         after = self.settings()
-        self.assertEqual(after["peers"][1], extra)
+        self.assertEqual({k: after["peers"][1][k] for k in extra}, extra)
         self.assertIn({"peer": OTHER_ID, "kind": "edge"}, after["zones"])
         self.assertEqual(len(after["peers"]), 2)
 
@@ -620,8 +643,10 @@ class LearningTheIdTests(Folder):
         super().setUp()
         self.settings_ = app_config.load_settings(self.path)
 
-    def test_the_first_link_fills_the_id_in_and_rewrites_the_zones(self):
+    def test_the_first_link_learns_the_id_and_next_load_compiles_its_zones(self):
         app_config.learn_peer_id(self.settings_, 0, PEER_ID)
+        self.put(self.settings_)
+        self.settings_ = app_config.load_settings(self.path)
         self.assertEqual(self.settings_["peers"][0]["id"], PEER_ID)
         self.assertEqual({zone["peer"] for zone in self.settings_["zones"]}, {PEER_ID})
 
@@ -629,7 +654,7 @@ class LearningTheIdTests(Folder):
         self.settings_["peers"].append({**MIGRATED_PEER, "id": OTHER_ID, "from_1_4": False, "token": THIRD})
         self.settings_["zones"].append({"peer": OTHER_ID, "kind": "edge"})
         app_config.learn_peer_id(self.settings_, 0, PEER_ID)
-        self.assertEqual([zone["peer"] for zone in self.settings_["zones"]], [PEER_ID] * 3 + [OTHER_ID])
+        self.assertEqual([zone["peer"] for zone in self.settings_["zones"]], [OTHER_ID])
 
     def test_it_refuses_this_machines_own_id_a_duplicate_a_bad_one_and_an_entry_that_has_one(self):
         self.settings_["peers"].append({**MIGRATED_PEER, "id": OTHER_ID, "from_1_4": False, "token": THIRD})
@@ -656,7 +681,7 @@ class PairingAgainUnder1_4Tests(Folder):
         peer = again["peers"][0]
         self.assertEqual((peer["token"], peer["name"], peer["host"]), (OTHER, "Studio", "192.0.2.40"))
         self.assertEqual((peer["id"], peer["linked"], peer["paired_with"], peer["from_1_4"]), ("", False, [], True))
-        self.assertEqual({zone["peer"] for zone in again["zones"]}, {""})
+        self.assertEqual(again["zones"], [])
         self.assertEqual(again["migrated_token_sha256"], hashlib.sha256(OTHER.encode()).hexdigest())
         self.assertEqual(again["machine_id"], settings["machine_id"])
         self.assertEqual(self.settings(), again)
@@ -677,7 +702,7 @@ class PairingAgainUnder1_4Tests(Folder):
         self.write_legacy({**LEGACY, "auth_token": OTHER})
         again = self.start()
         self.assertEqual([peer["token"] for peer in again["peers"]], [OTHER, THIRD])
-        self.assertEqual(again["peers"][1], extra)
+        self.assertEqual({k: again["peers"][1][k] for k in extra}, extra)
         self.assertIn({"peer": OTHER_ID, "kind": "edge"}, again["zones"])
 
     def test_a_peer_the_user_removed_stays_removed_while_the_old_file_is_unchanged(self):
@@ -694,8 +719,7 @@ class PairingAgainUnder1_4Tests(Folder):
         self.write_legacy({**LEGACY, "auth_token": OTHER})
         again = self.start()
         self.assertEqual([peer["token"] for peer in again["peers"]], [OTHER])
-        self.assertEqual([zone["kind"] for zone in again["zones"]], ["edge", "part", "corner"])
-        self.assertEqual({zone["peer"] for zone in again["zones"]}, {""})
+        self.assertEqual(again["zones"], [])
 
     def test_a_token_whose_key_id_is_another_entrys_is_not_migrated_but_the_hash_moves_on(self):
         settings = self.start()

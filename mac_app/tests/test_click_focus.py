@@ -19,10 +19,15 @@ def key(window, characters, code):
 
 
 def ring_shown(view):
-    while view is not None and not isinstance(view, (widgets.Pressable, widgets._RulerView)):
+    while view is not None and not isinstance(view, (widgets.Pressable, widgets._RulerView,
+                                                       kvm_bridge_app._DesignSlider)):
         view = view.superview()
     if isinstance(view, widgets._RulerView):
         return widgets.keyboard_focus_visible(view)
+    if isinstance(view, kvm_bridge_app._DesignSlider):
+        window = view.window()
+        return (window is not None and window.keyboard_navigation
+                and window.firstResponder() == view)
     return view.ring is not None and not view.ring.isHidden()
 
 
@@ -93,10 +98,8 @@ class ClickFocusTests(unittest.TestCase):
     def test_click_on_each_control_type_draws_no_ring(self):
         control = self.control
         self.show('design')
-        segment, words = control.length_select.cells[1][1], control.length_select.cells[1][2]
-        self.assert_no_ring_after_click(segment, 'segment')
-        self.assert_no_ring_after_click(words.view, 'segment label')
-        self.assertIsNot(self.window.firstResponder(), words.view)
+        slider = control.length_select.slider
+        self.assert_no_ring_after_click(slider, 'design slider')
         self.assert_no_ring_after_click(control.glow_box.view, 'switch')
         self.assert_no_ring_after_click(control.glow_box.words.view, 'switch label')
         tiles = control.notch_style_select.tiles
@@ -124,6 +127,39 @@ class ClickFocusTests(unittest.TestCase):
                 return
         self.fail('no ruler found')
 
+    def test_keyboard_focus_invalidates_the_resistance_thumb(self):
+        from unittest import mock
+
+        control = self.control
+        self.show('crossing')
+        strip = control.push_strip
+        self.window.makeFirstResponder_(strip)
+        self.window.keyboard_navigation = True
+        strip.drawn_focus = False
+
+        with mock.patch.object(strip, 'setNeedsDisplay_', wraps=strip.setNeedsDisplay_) as redraw:
+            self.window.refresh_input_focus()
+
+        redraw.assert_called_once_with(True)
+
+    def test_resistance_thumb_redraws_on_responder_transitions(self):
+        from unittest import mock
+
+        self.show('crossing')
+        strip = self.control.push_strip
+        with mock.patch.object(strip, 'setNeedsDisplay_', wraps=strip.setNeedsDisplay_) as redraw:
+            self.assertTrue(strip.becomeFirstResponder())
+            redraw.assert_called_once_with(True)
+            redraw.reset_mock()
+            self.assertTrue(strip.resignFirstResponder())
+            redraw.assert_called_once_with(True)
+
+    def test_mouse_focus_does_not_highlight_the_resistance_thumb(self):
+        self.show('crossing')
+        strip = self.control.push_strip
+        self.click(strip)
+        self.assertFalse(widgets.keyboard_focus_visible(strip))
+
     def _rulers(self, view):
         if view.isHidden():
             return
@@ -134,24 +170,24 @@ class ClickFocusTests(unittest.TestCase):
 
     def test_other_keys_after_a_click_leave_the_ring_off(self):
         self.show('design')
-        segment = self.control.length_select.cells[1][1]
-        self.click(segment)
+        slider = self.control.length_select.slider
+        self.click(slider)
         self.press_key('a', 0)
         self.assertFalse(self.window.keyboard_navigation)
-        self.assertFalse(ring_shown(segment))
+        self.assertFalse(ring_shown(slider))
 
     def test_tab_shows_a_ring_and_the_next_click_clears_it(self):
         self.show('design')
-        segment = self.control.length_select.cells[1][1]
-        self.click(segment)
+        slider = self.control.length_select.slider
+        self.click(slider)
         self.press_key('\t', 48)
         self.assertTrue(self.window.keyboard_navigation)
         responder = self.window.firstResponder()
-        self.assertIsInstance(responder, widgets.Pressable)
+        self.assertIsInstance(responder, kvm_bridge_app._DesignSlider)
         self.assertTrue(ring_shown(responder))
-        self.click(segment)
+        self.click(slider)
         self.assertFalse(ring_shown(responder))
-        self.assertFalse(ring_shown(segment))
+        self.assertFalse(ring_shown(slider))
 
 
 if __name__ == '__main__':

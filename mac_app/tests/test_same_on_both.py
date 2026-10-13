@@ -2,6 +2,7 @@
 change here going out. Built as test_appearance builds it, never put on screen; the two links'
 sends are recorded instead."""
 
+import copy
 import json
 import logging
 import sys
@@ -35,11 +36,45 @@ def pc_message(on, set_at, by="", **values):
                 glow_style="beam", glow_colour="ocean", effect_length="long", shortcut_arrival=False,
                 shortcut_arrival_style="locator")
     base.update(values)
-    return settings_sync.message_data(on, set_at, base, by=by)
+    return settings_sync.message_data(on, set_at, base, by=by,
+                                      groups=settings_sync.ALL_GROUPS if on else [])
 
 
 class SameOnBothTests(unittest.TestCase):
+    def test_idle_same_ticks_keep_one_native_follow_picker(self):
+        import gc
+        import objc
+        import weakref
+
+        owners = []
+        original = self.window.follow_select
+        for _ in range(200):
+            with objc.autorelease_pool():
+                self.window._show_same()
+                owners.append(weakref.ref(self.window.follow_select))
+        gc.collect()
+        self.assertIs(self.window.follow_select, original)
+        self.assertEqual(len({id(owner()) for owner in owners if owner() is not None}), 1)
+        self.assertEqual(len(self.window.follow_host.arrangedSubviews()), 1)
+
+    def test_follow_picker_recovers_when_a_peer_announces_design(self):
+        self.pair_sources(PEER)
+        self.window._design_peer_caps = lambda: {PEER: frozenset({"settings", "design_sync"})}
+        self.window._refresh_design_follow()
+        choice = self.window.follow_select
+        cell = next(cell for value, cell in choice.items if value == PEER)
+        self.assertFalse(cell.isEnabled())
+        self.window._design_states[PEER] = {"set_at": 100, "by": PEER,
+                                          "values": {"effect_length": "long"}}
+        self.window._refresh_design_follow()
+        self.assertIs(self.window.follow_select, choice)
+        self.assertTrue(cell.isEnabled())
+        self.assertEqual(cell.toolTip(), cell.title())
+
     def setUp(self):
+        capture = mock.patch.object(WakingController, "start_input_capture")
+        capture.start()
+        self.addCleanup(capture.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         path = Path(self.directory.name) / "config.json"
@@ -68,9 +103,89 @@ class SameOnBothTests(unittest.TestCase):
                                  "port": protocol.DEFAULT_PORT})
 
     def test_off_by_default_with_each_page_its_own(self):
-        self.assertFalse(self.window.same_switch.value)
+        self.assertFalse(self.window.same_checks["everything"].state())
+        self.assertEqual(set(self.window.same_checks), {"crossing", "design", "shortcut", "names", "everything"})
         self.assertEqual(self.window.scope_labels["design"].text, pages.SCOPE["design"])
         self.assertTrue(all(note.view.isHidden() for note in self.window.own_notes))
+
+    def test_everything_can_be_turned_off(self):
+        self.window._set_same_groups(settings_sync.ALL_GROUPS)
+        everything = self.window.same_checks["everything"]
+        everything.setState_(AppKit.NSControlStateValueOff)
+        self.window.sameGroupsChanged_(everything)
+
+        self.assertEqual(self.window.controller.cfg.same_groups, [])
+
+    def test_revert_restores_the_saved_values_and_announces_them(self):
+        self.pair_sources(PEER)
+        data = settings_sync.message_data(True, 100, {"resistance_px": 60}, by=PEER,
+                                          groups=["crossing"])
+        self.window.apply_same(data, peer=PEER)
+        self.assertTrue(settings_sync.snapshot_available(self.store.current().get("same_before_sync")))
+
+        self.window.revertSame_(None)
+
+        self.assertEqual(self.window.controller.cfg.crossing["resistance_px"], 120)
+        self.assertEqual(self.window.controller.cfg.same_groups, ["crossing"])
+        self.assertEqual(self.sent[-1]["crossing"]["resistance_px"], 120)
+
+    def test_revert_restores_shortcut_in_the_canonical_settings_field(self):
+        self.pair_sources(PEER)
+        data = settings_sync.message_data(True, 100, {"shortcut": False}, by=PEER,
+                                          groups=["shortcut"])
+        self.window.apply_same(data, peer=PEER)
+        self.assertFalse(self.store.current()["shortcut"])
+
+        self.window.revertSame_(None)
+
+        self.assertTrue(self.store.current()["shortcut"])
+
+    def test_revert_clears_a_first_remote_label_with_a_new_stamp(self):
+        self.pair_sources(PEER)
+        data = settings_sync.message_data(True, 100, by=PEER, groups=["names"], names={
+            PEER: {"label": "Named here", "set_at": 100, "by": PEER},
+        })
+        self.window.apply_same(data, peer=PEER)
+        entry = next(item for item in self.store.current()["peers"] if item["id"] == PEER)
+        self.assertEqual(entry["label"], "Named here")
+
+        self.window.revertSame_(None)
+
+        restored = next(item for item in self.store.current()["peers"] if item["id"] == PEER)
+        self.assertEqual(restored["label"], "")
+        self.assertGreater(restored["label_set_at"], 100)
+
+    def test_legacy_off_state_stays_off_when_announced_to_a_group_peer(self):
+        self.window.controller.cfg.same_groups = ["design"]
+        self.window.apply_same({"on": False, "set_at": 100, "by": PEER}, peer=None)
+
+        self.assertFalse(self.window.same_state()["on"])
+        self.assertEqual(self.window.same_state()["groups"], ["design"])
+
+    def test_revert_keeps_the_current_trigger_when_a_jump_chord_now_uses_it(self):
+        self.pair_sources(PEER)
+        raw = settings_store.config_to_raw(self.window.controller.cfg)
+        raw["trigger_key"] = "alt_r"
+        self.window.controller.apply_settings(self.store.save(raw))
+        original_groups = list(self.window.controller.cfg.same_groups)
+        data = settings_sync.message_data(True, 100, {"trigger_key": "f13"}, by=PEER,
+                                          groups=["shortcut"])
+        self.window.apply_same(data, peer=PEER)
+        settings = self.store.current()
+        settings["peers"][0]["jump_key"] = "alt+cmd+3"
+        self.store.save_settings(settings)
+
+        self.window.revertSame_(None)
+
+        self.assertEqual(self.window.controller.cfg.trigger_key, "f13")
+        self.assertEqual(self.window.controller.cfg.same_groups, ["shortcut"])
+
+    def test_older_settings_peer_without_layout_capability_shows_group_note(self):
+        self.window._design_peer_caps = lambda: {PEER: {"settings"}}
+
+        self.window._show_same()
+
+        self.assertFalse(self.window.same_old_note.view.isHidden())
 
     def test_full_screen_hold_switch_names_this_macs_edges(self):
         self.assertEqual(self.window.hold_box.words.text, "Hold this Mac's edges while an app on it is full screen")
@@ -147,6 +262,7 @@ class SameOnBothTests(unittest.TestCase):
         self.pair_sources(HIGH)
         raw = settings_store.config_to_raw(self.window.controller.cfg)
         raw["same_on_both"] = True
+        raw["same_groups"] = list(settings_sync.ALL_GROUPS)
         raw["same_set_at"] = 10
         raw["same_by"] = PEER
         raw["design_set_at"] = 20
@@ -171,6 +287,7 @@ class SameOnBothTests(unittest.TestCase):
         self.pair_sources(PEER, HIGH)
         raw = settings_store.config_to_raw(self.window.controller.cfg)
         raw["same_on_both"] = True
+        raw["same_groups"] = list(settings_sync.ALL_GROUPS)
         raw["same_set_at"] = 10
         raw["same_by"] = HIGH
         raw["design_follow_peer"] = PEER
@@ -191,7 +308,8 @@ class SameOnBothTests(unittest.TestCase):
     def test_same_on_all_machines_takes_precedence_without_clearing_following(self):
         self.pair_sources(PEER)
         raw = settings_store.config_to_raw(self.window.controller.cfg)
-        raw.update(design_follow_peer=PEER, same_on_both=True, same_set_at=100)
+        raw.update(design_follow_peer=PEER, same_on_both=True, same_set_at=100,
+                   same_groups=list(settings_sync.ALL_GROUPS))
         self.window.controller.apply_settings(self.store.save(raw))
         received = settings_sync.message_data(
             True, 101, settings_sync.mac_values(raw), by=PEER,
@@ -207,7 +325,8 @@ class SameOnBothTests(unittest.TestCase):
         self.pair_sources(PEER)
         raw = settings_store.config_to_raw(self.window.controller.cfg)
         raw["design_follow_peer"] = PEER
-        raw["crossing"].update(crossing)
+        # A preset set alone would lose to the held slider value when the store resolves them.
+        raw["crossing"].update(settings_sync._with_continuous(crossing))
         self.window.controller.apply_settings(self.store.save(raw))
         self.window._load_shared(raw)
         self.window._refresh_design_follow()
@@ -228,9 +347,8 @@ class SameOnBothTests(unittest.TestCase):
     def test_a_click_on_a_locked_control_changes_nothing_and_keeps_following(self):
         self.follow(effect_length="long")
         self.sent.clear()
-        short = next(cell for value, cell, _words in self.window.length_select.cells if value == "short")
-
-        short.press()
+        slider = self.window.length_select.slider
+        slider.keyDown_(mock.Mock(keyCode=lambda: 124))
         self.window.landing_box.view.press()
 
         self.assertEqual(self.window.length_select.value, "long")
@@ -279,6 +397,8 @@ class SameOnBothTests(unittest.TestCase):
         self.assertEqual(self.window.follow_note.text, cell.toolTip())
 
     def test_the_pcs_settings_arrive_and_this_macs_own_stay(self):
+        local_ways = {peer["id"]: (copy.deepcopy(peer.get("ways")), peer.get("jump_key"))
+                      for peer in self.store.current()["peers"]}
         self.window.apply_same(pc_message(True, 100))
         cfg = self.window.controller.cfg
         self.assertTrue(cfg.same_on_both)
@@ -288,9 +408,9 @@ class SameOnBothTests(unittest.TestCase):
         self.assertEqual(self.store.load().crossing["glow_colour"], "ocean")
         self.assertEqual(self.window.glow_style_select.value, "beam")
         self.assertEqual(self.window.resistance_ruler.value, 60)
-        self.assertTrue(self.window.same_switch.value)
-        self.assertEqual(self.window.scope_labels["crossing"].text,
-                         "Resistance, drag protection and Shortcut stay in step. Ways and jump keys below are local; each side is shared with its paired machine.")
+        self.assertTrue(self.window.same_checks["crossing"].state())
+        self.assertEqual({peer["id"]: (peer.get("ways"), peer.get("jump_key"))
+                          for peer in self.store.current()["peers"]}, local_ways)
 
     def test_arriving_settings_leave_a_half_typed_address_and_the_pairing_card(self):
         self.window.host_field.setStringValue_("192.0.2.99")
@@ -338,6 +458,39 @@ class SameOnBothTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0]["design"]["effect_length"], "short")
 
+    def test_a_shared_change_here_stamps_only_that_value_and_sends_the_stamps(self):
+        self.window._set_same(True)
+        own = self.store.current()["machine_id"]
+        before = dict(self.window.controller.cfg.same_stamps)
+        self.assertEqual(set(before), set(settings_sync.STAMPED_KEYS), "the seed is stored when Same changes")
+        self.sent.clear()
+        self.window.length_select.value = "short"
+        self.window._apply_settings()
+        stamps = self.store.load().same_stamps
+        changed = {key for key in stamps if stamps[key] != before[key]}
+        self.assertEqual(changed, {"effect_length", "effect_pace"})
+        self.assertEqual(stamps["effect_length"][1], own)
+        self.assertGreater(stamps["effect_length"][0], max(stamp for stamp, _by in before.values()))
+        sent = self.sent[-1]
+        self.assertEqual(sent["stamps"]["effect_length"], stamps["effect_length"])
+        self.assertEqual(sent["stamps"]["glow_colour"], before["glow_colour"])
+        self.assertGreaterEqual(sent["set_at"], stamps["effect_length"][0])
+
+    def test_a_change_here_while_off_is_stamped_and_kept_over_an_older_group_value(self):
+        self.window.length_select.value = "short"
+        self.window._apply_settings()
+        stamp = self.window.controller.cfg.same_stamps["effect_length"]
+        self.assertEqual(stamp[1], self.store.current()["machine_id"])
+        self.sent.clear()
+        self.window.apply_same(pc_message(True, 100))
+        cfg = self.window.controller.cfg
+        self.assertTrue(cfg.same_on_both)
+        self.assertEqual(cfg.crossing["effect_length"], "short")
+        self.assertEqual(cfg.crossing["glow_style"], "beam")
+        self.assertEqual(cfg.same_stamps["effect_length"], stamp)
+        self.assertEqual(cfg.same_stamps["glow_style"], [100, ""])
+        self.assertEqual(self.sent[-1]["design"]["effect_length"], "short", "the newer value is answered")
+
     def test_a_design_change_while_off_announces_its_local_design_state(self):
         self.window.length_select.value = "short"
         self.window._apply_settings()
@@ -358,13 +511,76 @@ class SameOnBothTests(unittest.TestCase):
             still.setNeedsDisplay_.assert_called_once_with(True)
         repaint.assert_called_once_with()
 
-    def test_an_old_pc_turns_the_switch_off_and_says_why(self):
+    def test_an_old_pc_keeps_the_picker_enabled_and_shows_the_compatibility_note(self):
         self.window._set_same(True)
         bring_up(self.window.controller, caps=("clipboard",))
         self.assertIs(self.window.controller.peer_settings, False)
         self.window._show_same()
-        self.assertFalse(self.window.same_switch.value)
-        self.assertIn("too old", self.window.same_note.text)
+        self.assertTrue(self.window.same_checks["crossing"].state())
+        self.assertTrue(self.window.same_checks["crossing"].isEnabled())
+        self.assertFalse(self.window.same_old_note.view.isHidden())
+
+    def test_names_only_keeps_design_following_and_local_scope(self):
+        self.pair_sources(PEER)
+        local_resistance = self.window.controller.cfg.crossing["resistance_px"]
+        local_drag_guard = self.window.controller.cfg.crossing["block_while_dragging"]
+        raw = settings_store.config_to_raw(self.window.controller.cfg)
+        raw.update(same_on_both=True, same_groups=["names"], design_follow_peer=PEER)
+        self.window.controller.apply_settings(self.store.save(raw))
+        self.window._design_states[PEER] = {"set_at": 100, "by": PEER, "values": {"effect_length": "long"}}
+        self.window._apply_followed_design(force=True)
+        self.window._show_same()
+        self.assertEqual(self.window.controller.cfg.crossing["effect_length"], "long")
+        self.assertEqual(self.window.controller.cfg.crossing["resistance_px"], local_resistance)
+        self.assertEqual(self.window.controller.cfg.crossing["block_while_dragging"], local_drag_guard)
+        self.assertEqual(self.window.resistance_ruler.value, local_resistance)
+        self.assertEqual(self.window.scope_labels["design"].text, pages.SCOPE["design"])
+        self.assertIn("Names", self.window.same_note.text)
+
+    def test_revert_restores_this_machines_name_and_shares_it(self):
+        self.pair_sources(PEER)
+        own = self.window.own_id()
+        original = self.store.current()["name"]
+        data = settings_sync.message_data(True, 100, by=PEER, groups=["names"],
+            names={own: {"label": "Remote name", "set_at": 100, "by": PEER}})
+        self.window.apply_same(data, peer=PEER)
+        self.assertEqual(self.store.current()["name"], "Remote name")
+        self.window.revertSame_(None)
+        self.assertEqual(self.store.current()["name"], original)
+        self.assertTrue(self.window.controller.cfg.same_on_both)
+        self.assertEqual(self.sent[-1]["names"][own]["label"], original)
+
+    def test_stale_names_policy_cannot_rename_after_names_was_deselected(self):
+        self.pair_sources(PEER)
+        self.window.apply_same(settings_sync.message_data(True, 200, by=PEER, groups=["crossing"]), peer=PEER)
+        self.window.apply_same(settings_sync.message_data(True, 100, by=PEER, groups=["names"],
+            names={PEER: {"label": "Delayed", "set_at": 300, "by": PEER}}), peer=PEER)
+        entry = next(item for item in self.store.current()["peers"] if item["id"] == PEER)
+        self.assertNotEqual(entry.get("label"), "Delayed")
+
+    def test_a_remote_selection_that_drops_design_resumes_the_cached_leader(self):
+        self.pair_sources(PEER, HIGH)
+        raw = settings_store.config_to_raw(self.window.controller.cfg)
+        raw.update(same_on_both=True, same_groups=["design"], same_set_at=10,
+                   design_follow_peer=PEER)
+        self.window.controller.apply_settings(self.store.save(raw))
+        self.window._design_states[PEER] = {"set_at": 100, "by": PEER, "values": {"effect_length": "long"}}
+        self.window._followed_version = (PEER, 100, PEER)
+        self.window.apply_same(settings_sync.message_data(True, 11, by=HIGH, groups=["names"]), peer=HIGH)
+        self.assertEqual(self.window.controller.cfg.crossing["effect_length"], "long")
+
+    def test_selection_only_revert_keeps_a_later_local_design_edit(self):
+        self.pair_sources(PEER)
+        raw = settings_store.config_to_raw(self.window.controller.cfg)
+        raw.update(same_on_both=True, same_groups=["crossing"], same_set_at=10)
+        self.window.controller.apply_settings(self.store.save(raw))
+        self.window.apply_same(settings_sync.message_data(True, 11, by=PEER, groups=["design"]), peer=PEER)
+        raw = settings_store.config_to_raw(self.window.controller.cfg)
+        raw["crossing"]["glow_colour"] = "ocean"
+        self.window.controller.apply_settings(self.store.save(raw))
+        self.window.revertSame_(None)
+        self.assertEqual(self.window.controller.cfg.same_groups, ["crossing"])
+        self.assertEqual(self.window.controller.cfg.crossing["glow_colour"], "ocean")
 
     def test_a_peers_same_state_is_forwarded_with_this_macs_own_design_state(self):
         self.pair_sources(PEER)

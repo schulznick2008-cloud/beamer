@@ -14,6 +14,7 @@ Main thread only. A failing preview disables itself as the real renderer does; n
 
 import time
 import types
+import math
 
 import AppKit
 import Quartz
@@ -22,10 +23,12 @@ import objc
 import crossing
 from core import effects
 import effects_overlay
+from frame_clock import PREVIEW_MAX_RATE, FrameClock
 import motion
 import notch_beam
 import notch_island
 import theme
+import tokens
 
 PUSH_S = 1.8
 REST_S = 1.0
@@ -135,6 +138,180 @@ def hosted_notch(base):
     return HostedNotch
 
 
+class HostedNotchScene(effects_overlay.EffectsCanvas):
+    """A complete notch crossing with the real hosted NotchBeam or NotchIsland layer tree."""
+
+    @objc.python_method
+    def setup(self, base, controller, logger, style, colour, notch):
+        self.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        self.widthAnchor().constraintEqualToAnchor_multiplier_(self.heightAnchor(), 2.0).setActive_(True)
+        self.setWantsLayer_(True)
+        self.layer().setCornerRadius_(theme.RADIUS["field"])
+        self.layer().setMasksToBounds_(True)
+        self.logger = logger
+        self.playing_since = None
+        self.style = style
+        self.colour = colour
+        self.notch = notch
+        self.controller = controller
+        self.still_at = 1.9
+        self.after = lambda: controller.cfg.crossing.get("notch_after_ms", 1200) / 1000.0
+        self.feed = PreviewFeed(controller, glow_colour=colour(), notch_style=style)
+        self.renderer = hosted_notch(base)(self.feed, logger, self._layer_host(notch))
+        self.renderer._show()
+        self.stage = self.renderer.screen.stage
+        self.stage.removeFromSuperlayer()
+        with notch_island._no_actions():
+            self.stage.setAnchorPoint_((0.0, 0.0))
+            self.stage.setPosition_((0.0, 0.0))
+            self.stage.setAffineTransform_(Quartz.CGAffineTransformIdentity)
+        self.painter = lambda ctx, width, height: self.paint_frame(ctx, width, height, self._time(),
+                                                                   self._live())
+        return self
+
+    @staticmethod
+    def _layer_host(notch):
+        host = PreviewScreen.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 600, 540))
+        host.setup(notch)
+        host.setFrame_(AppKit.NSMakeRect(0, 0, 600, 540))
+        host.arrange()
+        return host
+
+    @objc.python_method
+    def _time(self):
+        since = self.playing_since
+        elapsed = None if since is None else time.monotonic() - since
+        return effects.preview_time(self.still_at, elapsed, effects_overlay.reduce_motion())
+
+    @objc.python_method
+    def _live(self):
+        return (self.playing_since is not None and time.monotonic() >= self.playing_since
+                and not effects_overlay.reduce_motion())
+
+    @objc.python_method
+    def paint_frame(self, ctx, width, height, at=None, live=False):
+        """Paint a deterministic frame; callers may supply `t` for offline judging renders."""
+        t = self._time() if at is None else at
+        t %= effects.PREVIEW_LOOP_S
+        current_colour = self.colour()
+        dark = theme.is_dark()
+        feel = self.controller.cfg.crossing
+        pace = feel.get("effect_pace", effects.pace(feel.get("effect_length")))
+        size = feel.get("effect_size", "medium")
+        size_fraction = feel.get("effect_size_fraction")
+        fx = effects.preview_effect("glow")
+        crop = effects.still_view(fx, "notch", size, pace, size_fraction)
+        scene = effects.preview_still_scene(fx, t, "notch", effects_overlay.palette(current_colour),
+                                            dark=dark, pace=pace, effect_size=size, live=live,
+                                            view_width=crop[2], effect_size_fraction=size_fraction,
+                                            notch_geometry=self.notch)
+        scene["pens"] = []
+        effects_overlay.draw_scene(Quartz, ctx, scene, width, height, "notch", dark, crop=crop, pointer=11.0)
+        self._set_renderer_frame(t, current_colour, dark)
+        x, y, w, h, _radius = scene["notch"]
+        stage_bounds = self.stage.bounds()
+        stage_width = stage_bounds.size.width
+        scene_w, scene_h = crop[2:]
+        scale = min(width / scene_w, height / scene_h)
+        Quartz.CGContextSaveGState(ctx)
+        try:
+            Quartz.CGContextTranslateCTM(ctx, (width - scene_w * scale) / 2.0,
+                                          (height - scene_h * scale) / 2.0)
+            Quartz.CGContextScaleCTM(ctx, scale, scale)
+            Quartz.CGContextTranslateCTM(ctx, -crop[0], -crop[1])
+            Quartz.CGContextClipToRect(ctx, ((crop[0], crop[1]), (scene_w, scene_h)))
+            Quartz.CGContextTranslateCTM(ctx, x + w / 2.0 - stage_width / 2.0, y)
+            self.stage.renderInContext_(ctx)
+        finally:
+            Quartz.CGContextRestoreGState(ctx)
+
+    @objc.python_method
+    def _set_renderer_frame(self, t, colour, dark):
+        """Set the existing renderer's layers directly from the shared crossing clock."""
+        renderer = self.renderer
+        push_start, cross_at = effects._P_PUSH, effects._P_CROSS
+        after = self.after()
+        pressure_end = cross_at
+        if t < push_start:
+            level, flash, elapsed = 0.0, 0.0, 0.0
+        elif t < pressure_end:
+            u = min(1.0, max(0.0, (t - push_start) / (pressure_end - push_start)))
+            level, flash, elapsed = (1.0 - math.cos(math.pi * u)) / 2.0, 0.0, 0.0
+        else:
+            elapsed = t - cross_at
+            phase = notch_island.breakthrough_phase(elapsed, after)
+            level, flash = (1.0, phase[1]) if phase is not None else (0.0, 0.0)
+        if isinstance(renderer, notch_beam.NotchBeam):
+            self._set_beam_frame(renderer, level, flash, elapsed, colour, dark, after, t)
+        else:
+            self._set_island_frame(renderer, level, flash, elapsed, after)
+
+    @staticmethod
+    def _set_beam_frame(renderer, level, flash, elapsed, colour, dark, after, t):
+        base = notch_beam.LAP * 0.3
+        if t < effects._P_CROSS:
+            position = (base + notch_beam.LAP * max(0.0, t - effects._P_PUSH)
+                        / notch_beam.turn_seconds(level)) % notch_beam.LAP
+        else:
+            crossed = (base + notch_beam.LAP * (effects._P_CROSS - effects._P_PUSH)
+                       / notch_beam.turn_seconds(1.0)) % notch_beam.LAP
+            travel = notch_beam.lap_finish(crossed, after)
+            position = (crossed + travel * notch_island.ease_out(elapsed / max(after, 0.001))) % notch_beam.LAP
+        spans = notch_beam.comet_segments(position)
+        with notch_island._no_actions():
+            for gradient in renderer.gradients:
+                gradient.setColors_(notch_beam.palette_colours(colour, closed=True, dark=dark))
+            for segments in renderer.comets:
+                for layer, (start, end) in zip(segments, spans):
+                    layer.setHidden_(end - start < 0.002)
+                    layer.setStrokeStart_(start)
+                    layer.setStrokeEnd_(end)
+            renderer.island.setOpacity_(min(1.0, level * 20.0))
+            renderer.beam.setOpacity_(min(1.0, level + flash))
+            renderer.bloom.setOpacity_(min(1.0, level * 0.8 + flash * 0.6))
+            renderer.halo.setOpacity_(max(0.0, 1.0 - elapsed / notch_beam.HALO_S) * 0.9 if elapsed > 0 else 0.0)
+
+    @staticmethod
+    def _set_island_frame(renderer, level, flash, elapsed, after):
+        grow_w = level * tokens.ISLAND["grow_width"]
+        grow_d = level * tokens.ISLAND["grow_depth"]
+        with notch_island._no_actions():
+            renderer.island.removeAllAnimations()
+            renderer.rim.removeAllAnimations()
+            renderer.island.setPath_(renderer._island_path(grow_w, grow_d))
+            renderer.rim.setPath_(renderer._rim_path(grow_w, grow_d))
+            renderer.trace.setPath_(renderer._rim_path(grow_w, grow_d))
+            renderer.island.setOpacity_(1.0 if level > 0.0 else 0.0)
+            renderer.rim.setStrokeColor_(notch_island._colour(notch_island.FLASH_RIM) if flash else
+                                          notch_island._colour("signal"))
+            renderer.rim.setOpacity_(min(1.0, 0.25 + level * 0.9 + flash) if level or flash else 0.0)
+            renderer.rim.setShadowOpacity_(min(1.0, level * 0.75 + flash))
+            renderer.rim.setShadowRadius_(7.0 + flash * 7.0)
+            if elapsed > 0.0:
+                progress = min(1.0, elapsed / max(after, 0.001))
+                head = notch_island.trace_head(progress, after)
+                renderer.trace.setStrokeStart_(max(0.0, head - notch_island.TRACE_LENGTH))
+                renderer.trace.setStrokeEnd_(min(1.0, head))
+                renderer.trace.setOpacity_(1.0)
+            else:
+                renderer.trace.setOpacity_(0.0)
+            meter = max(0.0, min(1.0, (grow_d - tokens.ISLAND["meter_after_depth"]) / 8.0))
+            renderer._set_meter(level, meter)
+            renderer.meter.setOpacity_(meter)
+
+
+def notch_crossing_still(base, colour, logger, controller=None, notch=None):
+    """A notch style tile backed by its real renderer and the shared two-screen crossing scene."""
+    if controller is None:
+        cfg = types.SimpleNamespace(crossing={"notch_after_ms": 1200, "glow_colour": colour()})
+        controller = types.SimpleNamespace(cfg=cfg)
+    style = "beam" if issubclass(base, notch_beam.NotchBeam) else "island"
+    view = HostedNotchScene.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 1, 1))
+    if notch is None:
+        notch = (effects.PREVIEW_NOTCH["w"], effects.PREVIEW_NOTCH["h"])
+    return view.setup(base, controller, logger, style, colour, notch)
+
+
 def hosted_edge(base):
     """The app's EdgeGlow, drawing its band along the right side of a PreviewScreen."""
 
@@ -232,13 +409,7 @@ class PreviewScreen(AppKit.NSView):
             Quartz.CATransaction.commit()
 
 
-FRAME_RATE = 60
 HOVER_INTENT_S = 0.1
-
-
-class _Fire(AppKit.NSObject):
-    def fire_(self, _sender):
-        self.callback()
 
 
 def on_screen(view):
@@ -251,45 +422,6 @@ def on_screen(view):
         return False
     visible = view.visibleRect()
     return visible.size.width > 0 and visible.size.height > 0
-
-
-class FrameClock:
-    """Calls `callback()` once a frame, timed to `view`'s display at up to FRAME_RATE where macOS
-    offers a view's display link (14 and later), else by a timer. Either runs in the common run loop
-    modes, as a default-mode timer, rumps.Timer's, stops dead while the page scrolls or a slider is
-    dragged and then jumps."""
-
-    def __init__(self, view, callback):
-        self.view = view
-        self.callback = callback
-        self.source = None
-
-    def start(self):
-        if self.source is not None:
-            return
-        target = _Fire.alloc().init()
-        target.callback = self.callback
-        runloop = AppKit.NSRunLoop.mainRunLoop()
-        if self.view.window() is not None and hasattr(self.view, "displayLinkWithTarget_selector_"):
-            link = self.view.displayLinkWithTarget_selector_(target, "fire:")
-            # 60 on a 120Hz panel lands every other refresh, evenly, where a timer beats against it.
-            link.setPreferredFrameRateRange_(Quartz.CAFrameRateRangeMake(30, FRAME_RATE, FRAME_RATE))
-            link.addToRunLoop_forMode_(runloop, AppKit.NSRunLoopCommonModes)
-            self.source = link
-        else:
-            timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-                1.0 / FRAME_RATE, target, "fire:", None, True
-            )
-            runloop.addTimer_forMode_(timer, AppKit.NSRunLoopCommonModes)
-            self.source = timer
-
-    def stop(self):
-        source, self.source = self.source, None
-        if source is not None:
-            source.invalidate()
-
-    def is_alive(self):
-        return self.source is not None
 
 
 class PreviewLoop:
@@ -308,16 +440,16 @@ class PreviewLoop:
         self.resting = ()
         self.hovered = None
         self.hovered_at = 0.0
-        self.clock = None if host is None else FrameClock(host, self._tick)
+        self.clock = None if host is None else FrameClock(host, self._tick, PREVIEW_MAX_RATE)
 
     def add(self, feed, renderer, update, screen):
         """`update(kind, pressure)` passes an event to `renderer` the way the app's crossing
         feedback would. The renderer's own timer is swapped for a FrameClock on `screen`."""
-        renderer.timer = FrameClock(screen, lambda: renderer._tick(None))
+        renderer.timer = FrameClock(screen, lambda: renderer._tick(None), PREVIEW_MAX_RATE)
         self.players.append(types.SimpleNamespace(feed=feed, renderer=renderer, update=update, screen=screen,
                                                   started_at=None, phase=None, quarter=0))
         if self.clock is None:
-            self.clock = FrameClock(screen, self._tick)
+            self.clock = FrameClock(screen, self._tick, PREVIEW_MAX_RATE)
 
     def owns(self, view):
         return any(player.screen is view for player in self.players)
@@ -329,14 +461,34 @@ class PreviewLoop:
         """`view` is the preview of the tile under the pointer, one of this loop's or not, or None."""
         self.hovered = view
         self.hovered_at = time.monotonic()
+        # Under Reduce Motion nothing plays, so the clock has nothing to drive.
+        if self.running and self.owns(view) and self.clock is not None and not effects_overlay.reduce_motion():
+            self.clock.start()
 
     def start(self):
         if self.running:
+            self.sync_clock()
             return
         self.running = True
         self.repaint()
-        if self.clock is not None:
+        if self.owns(self.hovered) and self.clock is not None:
             self.clock.start()
+
+    def sync_clock(self):
+        if self.clock is None:
+            return
+        wanted = (self.running and not effects_overlay.reduce_motion()
+                  and any(on_screen(player.screen) and
+                          (player.screen is self.hovered or player.screen in self.resting)
+                          for player in self.players))
+        if wanted:
+            self.clock.start()
+        else:
+            for player in self.players:
+                if player.started_at is not None:
+                    player.started_at = None
+                    self._hold(player)
+            self.clock.stop()
 
     def stop(self):
         if not self.running:
@@ -421,6 +573,7 @@ class PreviewLoop:
                 player.update("cross", 1.0)
             elif phase == "push" and level > 0.0:
                 player.update("tick" if ticked else "pressure", level)
+        self.sync_clock()
 
 
 class TileStack(AppKit.NSView):
@@ -475,9 +628,8 @@ class _HoverOwner(AppKit.NSObject):
 
 
 class TileHover:
-    """The one tile under the pointer plays its animation and settles back to its still when the
-    pointer leaves; under Reduce Motion it keeps its still. A crossing effect's still plays on from
-    the frame it shows, so the tile starts without a jump."""
+    """The hovered tile plays after intent and restores its still on leaving. Crossings begin
+    with approach; shortcut arrivals resume their still. Reduce Motion keeps the still."""
 
     def __init__(self, loop):
         self.loop = loop
@@ -510,8 +662,21 @@ class TileHover:
             return
         # A pointer passing over on its way elsewhere leaves the tiles it crosses still.
         target.playing_since = time.monotonic() + HOVER_INTENT_S
-        self.clock = FrameClock(target, lambda: target.setNeedsDisplay_(True))
+        self.clock = FrameClock(target, self._tick, PREVIEW_MAX_RATE)
         self.clock.start()
+
+    def sync_clock(self):
+        if self.clock is None:
+            return
+        if on_screen(self.target) and not effects_overlay.reduce_motion():
+            self.clock.start()
+        else:
+            self.clock.stop()
+
+    def _tick(self):
+        self.sync_clock()
+        if self.clock is not None and self.clock.is_alive():
+            self.target.setNeedsDisplay_(True)
 
     def leave(self, preview):
         if preview is self.current:
@@ -541,27 +706,24 @@ def notch_update(renderer):
 
 # The crossing effects' previews: effects.preview_scene drawn by effects_overlay.draw_scene, the same
 # replay the overlay uses on screen. Every tile shows one still frame at the place the page's Show at
-# chooses, and plays on from it while TileHover says the pointer is over it; nothing else animates.
-# The still is part way into the push, where every style shows.
-STILL_AT_S = 1.7
-# The part of the scene a tile shows at each place, centred on where the pointer pushes so the
-# departure fills the tile: the Mac's right-hand side, the gap and the PC's left edge; the Mac's
-# top right corner with room above it; the notch and the Mac's screen under it, where the forms play.
-STILL_CROPS = {"edge": (620.0, 142.0, 240.0, 120.0), "corner": (680.0, -50.0, 240.0, 120.0),
-               "notch": (220.0, 470.0, 360.0, 180.0)}
+# chooses, and plays the full journey while TileHover says the pointer is over it.
 STAGE_METHODS = (("edge", "Edge"), ("corner", "Corner"), ("notch", "Notch"))
-SWITCH_STILL_CROP = (248.0, 138.0, 240.0, 120.0)
-SWITCH_STILL_AT_S = 0.6
 
 
-def _played(view, still_at):
-    """The time into its loop a tile draws: its still, or on from it while it plays."""
+def _played(view, still_at, switch=False):
+    """Crossings start at approach; shortcut arrivals resume their specimen frame."""
     since = view.playing_since
-    return still_at if since is None else still_at + max(0.0, time.monotonic() - since)
+    return effects.preview_time(still_at, None if since is None else time.monotonic() - since,
+                                effects_overlay.reduce_motion(), switch=switch)
+
+
+def _live(view):
+    return (view.playing_since is not None and time.monotonic() >= view.playing_since
+            and not effects_overlay.reduce_motion())
 
 
 def effect_still(effect_id, colour, logger, height=84, place=lambda: "edge", pace=lambda: 1.0,
-                 effect_size=lambda: "medium"):
+                 effect_size=lambda: "medium", effect_size_fraction=lambda: None):
     """A tile's still frame of `effect_id`, in the selected colour, place, length and size."""
     view = effects_overlay.EffectsCanvas.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 1, 1))
     view.setTranslatesAutoresizingMaskIntoConstraints_(False)
@@ -569,8 +731,7 @@ def effect_still(effect_id, colour, logger, height=84, place=lambda: "edge", pac
     view.setWantsLayer_(True)
     view.layer().setCornerRadius_(theme.RADIUS["field"])
     view.layer().setMasksToBounds_(True)
-    view.layer().setBorderWidth_(1)
-    theme.tint(view.layer(), border="rule")
+    view.layer().setBorderWidth_(0)
     view.logger = logger
     view.playing_since = None
 
@@ -578,29 +739,37 @@ def effect_still(effect_id, colour, logger, height=84, place=lambda: "edge", pac
         fx = effects.preview_effect(effect_id)
         dark = theme.is_dark()
         where = place()
-        # Beam's comet crosses the cropped pointer at this time; the common still puts it off-tile.
-        held_at = 1.45 if effect_id == "beam" and where == "edge" else STILL_AT_S
-        scene = effects.preview_scene(fx, _played(view, held_at), where, effects_overlay.palette(colour()), dark=dark,
-                                      pace=pace(), effect_size=effect_size())
-        # A small pointer, so the effect rather than the arrow is what a tile shows.
-        # A desktop-scale thin line would disappear below one pixel in the common crop.
-        crop = (730.0, 172.5, 120.0, 60.0) if effect_id == "beam" and where == "edge" else STILL_CROPS[where]
+        current_pace, current_size, size_fraction = pace(), effect_size(), effect_size_fraction()
+        held_at = effects.still_time(fx, where, current_size, current_pace, size_fraction)
+        crop = effects.still_view(fx, where, current_size, current_pace, size_fraction)
+        scene = effects.preview_still_scene(
+            fx, _played(view, held_at), where, effects_overlay.palette(colour()), dark=dark,
+            pace=current_pace, effect_size=current_size, live=_live(view), view_width=crop[2],
+            effect_size_fraction=size_fraction)
         effects_overlay.draw_scene(Quartz, ctx, scene, width, height, where, dark, crop=crop, pointer=11.0)
 
     view.painter = paint
     return view
 
 
-def switch_still(fx, colour, logger, height=84, pace=lambda: 1.0, effect_size=lambda: "medium"):
+def switch_still(fx, colour, logger, height=84, pace=lambda: 1.0, effect_size=lambda: "medium",
+                 effect_size_fraction=lambda: None):
     """A tile's still frame of what a switch plays: `fx()` is the Effect, asked when it draws, since
     Same as crossing follows the crossing style."""
     view = effect_still(None, colour, logger, height)
 
     def paint(ctx, width, height):
         dark = theme.is_dark()
-        scene = effects.preview_switch_scene(fx(), _played(view, SWITCH_STILL_AT_S), effects_overlay.palette(colour()),
-                                             dark=dark, pace=pace(), effect_size=effect_size())
-        effects_overlay.draw_scene(Quartz, ctx, scene, width, height, "switch", dark, crop=SWITCH_STILL_CROP, pointer=11.0)
+        effect = fx()
+        current_pace, current_size, size_fraction = pace(), effect_size(), effect_size_fraction()
+        t = _played(view, effects.still_time(effect, "switch", current_size, current_pace, size_fraction), switch=True)
+        crop = effects.still_view(effect, "switch", current_size, current_pace, size_fraction)
+        scene = effects.preview_still_scene(
+            effect, t, "switch", effects_overlay.palette(colour()), dark=dark, pace=current_pace,
+            effect_size=current_size, live=_live(view), view_width=crop[2],
+            effect_size_fraction=size_fraction)
+        effects_overlay.draw_scene(Quartz, ctx, scene, width, height, "switch", dark,
+                                   crop=crop, pointer=11.0)
 
     view.painter = paint
     return view

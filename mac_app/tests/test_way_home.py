@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import settings_store
 from bridge import KVMController
 from bridge_fakes import PAIRED_TOKEN, FakeClipboard, FakeQuartz, quiet_logger
-from core import protocol, receiver, return_edge
+from core import protocol, receiver, return_edge, ways
 from core.tests import responder_harness as harness
 from windows_input import WindowsInput
 
@@ -145,6 +145,11 @@ class ChangesReachTheArmedZonesTests(unittest.TestCase):
     """A real responder with a peer driving this Mac: the zones armed for it follow the settings."""
 
     def setUp(self):
+        # These tests push the moment input lands; the arrival grace is test_arrival_grace's
+        # subject, not theirs.
+        grace = mock.patch.object(return_edge, "ARRIVAL_GRACE_SECONDS", 0.0)
+        grace.start()
+        self.addCleanup(grace.stop)
         folder = Path(tempfile.mkdtemp())
         self.store = settings_store.SettingsStore(folder / "settings.json")
         cfg = self.store.load()
@@ -187,6 +192,11 @@ class ChangesReachTheArmedZonesTests(unittest.TestCase):
         settings = self.store.current()
         settings["peers"][0].update(id=PEER_TEXT, side="right", send=False, from_1_4=False)
         settings["zones"] = zones(methods, parts, corner)
+        settings["peers"][0]["ways"] = {
+            "edge": bool(set(methods) & {"edge", "part"}),
+            "thirds": list(ways.PARTS) if "edge" in methods else list(parts),
+            "corner": "corner" in methods, "corner_at": corner, "notch": "notch" in methods,
+        }
         self.store.save_settings(settings)
 
     def armed(self):

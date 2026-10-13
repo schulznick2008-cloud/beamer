@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass, field
 
-from core import effects
+from core import effects, settings_sync
 from crossing import DEFAULT_CROSSING
 
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -81,9 +81,13 @@ class Config:
     # seconds of the last change to that or to a shared value; see settings_sync.
     same_on_both: bool = False
     same_set_at: int = 0
+    same_groups: list = field(default_factory=list)
     # Who made the change the stamp above is for, as a machine id: the tie-break between two ends
     # that changed it in the same second (WIRE.md section 10).
     same_by: str = ""
+    # Each shared value's own (set_at, by) as `{key: [set_at, by]}`, so an edit carries only what a
+    # person changed (settings_sync.held_stamps; rc14, 10-10-2026).
+    same_stamps: dict = field(default_factory=dict)
     design_set_at: int = 0
     design_by: str = ""
     design_follow_peer: str = ""
@@ -99,6 +103,15 @@ class Config:
 def _stamp(value) -> int:
     """A saved unix-seconds stamp, or 0 for anything that is not one."""
     return int(value) if not isinstance(value, bool) and isinstance(value, (int, float)) and value > 0 else 0
+
+
+def _same_stamps(value) -> dict:
+    """The saved per-value stamps, keeping only well-formed pairs for keys that are shared."""
+    if not isinstance(value, dict):
+        return {}
+    pairs = {key: settings_sync._stamp_pair(value.get(key), now=settings_sync.MAX_STAMP)
+             for key in settings_sync.STAMPED_KEYS}
+    return settings_sync.stored_stamps({key: pair for key, pair in pairs.items() if pair is not None})
 
 
 def key_map_style(key_map):
@@ -124,6 +137,10 @@ def load_config(path: str = None) -> Config:
 
 def parse_config(raw: dict) -> Config:
     """A Config from a dict in config.json's shape, the one settings_store hands over from settings.json."""
+    groups = raw.get("same_groups", ["crossing", "design", "shortcut", "names"]
+                    if raw.get("same_on_both", False) else [])
+    if not isinstance(groups, list) or any(group not in ("crossing", "design", "shortcut", "names") for group in groups):
+        raise ConfigError("same_groups must contain known group names")
     missing = [k for k in ("host", "port", "auth_token") if k not in raw]
     if missing:
         raise ConfigError(f"config.json is missing required field(s): {', '.join(missing)}")
@@ -152,6 +169,16 @@ def parse_config(raw: dict) -> Config:
     if not isinstance(saved_crossing, dict):
         raise ConfigError("config.json crossing must be a JSON object")
     crossing.update(saved_crossing)
+    if crossing.get("shortcut_goes_to") not in ("last", "next", "ticked"):
+        crossing["shortcut_goes_to"] = "last"
+    (crossing["effect_pace"], crossing["effect_size_fraction"],
+     crossing["effect_length"], crossing["effect_size"]) = effects.design_values(
+        saved_crossing.get("effect_pace"), saved_crossing.get("effect_size_fraction"),
+        saved_crossing.get("effect_length"), saved_crossing.get("effect_size"))
+    # Normalising would quietly replace a preset that is not one; the store's validation refuses it.
+    for name, presets in (("effect_length", effects.LENGTHS), ("effect_size", effects.SIZES)):
+        if name in saved_crossing and saved_crossing[name] not in {value for value, _label in presets}:
+            crossing[name] = saved_crossing[name]
     crossing["glow_style"], crossing["glow_colour"], crossing["shortcut_arrival_style"] = effects.offered(
         crossing["glow_style"], crossing["glow_colour"], crossing["shortcut_arrival_style"])
     crossing["methods"] = list(crossing["methods"])
@@ -178,7 +205,9 @@ def parse_config(raw: dict) -> Config:
         hide_addresses=raw.get("hide_addresses", False) is True,
         same_on_both=raw.get("same_on_both", False) is True,
         same_set_at=_stamp(raw.get("same_set_at", 0)),
+        same_groups=groups,
         same_by=str(raw.get("same_by", "") or ""),
+        same_stamps=_same_stamps(raw.get("same_stamps")),
         design_set_at=_stamp(raw.get("design_set_at", 0)),
         design_by=str(raw.get("design_by", "") or ""),
         design_follow_peer=str(raw.get("design_follow_peer", "") or ""),

@@ -184,6 +184,12 @@ class TakingTests(unittest.TestCase):
         self.assertEqual(focus["route"], 1)
         self.assertEqual(self.rig.redirects, [True])
 
+    def test_a_link_ending_after_an_ack_stall_returns_pc_input_home(self):
+        self.assertTrue(self.sender.set_redirecting(True))
+        self.rig.drop(B)
+        self.assertFalse(self.sender.redirecting)
+        self.assertEqual(self.rig.redirects[-1], False)
+
     def test_the_clipboard_follows_the_take_and_goes_before_any_input(self):
         self.sender.set_redirecting(True)
         self.sender.on_key("a", True, 0x41, "a")
@@ -524,13 +530,89 @@ class KeyTests(unittest.TestCase):
 
     def test_the_windows_key_goes_to_a_mac_as_ctrl_in_the_semantic_style(self):
         self.sender.on_key("ctrl", True, 0x5B)
-        self.assertEqual(self.keys(), [("keydown", "ctrl")])
+        self.assertEqual(self.keys(), [])
+        self.sender.on_key("ctrl", False, 0x5B)
+        self.assertEqual(self.keys(), [("keydown", "ctrl"), ("keyup", "ctrl")])
+
+    def test_a_click_or_scroll_with_the_windows_key_down_carries_it_as_the_mac_modifier(self):
+        def sent():
+            return [m["type"] for m in self.rig.sent(B)
+                    if m["type"] in ("keydown", "keyup", "mousedown", "mouseup", "scroll")]
+
+        self.sender.on_key("ctrl", True, 0x5B)
+        self.sender.on_button("left", True)
+        self.assertEqual(sent(), ["keydown", "mousedown"])
+        self.sender.on_button("left", False)
+        self.sender.on_key("ctrl", False, 0x5B)
+        self.assertEqual(sent()[2:], ["mouseup", "keyup"])
+        self.sender.on_key("ctrl", True, 0x5B)
+        self.sender.on_wheel(1, 0)
+        self.assertEqual(sent()[4:], ["keydown", "scroll"])
+
+    def test_windows_key_after_click_can_be_used_for_a_shortcut_without_sticking(self):
+        self.sender.on_key("ctrl", True, 0x5B)
+        self.sender.on_button("left", True)
+        self.sender.on_button("left", False)
+        self.sender.on_key("s", True, 0x53, "s")
+        self.sender.on_key("s", False, 0x53, "s")
+        self.sender.on_key("ctrl", False, 0x5B)
+        self.assertEqual(self.keys(), [
+            ("keydown", "ctrl"), ("keyup", "ctrl"),
+            ("keydown", "spotlight"), ("keyup", "spotlight"),
+        ])
+
+    def test_windows_search_and_dictation_shortcuts_become_mac_intents(self):
+        for vk, key in ((0x53, "s"), (0x48, "h")):
+            self.sender.on_key("ctrl", True, 0x5B)
+            self.sender.on_key(key, True, vk, key)
+            self.sender.on_key(key, False, vk, key)
+            self.sender.on_key("ctrl", False, 0x5B)
+        self.assertEqual(self.keys(), [
+            ("keydown", "spotlight"), ("keyup", "spotlight"),
+            ("keydown", "dictation"), ("keyup", "dictation"),
+        ])
+
+    def test_right_windows_key_shortcuts_become_mac_intents(self):
+        self.sender.on_key("ctrl_r", True, 0x5C)
+        self.sender.on_key("s", True, 0x53, "s")
+        self.sender.on_key("s", False, 0x53, "s")
+        self.sender.on_key("ctrl_r", False, 0x5C)
+        self.assertEqual(self.keys(), [("keydown", "spotlight"), ("keyup", "spotlight")])
+
+    def test_windows_shortcuts_map_safely_to_linux_or_are_dropped(self):
+        self.rig = Rig(entries=[harness.entry(B, "Linux", platform="linux", side="left")])
+        self.sender = self.rig.sender
+        self.sender.set_redirecting(True)
+        self.rig.accept_take()
+        for key, vk in (("s", 0x53), ("h", 0x48), ("n", 0x4E)):
+            self.sender.on_key("ctrl", True, 0x5B)
+            self.sender.on_key(key, True, vk, key)
+            self.sender.on_key(key, False, vk, key)
+            self.sender.on_key("ctrl", False, 0x5B)
+        self.assertEqual(self.keys(), [("keydown", "spotlight"), ("keyup", "spotlight")])
+
+    def test_windows_notifications_shortcut_is_dropped_instead_of_becoming_control_n(self):
+        self.sender.on_key("ctrl", True, 0x5B)
+        self.sender.on_key("n", True, 0x4E, "n")
+        self.sender.on_key("n", False, 0x4E, "n")
+        self.sender.on_key("ctrl", False, 0x5B)
+        self.assertEqual(self.keys(), [])
+
+    def test_windows_shift_search_remains_a_physical_shortcut(self):
+        self.sender.on_key("ctrl", True, 0x5B)
+        self.sender.on_key("shift", True, 0xA0)
+        self.sender.on_key("S", True, 0x53, "s")
+        self.sender.on_key("S", False, 0x53, "s")
+        self.sender.on_key("shift", False, 0xA0)
+        self.sender.on_key("ctrl", False, 0x5B)
+        self.assertNotIn(("keydown", "spotlight"), self.keys())
 
     def test_positional_keeps_each_key_in_its_place(self):
         self.sender.update_config(make_config(modifier_style="positional"))
         self.sender.on_key("cmd", True, 0xA2)
         self.sender.on_key("ctrl", True, 0x5B)
-        self.assertEqual(self.keys(), [("keydown", "ctrl"), ("keydown", "cmd")])
+        self.sender.on_key("ctrl", False, 0x5B)
+        self.assertEqual(self.keys(), [("keydown", "ctrl"), ("keydown", "cmd"), ("keyup", "cmd")])
 
     def test_mac_layout_sends_both_sides_of_each_modifier_to_the_mac_key(self):
         self.sender.update_config(make_config(modifier_style="mac_layout"))

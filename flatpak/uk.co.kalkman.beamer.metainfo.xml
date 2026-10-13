@@ -2,17 +2,55 @@
 <component type="desktop-application">
   <id>uk.co.kalkman.beamer</id>
   <name>Beamer</name>
-  <summary>Share one keyboard and mouse between your computers</summary>
+  <summary>Share input across computers</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-only</project_license>
   <developer id="uk.co.kalkmancode"><name>Kalkman Code</name></developer>
   <description>
-    <p>Beamer shares your keyboard, mouse and clipboard between paired computers on your network. Move through a screen edge to control another computer.</p>
-    <p>On Linux, Beamer uses the desktop's input capture, remote desktop and clipboard portals on Wayland, or X11. Wayland support depends on the portals your desktop provides. Crossing effects are unavailable on Wayland.</p>
+    <p>Use one keyboard and mouse across paired computers on your local network. Push the pointer through a screen edge or use a shortcut to switch machines, and take the clipboard with you.</p>
+    <p>On Wayland, the desktop controls input capture. Beamer can send input out when the pointer crosses an edge, but its shortcut only brings input back. It cannot hold an edge for a full-screen app, keep selected keys on the Linux computer while input is away, or draw crossing effects at the Linux screen edge.</p>
+    <p>On X11, Beamer can send and receive input across paired computers, including keyboard, pointer and clipboard. The Linux build has been tested on Fedora 44 with GNOME 50 under Wayland; X11 on real hardware and KDE Plasma have not been tested.</p>
   </description>
   <launchable type="desktop-id">uk.co.kalkman.beamer.desktop</launchable>
   <url type="homepage">https://kalkmancode.co.uk/beamer</url>
   <url type="bugtracker">https://github.com/kalkman-code/beamer/issues</url>
+  <url type="vcs-browser">https://github.com/kalkman-code/beamer</url>
+  <url type="contribute">https://github.com/kalkman-code/beamer/blob/v1.5.2/CONTRIBUTING.md</url>
+  <branding>
+    <color type="primary" scheme_preference="light">#006a88</color>
+    <color type="primary" scheme_preference="dark">#5fd4f4</color>
+  </branding>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <recommends>
+    <display_length compare="ge">768</display_length>
+  </recommends>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/kalkman-code/beamer/v1.5.2/assets/linux-overview.png</image>
+      <caption>See which machine has input and manage paired computers</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/kalkman-code/beamer/v1.5.2/assets/linux-crossing.png</image>
+      <caption>Choose where input crosses between screens</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/kalkman-code/beamer/v1.5.2/assets/linux-design.png</image>
+      <caption>Choose crossing styles and colours for screen edges and machine hand-offs</caption>
+    </screenshot>
+  </screenshots>
   <content_rating type="oars-1.1"/>
-  <releases><release version="@VERSION@" timestamp="@TIMESTAMP@"/></releases>
+  <releases>
+    <release version="1.5.2" date="2026-10-08">
+      <description><p>Adds the shared desk map, granular settings, dormant pairing repair and Linux crossing effects.</p></description>
+    </release>
+    <release version="1.5.1" date="2026-10-06">
+      <description><p>Fixes the Linux key-box hint and other issues found in the 1.5.0 release.</p></description>
+    </release>
+    <release version="1.5.0" date="2026-10-06">
+      <description><p>Adds Linux support and expands multi-computer support.</p></description>
+    </release>
+  </releases>
 </component>

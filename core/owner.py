@@ -68,6 +68,8 @@ class Moved:
     edge: Optional[str] = None  # where to land the pointer, when the move says
     offset: Optional[float] = None
     other: Optional[object] = None
+    display: Optional[str] = None
+    side: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,8 @@ class _Wait:
     reach: list
     edge: Optional[str] = None
     offset: Optional[float] = None
+    display: Optional[str] = None
+    side: Optional[str] = None
 
 
 def _ident(message):
@@ -126,6 +130,7 @@ class Owner:
         self.resistance_px = resistance_px  # None for a phone, which has no hand at an edge
         self.route = 0
         self.on = None                      # the peer this machine's input is on, None at home
+        self._chain = (own_id,)
         self.reach_sent = []                # the `reach` last sent there
         self._clock = clock
         self._visit_route = 0               # the route of the take that began the current visit
@@ -144,6 +149,11 @@ class Owner:
     @property
     def away(self):
         return self.on is not None
+
+    @property
+    def chain(self):
+        """The active route, including the refusal's named onward machine when there is one."""
+        return self._chain
 
     def deadline(self):
         times = list(self._left_out.values())
@@ -191,7 +201,7 @@ class Owner:
 
     # Moves
 
-    def go(self, peer, edge=None, offset=None):
+    def go(self, peer, edge=None, offset=None, display=None, side=None):
         if peer is None or peer == self.own_id:
             return self._come_home("asked") if self.on is not None else []
         if peer == self.on:
@@ -209,10 +219,11 @@ class Owner:
         self.route += 1
         if left is not None:
             actions += self._let_go_of(left, peer)
-        actions += self._take(peer, edge, offset, chain=False)
+        actions += self._take(peer, edge, offset, chain=False, display=display, side=side)
         self._arrive(peer, self._wait.reach)
+        self._chain = (self.own_id, peer)
         actions += self._clipboard_to(peer)
-        actions.append(Moved(peer, left, "asked", edge, offset))
+        actions.append(Moved(peer, left, "asked", edge, offset, display=display, side=side))
         return actions + self._replay_held()
 
     def switch(self, peer, data):
@@ -220,16 +231,17 @@ class Owner:
             return []
         route, nxt = data.get("route"), data.get("next")
         edge, offset = data.get("edge"), data.get("offset")
+        display, side = data.get("display"), data.get("side")
         if nxt == self.own_id:
             if not isinstance(route, int) or route < self._visit_route:
                 return []
-            return self._come_home("switch", edge, offset)
+            return self._come_home("switch", edge, offset, display=display, side=side)
         if route != self.route or (self._wait is not None and self._wait.chain):
             return []
         if nxt not in self.reach_sent or nxt not in self._links & self._accepting:
             return self._not_taken(nxt, "unreachable")
         self.route += 1
-        return self._take(nxt, edge, offset, chain=True)
+        return self._take(nxt, edge, offset, chain=True, display=display, side=side)
 
     def accept(self, peer, data):
         route = data.get("route")
@@ -245,8 +257,9 @@ class Owner:
             left = self.on
             actions = self._let_go_of(left, peer)
             self._arrive(peer, wait.reach)
+            self._chain = (*self._chain, peer)
             actions += self._clipboard_to(peer)
-            actions.append(Moved(peer, left, "switch", wait.edge, wait.offset))
+            actions.append(Moved(peer, left, "switch", wait.edge, wait.offset, display=wait.display, side=wait.side))
             return actions + self._replay_held() + self._refresh_reach()
         if peer == self.on:
             return []
@@ -259,12 +272,16 @@ class Owner:
         wait = self._wait
         if wait is not None and wait.chain:
             if peer == wait.peer and route == wait.route:
-                return self._not_taken(peer, why, data.get("other"))
+                actions = self._not_taken(peer, why, data.get("other"))
+                self._append_refusal_chain(peer, why, data.get("other"))
+                return actions
             return []
         # The take's own route too: a re-arm sent before its answer came raised the route past it.
         if peer == self.on and (route == self.route or (wait is not None and route == wait.route)):
             self._hold_back(peer, why)
-            return self._come_home(why, other=data.get("other"))
+            actions = self._come_home(why, other=data.get("other"))
+            self._append_refusal_chain(peer, why, data.get("other"))
+            return actions
         return []
 
     def tick(self):
@@ -361,11 +378,13 @@ class Owner:
 
     # The pieces
 
-    def _take(self, peer, edge, offset, chain):
+    def _take(self, peer, edge, offset, chain, display=None, side=None):
         reach = self.reach_for(peer)
         data = {"route": self.route, "target": peer}
         if edge is not None:
             data["edge"], data["offset"] = edge, offset
+        if display is not None and side is not None:
+            data["display"], data["side"] = display, side
         if self.resistance_px is not None:
             data["resistance_px"] = self.resistance_px
         data["reach"] = reach
@@ -373,7 +392,7 @@ class Owner:
         for route in [route for route, (_, when) in self._takes.items() if now - when > TAKE_MEMORY]:
             del self._takes[route]
         self._takes[self.route] = (peer, now)
-        self._wait = _Wait(peer, self.route, now + TAKE_WAIT, chain, reach, edge, offset)
+        self._wait = _Wait(peer, self.route, now + TAKE_WAIT, chain, reach, edge, offset, display, side)
         return [Send(peer, {"type": "focus", "data": data})]
 
     def _arrive(self, peer, reach):
@@ -392,7 +411,7 @@ class Owner:
     def _forget_pressed(self, peer):
         self._swallow.update(self._pressed.pop(peer, {}))
 
-    def _come_home(self, why, edge=None, offset=None, other=None):
+    def _come_home(self, why, edge=None, offset=None, other=None, display=None, side=None):
         left = self.on
         if self._wait is not None and not self._wait.chain:
             # Never taken: a clipboard sent after the take was dropped there.
@@ -404,8 +423,9 @@ class Owner:
         else:
             self._forget_pressed(left)
         self.on = None
+        self._chain = (self.own_id,)
         self.reach_sent = []
-        actions.append(Moved(None, left, why, edge, offset, other))
+        actions.append(Moved(None, left, why, edge, offset, other, display, side))
         return actions + self._replay_held()
 
     def _abandon(self, unless=None):
@@ -436,6 +456,16 @@ class Owner:
         """`peer` is not asked again for as long as it would refuse: each push at its edge would
         otherwise ask, be refused, and say so."""
         self._left_out[peer] = self._clock() + (SENT_HOME_FOR if why == "sent_home" else LEFT_OUT)
+
+    def _append_refusal_chain(self, peer, why, other):
+        if why not in ("owned", "busy") or peer is None or other is None:
+            return
+        chain = list(self._chain)
+        if not chain or chain[-1] != peer:
+            chain.append(peer)
+        if chain[-1] != other:
+            chain.append(other)
+        self._chain = tuple(chain)
 
     def _stay(self):
         self.route += 1

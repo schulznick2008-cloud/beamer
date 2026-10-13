@@ -72,8 +72,8 @@ PIXELS_PER_CLICK = 40.0
 
 NO_PORTAL = ("This desktop does not let apps control the keyboard and mouse (it has no RemoteDesktop "
              "portal with libei), so another machine cannot drive this one and the clipboard is not shared.")
-REFUSED = ("Beamer was not allowed to control this machine, so another machine cannot drive it and the "
-           "clipboard is not shared. Restart Beamer to be asked again.")
+REFUSED = ("The desktop did not allow Beamer to control this PC. Choose Ask again and allow the requested "
+           "keyboard and pointer access in the desktop prompt.")
 ENDED = "The desktop stopped letting Beamer control this machine: {detail}"
 CLOSED = ("Remote control was stopped from the desktop, so another machine cannot drive this one and the "
           "clipboard is not shared until Beamer restarts.")
@@ -81,6 +81,15 @@ MISSING = "Beamer cannot control this machine: {detail}"
 
 # Called with one of the sentences above when the session cannot start or ends; set by the app.
 on_problem: Optional[Callable[[str], None]] = None
+on_permission: Optional[Callable[[str, str, bool], None]] = None
+
+
+def _report_permission(status: str, detail: str = "", retryable: bool = False) -> None:
+    if on_permission is not None:
+        try:
+            on_permission(status, detail, retryable)
+        except Exception:
+            LOGGER.exception("Could not report RemoteDesktop permission state")
 
 
 class WaylandLayout(Layout):
@@ -220,6 +229,20 @@ class Remote:
             self._thread = threading.Thread(target=self._run, name="Beamer-remote", daemon=True)
             self._thread.start()
 
+    def request_again(self) -> None:
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                raise RuntimeError("The last RemoteDesktop session has not stopped yet")
+        with self._lock:
+            if self._closed:
+                return
+            self._terminal = False
+            self.problem = None
+            self._retry_at = 0.0
+        self.start()
+
     def stop(self) -> None:
         """For good: nothing after it opens the session again."""
         with self._lock:
@@ -300,11 +323,20 @@ class Remote:
             ended = not problem.terminal
             self._terminal = problem.terminal
             self._report(problem.sentence)
+            _report_permission("refused" if problem.sentence == REFUSED else "unavailable", problem.sentence,
+                               problem.sentence == CLOSED)
+        except portal.Refused:
+            self._tokens.write("")
+            self._terminal = True
+            self._report(REFUSED)
+            _report_permission("refused", REFUSED)
         except Exception as exc:
             if not self._stopping.is_set():
                 LOGGER.exception("Remote control stopped")
                 ended = True
-                self._report(ENDED.format(detail=exc))
+                sentence = ENDED.format(detail=exc)
+                self._report(sentence)
+                _report_permission("unavailable", sentence)
         finally:
             if ended:
                 if self._tokens.read():
@@ -351,6 +383,9 @@ class Remote:
         except portal.Refused:
             self._tokens.write("")
             raise _Problem(REFUSED, terminal=True) from None
+        if started.get("devices", 0) & (DEVICE_KEYBOARD | DEVICE_POINTER) != DEVICE_KEYBOARD | DEVICE_POINTER:
+            self._tokens.write("")
+            raise _Problem(REFUSED, terminal=True)
         self._tokens.write(started.get("restore_token", ""))
         self.clipboard_enabled = bool(started.get("clipboard_enabled"))
         fd = portal_.call(INTERFACE, "ConnectToEIS", "oa{sv}", (self.handle, {}))[0]
@@ -363,6 +398,7 @@ class Remote:
         self._eis_at = time.monotonic()
         self.problem = None
         self.ready.set()
+        _report_permission("ready")
         desktop_portal.set_mover(lambda x, y: self.submit(lambda remote: remote.place(x, y)))
 
     def _wait(self) -> None:
@@ -697,6 +733,10 @@ def remote() -> Remote:
 def start() -> None:
     """Open the session now, so the desktop asks while the user is at this machine."""
     remote().start()
+
+
+def request_again() -> None:
+    remote().request_again()
 
 
 def stop() -> None:

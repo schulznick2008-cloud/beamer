@@ -24,16 +24,21 @@ def offscreen_control_window():
     store.lock = threading.RLock()
     store._handed_token = token
     store._cache = store._complete({**store._fresh(), "peers": []})
+    store.save = mock.Mock(return_value=cfg)
     logger = logging.getLogger("test-window-geometry")
     from wake import WakingController
 
     controller = WakingController(cfg, logger=logger)
+    controller.start_input_capture = lambda: None
     with mock.patch.object(kvm_bridge_app, "accessibility_granted", return_value=True), mock.patch.object(
         kvm_bridge_app, "input_monitoring_granted", return_value=True
     ):
-        return kvm_bridge_app.ControlWindow.alloc().initWithController_settingsStore_logger_(
+        window = kvm_bridge_app.ControlWindow.alloc().initWithController_settingsStore_logger_(
             controller, store, logger
         )
+    # Layout previews have no backing path, so the debounced save must stay inert.
+    window._apply_settings = lambda: None
+    return window
 
 
 class WindowGeometryTests(unittest.TestCase):
@@ -63,7 +68,8 @@ class WindowGeometryTests(unittest.TestCase):
         window = offscreen_control_window()
         # The window takes its largest size from every constraint above WindowSizeStayPut (500),
         # so one page's rigid row or reading-width note used to cap it at 773 to 837 pt.
-        screen_width = AppKit.NSScreen.mainScreen().visibleFrame().size.width
+        screen = AppKit.NSScreen.mainScreen()
+        screen_width = screen.visibleFrame().size.width if screen else 1728
 
         window.window.setFrame_display_(((100000, 100000), (screen_width, 900)), False)
         from Foundation import NSDate, NSRunLoop
@@ -99,25 +105,31 @@ class WindowGeometryTests(unittest.TestCase):
                     right = page.frame().size.width - left - body.frame().size.width
                     self.assertAlmostEqual(left, right, delta=1)
 
-    def test_crossing_pair_flips_without_reparenting_at_wide_and_narrow_sizes(self):
-        AppKit = kvm_bridge_app.AppKit
-        window = offscreen_control_window()
-        window._select_page("crossing")
-        horizontal = AppKit.NSUserInterfaceLayoutOrientationHorizontal
-        vertical = AppKit.NSUserInterfaceLayoutOrientationVertical
-
-        for width, height in ((1366, 900), (1920, 900), (2560, 900), (1440, 3440)):
-            with self.subTest(window=(width, height)):
-                pair = self._assert_side_by_side_layout(window, "ways_pair", width, height, horizontal)
-                self.assertEqual(pair.needed(), 632)
-                self.assertEqual(pair.gap, 24)
-                self.assertEqual(pair.view.spacing(), 24)
-                self.assertGreaterEqual(pair.first.frame().size.width, 254)
-                self.assertGreaterEqual(pair.second.frame().size.width, 354)
-
-        with self.subTest(window=(700, 900)):
-            pair = self._assert_side_by_side_layout(window, "ways_pair", 700, 900, vertical)
-            self.assertLess(pair.bounds().size.width, pair.needed())
+    def test_ledger_uses_blocks_under_620_and_columns_above(self):
+        from mac_app.tests.test_crossing_page_machines import Page, BEE, token
+        fixture = Page()
+        fixture.setUp()
+        try:
+            window = fixture.build([(BEE, token(100), "Bee", {"side": "left"})],
+                                   [{"peer": BEE, "kind": "edge"}])
+            window._select_page("crossing")
+            for width in (640, 900, 1366, 1920):
+                window.window.setFrame_display_(((100000, 100000), (width, 900)), False)
+                window.window.contentView().layoutSubtreeIfNeeded()
+                ledger = window.crossing_ledger
+                ledger.reflow()
+                row = ledger.rows[BEE]
+                narrow = ledger.bounds().size.width < 620
+                self.assertEqual(ledger.headers[0].view.isHidden(), narrow)
+                machine, edge = row.cells["machine"].frame(), row.cells["edge"].frame()
+                self.assertGreater(edge.origin.y, machine.origin.y) if narrow else self.assertEqual(
+                    edge.origin.y, machine.origin.y)
+                for cell in row.cells.values():
+                    self.assertLessEqual(cell.frame().origin.x + cell.frame().size.width,
+                                         ledger.bounds().size.width + 1)
+                self.assertFalse(window.pages["crossing"].hasHorizontalScroller())
+        finally:
+            fixture.doCleanups()
 
     def test_design_controls_lead_full_width_responsive_tile_groups(self):
         window = offscreen_control_window()
@@ -211,9 +223,9 @@ class WindowGeometryTests(unittest.TestCase):
         from Foundation import NSDate, NSRunLoop
 
         window = offscreen_control_window()
-        state = SimpleNamespace(word="Connected", led="signal", blink=False, tone="signal", detail="")
+        state = SimpleNamespace(key="connected", word="Connected", led="signal", blink=False, tone="signal", detail="")
         row = SimpleNamespace(label="Windows PC", state=state, token="t1", platform="Windows", address="192.0.2.20",
-                              in_use=True, drives=True, driven=True, phone=False)
+                              in_use=True, drives=True, driven=True, phone=False, left_out=False)
         window.panel.removing = "t1"
         window.panel._build_rows([row])
         window.window.setFrame_display_(((100000, 100000), (1728, 900)), False)

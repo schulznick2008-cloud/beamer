@@ -5,6 +5,8 @@ far the pointer is pushed past the edge before it gives."""
 from __future__ import annotations
 
 import math
+import copy
+import platform
 import AppKit
 import Quartz
 import objc
@@ -12,11 +14,23 @@ import objc
 import motion
 import pages
 import theme
+from core.resistance_strip import MAX_RESISTANCE, resistance_x
+from core import ways as core_ways
 
 
 def _rect(frame):
     x, y, w, h = frame
     return ((x, y), (w, h))
+
+
+def _set_layer_frame_if_changed(layer, frame):
+    x, y, width, height = frame[0][0], frame[0][1], frame[1][0], frame[1][1]
+    current = layer.frame()
+    if (abs(current.origin.x - x) < 0.01 and abs(current.origin.y - y) < 0.01
+            and abs(current.size.width - width) < 0.01
+            and abs(current.size.height - height) < 0.01):
+        return
+    layer.setFrame_(frame)
 
 
 def _text_width(text, font):
@@ -66,6 +80,35 @@ def _collapsed(frame, side):
     if side in ("left", "right"):
         return (x, y + h / 2, w, 0.0)
     return (x + w / 2, y, 0.0, h)
+
+
+# The clear space centred on each third boundary of the selected machine's seam and tracks.
+THIRD_GAP = 2.0
+CYCLE_BOX = 16.0
+
+
+def _at_break(value, breaks):
+    return any(abs(value - point) < 1e-6 for point in breaks)
+
+
+def _split_at_breaks(stretch, breaks):
+    side, low, high = stretch
+    cuts = [low] + sorted(point for point in breaks if low + 1e-6 < point < high - 1e-6) + [high]
+    return [(side, one, two) for one, two in zip(cuts, cuts[1:])]
+
+
+def notch_span(notch_range, displays):
+    """(display key, left, right) of the notch as fractions of its display's width, or None: the
+    display whose x-range holds `notch_range` and whose top is the desktop's, from global rects with
+    x/y/width/height as `desktop_mac.display_map()` gives them."""
+    if not notch_range or not displays:
+        return None
+    left, right = notch_range
+    top = min(rect.y for rect in displays.values())
+    for key, rect in displays.items():
+        if rect.y == top and rect.width > 0 and rect.x <= left and right <= rect.x + rect.width:
+            return key, (left - rect.x) / rect.width, (right - rect.x) / rect.width
+    return None
 
 
 class ArrangementDiagram(AppKit.NSView):
@@ -246,8 +289,7 @@ class ArrangementDiagram(AppKit.NSView):
             layer.setFrame_(_rect(frame))
             layer.setOpacity_(1.0 if on else 0.0)
             return
-        # Explicit animations from the collapsed mark: an implicit one would start from wherever
-        # the mark was drawn before, inside this same transaction.
+        # An implicit animation would start from the prior frame, not the collapsed mark.
         start = _collapsed(frame, side) if side else (frame[0] + frame[2] / 2, frame[1] + frame[3] / 2, 0, 0)
         motion.transaction(False)
         layer.setFrame_(_rect(frame))
@@ -266,15 +308,1269 @@ class ArrangementDiagram(AppKit.NSView):
             grow.setDuration_(motion.DURATION)
             grow.setTimingFunction_(motion.timing())
             layer.addAnimation_forKey_(grow, key)
+        if not (on and was != state and animate):
+            layer.setFrame_(_rect(frame))
+        layer.setOpacity_(1.0 if on else 0.0)
+
+
+def outcome_for_tile(state, crosses, is_own=False):
+    if is_own:
+        return ""
+    if state == "overlap":
+        return "Overlaps"
+    if state in ("gap", "between", "set-elsewhere", "set_elsewhere"):
+        return "Drag to connect"
+    if not crosses:
+        return "Edge off"
+    return "Crosses"
+
+
+class AtlasAccessibleElement(AppKit.NSObject):
+    def initWithCanvas_key_kind_(self, canvas, key, kind):
+        self = objc.super(AtlasAccessibleElement, self).init()
+        if self is None:
+            return None
+        self.canvas, self.key, self.kind = canvas, key, kind
+        return self
+
+    def accessibilityRole(self):
+        return AppKit.NSAccessibilityCheckBoxRole if self.kind == "cycle" else AppKit.NSAccessibilityButtonRole
+
+    def accessibilityLabel(self):
+        if self.kind == "recentre":
+            name = self.canvas.labels.get(self.canvas.selected, "machine")
+            return f"Recentre {name}"
+        name = self.canvas.labels.get(self.key, f"Machine · {self.key[-6:]}")
+        return f"{name}, In the shortcut's cycle" if self.kind == "cycle" else name
+
+    def accessibilityValue(self):
+        if self.kind == "cycle":
+            return self.canvas.cycle.get(self.key, True) is True
+        return "Selected" if self.canvas.selected == self.key else ""
+
+    def accessibilityParent(self):
+        return self.canvas
+
+    def accessibilityFrame(self):
+        if self.kind == "recentre":
+            return self.canvas._recentre_screen_frame()
+        frames, _scale = self.canvas._map()
+        frame = frames.get(self.key)
+        if frame is None:
+            return AppKit.NSZeroRect
+        if self.kind == "cycle":
+            frame = self.canvas._cycle_hit_rect(frame)
+        rect = AppKit.NSMakeRect(*frame)
+        window = self.canvas.window()
+        if window is None:
+            return rect
+        return window.convertRectToScreen_(self.canvas.convertRect_toView_(rect, None))
+
+    def accessibilityPerformPress(self):
+        if self.kind == "recentre":
+            self.canvas.recentre_selected()
+            return True
+        if self.kind == "cycle":
+            self.canvas.toggle_cycle(self.key)
+        else:
+            self.canvas.select_tile(self.key)
+        return True
+
+
+class AtlasCanvas(AppKit.NSView):
+    """Interactive map of machine tiles; geometry stays in the shared core layout units."""
+
+    HEIGHT = 260.0
+    INSET = 14.0
+
+    @staticmethod
+    def snap_radius_for_scale(scale):
+        return 12 / max(float(scale), 0.01)
+
+    def isFlipped(self):
+        return True
+
+    @objc.python_method
+    def setup(self):
+        self.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        self.heightAnchor().constraintGreaterThanOrEqualToConstant_(self.HEIGHT).setActive_(True)
+        self.setWantsLayer_(True)
+        theme.tint(self.layer(), background="well", border="edge")
+        self.layer().setBorderWidth_(1)
+        self.layer().setCornerRadius_(4)
+        self.tiles = {}
+        self.states = {}
+        self.labels = {}
+        self.older = set()
+        self.selected = None
+        self.own_id = ""
+        self.cycle = {}
+        self.cycle_enabled = False
+        self.keyboard_focus = False
+        self.hovered = None
+        self.focus_layer = _box(None, "ink_2", 4)
+        self.focus_layer.setBorderWidth_(2)
+        self.focus_layer.setHidden_(True)
+        self.layer().addSublayer_(self.focus_layer)
+        self.layer_for_tile = {}
+        self.display_layers = {}
+        self.label_for_tile = {}
+        self.state_for_tile = {}
+        self.outcome_for_tile = {}
+        self.dot_for_tile = {}
+        self.cycle_for_tile = {}
+        self.accessible_elements = {}
+        self.contact_layers = {}
+        self.seam_segments = []
+        self.mark_layers = {}
+        self.corner_halo_layers = {}
+        self.recentre_layer = _box("panel", None, 4)
+        self.recentre_label = _text_layer(theme.TYPE["note"], "ink_3")
+        self.recentre_layer.addSublayer_(self.recentre_label)
+        self.recentre_layer.setHidden_(True)
+        self.recentre_layer.setZPosition_(22)
+        self.layer().addSublayer_(self.recentre_layer)
+        self.recentre_hovered = False
+        self.snap_ghost = Quartz.CAShapeLayer.layer()
+        self.snap_ghost.setFillColor_(AppKit.NSColor.clearColor().CGColor())
+        self.snap_ghost.setStrokeColor_(theme.cg("signal"))
+        self.snap_ghost.setLineWidth_(1)
+        self.snap_ghost.setLineDashPattern_([4, 3])
+        self.snap_ghost.setOpacity_(0.4)
+        self.snap_ghost.setLineCap_(Quartz.kCALineCapRound)
+        self.snap_ghost.setHidden_(True)
+        self.layer().addSublayer_(self.snap_ghost)
+        self.snap_seam = Quartz.CAShapeLayer.layer()
+        self.snap_seam.setFillColor_(AppKit.NSColor.clearColor().CGColor())
+        self.snap_seam.setStrokeColor_(theme.cg("signal"))
+        self.snap_seam.setLineWidth_(4)
+        self.snap_seam.setLineCap_(Quartz.kCALineCapRound)
+        self.snap_seam.setOpacity_(0.5)
+        self.snap_seam.setHidden_(True)
+        self.layer().addSublayer_(self.snap_seam)
+        self.guide_layers = []
+        self.grid_layers = []
+        self.dragging = None
+        self.third_pressed = None
+        self.third_layers = {}
+        self.on_layout_change = None
+        self.on_select = None
+        self.on_third = None
+        self.on_rename = None
+        self.on_cycle_change = None
+        self.on_leave_out = None
+        self.reduced_motion = False
+        self.last_announcement = ""
+        self.setAccessibilityElement_(True)
+        self.setAccessibilityRole_(AppKit.NSAccessibilityGroupRole)
+        self.setAccessibilityLabel_("Whole desk layout")
+        return self
+
+    def acceptsFirstResponder(self):
+        return True
+
+    def resignFirstResponder(self):
+        self.keyboard_focus = False
+        self._draw(False)
+        return True
+
+    @objc.python_method
+    def refresh_keyboard_focus(self):
+        from widgets import keyboard_focus_visible
+
+        self.keyboard_focus = keyboard_focus_visible(self)
+        self._draw(False)
+
+    @objc.python_method
+    def show_layout(self, tiles, states, labels, own_id, selected, cycle=None, cycle_enabled=False,
+                    older=(), animate=False):
+        cycle = dict(cycle or {})
+        older = set(older)
+        if (tiles == self.tiles and states == self.states and labels == self.labels
+                and own_id == self.own_id and selected == self.selected
+                and cycle == self.cycle and bool(cycle_enabled) == self.cycle_enabled
+                and older == self.older):
+            return
+        self.tiles = copy.deepcopy(tiles)
+        self.states = copy.deepcopy(states)
+        self.labels = dict(labels)
+        self.own_id = own_id
+        self.selected = selected
+        self.cycle = cycle
+        self.cycle_enabled = bool(cycle_enabled)
+        self.older = older
+        for key in list(self.layer_for_tile):
+            if key not in self.tiles:
+                for layer in self.display_layers.pop(key, []):
+                    layer.removeFromSuperlayer()
+                for layer in (self.layer_for_tile.pop(key), self.label_for_tile.pop(key),
+                              self.state_for_tile.pop(key), self.outcome_for_tile.pop(key),
+                              self.dot_for_tile.pop(key), self.cycle_for_tile.pop(key)):
+                    layer.removeFromSuperlayer()
+        self.setAccessibilityLabel_(self.last_announcement or self._description())
+        self.setNeedsLayout_(True)
+        self.setNeedsDisplay_(True)
+        if self.superview() is not None:
+            self.layoutSubtreeIfNeeded()
+        self._draw(animate and not self.reduced_motion)
+
+    @objc.python_method
+    def _description(self):
+        parts = []
+        for key, tile in self.tiles.items():
+            label = self.labels.get(key, f"Machine · {key[-6:]}")
+            state = self.states.get(key, {}).get("state")
+            sentence = self.states.get(key, {}).get("sentence", "")
+            if sentence:
+                parts.append(sentence)
+            elif key == self.own_id:
+                name = self.states.get(key, {}).get("machine_name")
+                parts.append(f"{label}, {name}, this Mac." if name else f"{label}, this Mac.")
+            else:
+                status = self.states.get(key, {})
+                outcome = ("Offline" if not status.get("linked") else
+                           "Crosses" if status.get("crosses") else
+                           "Edge off" if status.get("edge_off") else
+                           outcome_for_tile(state, False))
+                parts.append(f"{label}, {outcome}.")
+            if self.cycle_enabled and key != self.own_id:
+                parts.append(f"{label} is {'in' if self.cycle.get(key, True) else 'out of'} the shortcut's cycle.")
+        return " ".join(parts) or "No machines paired."
+
+    def accessibilityChildren(self):
+        children = []
+        for key in self.tiles:
+            children.append(self.accessible_elements.setdefault(
+                key, AtlasAccessibleElement.alloc().initWithCanvas_key_kind_(self, key, "tile")))
+            if self.cycle_enabled and key != self.own_id:
+                children.append(self.accessible_elements.setdefault(
+                    (key, "cycle"), AtlasAccessibleElement.alloc().initWithCanvas_key_kind_(self, key, "cycle")))
+        if self._show_recentre():
+            children.append(self.accessible_elements.setdefault(
+                "recentre", AtlasAccessibleElement.alloc().initWithCanvas_key_kind_(self, self.selected, "recentre")))
+        return children
+
+    @objc.python_method
+    def select_tile(self, key):
+        if key not in self.tiles or key == self.own_id:
+            return
+        self.selected = key
+        if self.on_select:
+            self.on_select(key)
+        self._draw(False)
+
+    @objc.python_method
+    def reading_order(self):
+        placed = sorted(((tile["y"] + tile["h"] / 2, tile["x"] + tile["w"] / 2,
+                          tile["h"], key) for key, tile in self.tiles.items() if key != self.own_id))
+        rows = []
+        for item in placed:
+            if not rows or item[0] - rows[-1][0][0] > min(item[2], rows[-1][0][2]) / 2:
+                rows.append([item])
+            else:
+                rows[-1].append(item)
+        return [item[3] for row in rows for item in sorted(row, key=lambda entry: entry[1])]
+
+    @objc.python_method
+    def announce(self, sentence):
+        self.last_announcement = sentence
+        self.setAccessibilityLabel_(sentence)
+        AppKit.NSAccessibilityPostNotificationWithUserInfo(
+            self, AppKit.NSAccessibilityAnnouncementRequestedNotification,
+            {AppKit.NSAccessibilityAnnouncementKey: sentence,
+             AppKit.NSAccessibilityPriorityKey: AppKit.NSAccessibilityPriorityMedium})
+
+    @objc.python_method
+    def announce_move(self, peer, tile, state):
+        name = self.labels.get(peer, f"Machine · {peer[-6:]}")
+        own = self.tiles.get(self.own_id, {})
+        side = "right of" if tile["x"] >= own.get("x", 0) + own.get("w", 0) else \
+            "left of" if tile["x"] + tile["w"] <= own.get("x", 0) else \
+            "below" if tile["y"] >= own.get("y", 0) + own.get("h", 0) else "above"
+        thirds = state.get("thirds", [])
+        third = f", {thirds[0]} third" if len(thirds) == 1 else ""
+        map_state = state.get("state")
+        if not state.get("crosses") and core_ways._rect_contact(own, tile) is None:
+            map_state = "gap"
+        crosses = outcome_for_tile(map_state, state.get("crosses")) + "."
+        self.announce(f"{name}, {side} This Mac{third}. {crosses}")
+
+    @objc.python_method
+    def _layer(self, key):
+        if key not in self.layer_for_tile:
+            tile = _box("panel", "rule", 4)
+            title = _text_layer(theme.TYPE["body"], "ink")
+            title.setFont_(theme.font(theme.TYPE["body"], 600))
+            state = _text_layer(theme.TYPE["eyebrow"], "ink_3")
+            outcome = _text_layer(theme.TYPE["note"], "ink_2")
+            dot = _box("signal", None, 3)
+            cycle = _box("well", "edge", 3)
+            check = Quartz.CAShapeLayer.layer()
+            # The sublayer inherits the view's flipped geometry, so the tick is authored y-down.
+            path = Quartz.CGPathCreateMutable()
+            Quartz.CGPathMoveToPoint(path, None, 4.5, 8.5)
+            Quartz.CGPathAddLineToPoint(path, None, 7, 11)
+            Quartz.CGPathAddLineToPoint(path, None, 11.5, 5)
+            check.setPath_(path)
+            check.setFillColor_(AppKit.NSColor.clearColor().CGColor())
+            theme.tint(check, stroke="ground")
+            check.setLineWidth_(1.8)
+            check.setLineCap_(Quartz.kCALineCapRound)
+            check.setLineJoin_(Quartz.kCALineJoinRound)
+            check.setFrame_(((0, 0), (CYCLE_BOX, CYCLE_BOX)))
+            check.setHidden_(True)
+            cycle.addSublayer_(check)
+            self.layer().addSublayer_(tile)
+            self.layer().addSublayer_(title)
+            self.layer().addSublayer_(state)
+            self.layer().addSublayer_(outcome)
+            self.layer().addSublayer_(dot)
+            self.layer().addSublayer_(cycle)
+            self.layer_for_tile[key] = tile
+            self.label_for_tile[key] = title
+            self.state_for_tile[key] = state
+            self.outcome_for_tile[key] = outcome
+            self.dot_for_tile[key] = dot
+            self.cycle_for_tile[key] = cycle
+        return (self.layer_for_tile[key], self.label_for_tile[key], self.state_for_tile[key],
+                self.outcome_for_tile[key], self.dot_for_tile[key], self.cycle_for_tile[key])
+
+    @staticmethod
+    def _title_top(frame):
+        return frame[1] + (frame[3] - 20) / 2 if frame[3] < 56 else frame[1] + 10
+
+    @objc.python_method
+    def _shows_cycle(self, key):
+        return self.cycle_enabled and key != self.own_id
+
+    @objc.python_method
+    def _title_rect(self, key, frame):
+        """The name's text rect. Beside the shortcut-cycle tick the name stays centred on the tile while
+        it fits the room left symmetric by the tick, else takes the room left of the tick; a tile 44 to
+        56pt tall puts the name on its own row above the tick."""
+        x, y, width, height = frame
+        if not self._shows_cycle(key):
+            return x + 8, self._title_top(frame), max(1, width - 16), 20
+        if 44 <= height < 56:
+            return x + 8, y + 4, max(1, width - 16), 20
+        room = 8 + CYCLE_BOX + 6
+        label = self.labels.get(key, f"Machine · {key[-6:]}")
+        if height >= 56 and _text_width(label, theme.font(theme.TYPE["body"], 600)) <= width - 2 * room:
+            return x + room, self._title_top(frame), width - 2 * room, 20
+        return x + 8, self._title_top(frame), max(1, self._cycle_box(frame)[0] - 6 - x - 8), 20
+
+    @staticmethod
+    def _cycle_box(frame):
+        """The shortcut-cycle tick: its own column at the right end of the name's line, or in the
+        bottom-right corner of a tile 44 to 56pt tall, under the name."""
+        x, y, width, height = frame
+        if 44 <= height < 56:
+            return x + width - 8 - CYCLE_BOX, y + height - 4 - CYCLE_BOX, CYCLE_BOX, CYCLE_BOX
+        return x + width - 8 - CYCLE_BOX, AtlasCanvas._title_top(frame) + 10 - CYCLE_BOX / 2, CYCLE_BOX, CYCLE_BOX
+
+    @staticmethod
+    def _cycle_hit_rect(frame):
+        x, y, width, height = AtlasCanvas._cycle_box(frame)
+        return x - 4, y - 4, width + 8, height + 8
+
+    @objc.python_method
+    def _map(self):
+        width, height = self.bounds().size.width, self.bounds().size.height
+        if not self.tiles or width <= 0 or height <= 0:
+            return {}, 1.0
+        if self.dragging is not None and all(key in self.dragging for key in ("scale", "map_x", "map_y")):
+            scale = self.dragging["scale"]
+            offset_x, offset_y = self.dragging["map_x"], self.dragging["map_y"]
+            return {key: (tile["x"] * scale + offset_x, tile["y"] * scale + offset_y,
+                          tile["w"] * scale, tile["h"] * scale)
+                    for key, tile in self.tiles.items()}, scale
+        panels = [frame for tile in self.tiles.values() for frame in core_ways._display_frames(tile)]
+        horizontal = [(tile["x"], tile["x"] + tile["w"]) for tile in self.tiles.values()]
+        vertical = [(tile["y"], tile["y"] + tile["h"]) for tile in self.tiles.values()]
+        horizontal.extend((frame["x"], frame["x"] + frame["w"]) for frame in panels)
+        vertical.extend((frame["y"], frame["y"] + frame["h"]) for frame in panels)
+        left = min(edge for pair in horizontal for edge in pair)
+        right = max(edge for pair in horizontal for edge in pair)
+        top = min(edge for pair in vertical for edge in pair)
+        bottom = max(edge for pair in vertical for edge in pair)
+        cx, cy = (left+right)/2, (top+bottom)/2
+        scale = min((width-2*self.INSET) / max(1, right-left),
+                    (height-2*self.INSET) / max(1, bottom-top), 1.15)
+        offset_x = width / 2 - cx * scale
+        offset_y = height / 2 - cy * scale
+        frames = {key: (tile["x"] * scale + offset_x, tile["y"] * scale + offset_y,
+                        tile["w"] * scale, tile["h"] * scale)
+                  for key, tile in self.tiles.items()}
+        return frames, scale
+
+    def layout(self):
+        objc.super(AtlasCanvas, self).layout()
+        if self.tiles:
+            self._draw(False)
+
+    @objc.python_method
+    def _draw(self, animate):
+        frames, _scale = self._map()
+        if not frames:
+            return
+        motion.transaction(animate and motion.live(self))
+        for key, frame in frames.items():
+            tile, title, state_layer, outcome_layer, dot, cycle_layer = self._layer(key)
+            state = self.states.get(key, {}).get("state", "")
+            is_own = key == self.own_id
+            inactive = self.states.get(key, {}).get("in_use") is False
+            selected = key == self.selected
+            gap = state in ("gap", "set-elsewhere", "between", "overlap")
+            hover = key == self.hovered and not self.keyboard_focus
+            _set_layer_frame_if_changed(tile, _rect(frame))
+            tile.setBorderWidth_(1 if is_own else 2 if selected or gap else 1)
+            theme.tint(tile, background="well" if is_own else "panel",
+                       border="edge" if is_own else "ink_2" if selected else
+                       "ink_3" if hover else "amber" if gap else "edge")
+            tile.setOpacity_(0.42 if inactive else 1.0)
+            screens = core_ways._display_frames(self.tiles[key]) if self.tiles[key].get("displays") else []
+            layers = self.display_layers.setdefault(key, [])
+            while len(layers) < len(screens):
+                screen_layer = Quartz.CALayer.layer()
+                screen_layer.setBorderWidth_(1)
+                screen_layer.setCornerRadius_(2)
+                # Directly above the tile, under its labels: a snapshot (cacheDisplayInRect) draws
+                # sublayers in array order and ignores zPosition, so appended they hid the name.
+                self.layer().insertSublayer_above_(screen_layer, layers[-1] if layers else tile)
+                layers.append(screen_layer)
+            for index, layer in enumerate(layers):
+                if index >= len(screens):
+                    layer.setHidden_(True)
+                    continue
+                screen = screens[index]
+                scale_x = frame[2] / self.tiles[key]["w"]
+                scale_y = frame[3] / self.tiles[key]["h"]
+                _set_layer_frame_if_changed(
+                    layer, ((screen["x"] * scale_x + frame[0] - self.tiles[key]["x"] * scale_x,
+                             screen["y"] * scale_y + frame[1] - self.tiles[key]["y"] * scale_y),
+                            (screen["w"] * scale_x, screen["h"] * scale_y)))
+                layer.setHidden_(False)
+                theme.tint(layer, background="well", border="edge")
+            title.setString_(self.labels.get(key, f"Machine · {key[-6:]}"))
+            _set_layer_frame_if_changed(title, _rect(self._title_rect(key, frame)))
+            status_info = self.states.get(key, {})
+            status = (f"{status_info.get('machine_name') or platform.node().split('.')[0] or 'This Mac'} · macOS"
+                      if is_own else
+                      f"{status_info.get('platform', 'Computer')} · {'Linked' if status_info.get('linked') else 'Offline'}")
+            if key in self.older:
+                status = f"Beamer {status_info.get('version') or '1.5.2'} · only sees which side"
+            if inactive:
+                status = "Not in use"
+            state_layer.setString_(status)
+            state_layer.setAlignmentMode_(Quartz.kCAAlignmentLeft)
+            _set_layer_frame_if_changed(state_layer, ((frame[0] + 24, frame[1] + 35),
+                                                     (max(1, frame[2] - 32), 16)))
+            state_layer.setHidden_(frame[3] < 72)
+            theme.tint(state_layer, foreground="amber" if gap else "ink_3")
+            crosses = status_info.get("crosses", is_own)
+            outcome = ("Offline" if not is_own and not status_info.get("linked") else
+                       "Crosses" if crosses and (status_info.get("corner_way") or status_info.get("notch_way")) else
+                       "Edge off" if status_info.get("edge_off") or status_info.get("unpicked") else
+                       outcome_for_tile(state, crosses, is_own))
+            if is_own:
+                outcome = ""
+            outcome_layer.setString_(outcome)
+            _set_layer_frame_if_changed(
+                outcome_layer, ((frame[0] + 8, frame[1] + frame[3] - 22),
+                                (max(1, frame[2] - 16), 14)))
+            outcome_layer.setHidden_(frame[3] < 56)
+            theme.tint(outcome_layer, foreground="signal" if outcome == "Crosses" else
+                       "amber" if outcome in ("Drag to connect", "Overlaps") else "ink_3")
+            _set_layer_frame_if_changed(dot, ((frame[0] + 12, frame[1] + 40), (6, 6)))
+            dot.setCornerRadius_(3)
+            dot.setHidden_(frame[3] < 72)
+            theme.tint(dot, background="amber" if key in self.older else
+                       "signal" if status_info.get("linked") else "ink_3")
+            cycle_layer.setHidden_(not self._shows_cycle(key))
+            _set_layer_frame_if_changed(cycle_layer, _rect(self._cycle_box(frame)))
+            ticked = self.cycle.get(key, True) is True
+            cycle_layer.setBorderWidth_(0 if ticked else 1)
+            theme.tint(cycle_layer, background="ink_2" if ticked else "well", border="edge")
+            cycle_layer.sublayers()[0].setHidden_(not ticked)
+            if self.display_layers.get(key):
+                z_position = max(layer.zPosition() for layer in self.display_layers[key]) + 1.0
+                for layer in (title, state_layer, outcome_layer, dot, cycle_layer):
+                    layer.setZPosition_(z_position)
+        focus = frames.get(self.selected) if self.keyboard_focus else None
+        self.focus_layer.setHidden_(focus is None)
+        if focus is not None:
+            _set_layer_frame_if_changed(
+                self.focus_layer, _rect((focus[0] - 3, focus[1] - 3, focus[2] + 6, focus[3] + 6)))
+        self._draw_guides(frames.get(self.own_id))
+        self._draw_contacts(frames)
+        self._draw_marks(frames)
+        self._draw_snap_preview(frames, _scale)
+        show_recentre = self._show_recentre()
+        self.recentre_layer.setHidden_(not show_recentre)
+        if show_recentre:
+            button = self._recentre_frame()
+            _set_layer_frame_if_changed(self.recentre_layer, _rect(button))
+            self.recentre_layer.setBorderWidth_(1 if self.keyboard_focus or self.recentre_hovered else 0)
+            theme.tint(self.recentre_layer, background="panel",
+                       border="ink_2" if self.keyboard_focus or self.recentre_hovered else "rule")
+            self.recentre_label.setString_("Recentre")
+            self.recentre_label.setAlignmentMode_(Quartz.kCAAlignmentCenter)
+            _set_layer_frame_if_changed(self.recentre_label, ((4, 2), (button[2] - 8, button[3] - 4)))
+            theme.tint(self.recentre_label, foreground="ink_2" if self.recentre_hovered or self.keyboard_focus else "ink_3")
+        self.removeAllToolTips()
+        for _peer, _third, _side, start, end in self._third_segments(frames):
+            rect = (AppKit.NSMakeRect(start[0] - 5, start[1], 10, end[1] - start[1])
+                    if start[0] == end[0] else
+                    AppKit.NSMakeRect(start[0], start[1] - 5, end[0] - start[0], 10))
+            self.addToolTipRect_owner_userData_(rect, self, 1)
+        for key, frame in frames.items():
+            if self._shows_cycle(key):
+                self.addToolTipRect_owner_userData_(AppKit.NSMakeRect(*self._cycle_hit_rect(frame)), self, 0)
+        Quartz.CATransaction.commit()
+
+    @objc.python_method
+    def _draw_contacts(self, frames):
+        self.seam_segments = []
+        contacts = {}
+        own = self.own_id
+        for peer, state in self.states.items():
+            if (peer != own and own in frames and peer in frames
+                    and state.get("state") in ("edge", "part", "corner") and state.get("crosses")
+                    and state.get("picked_thirds", ["start"])):
+                found = [(screen, stretch, self._third_breaks(contact, screen) if peer == self.selected else set())
+                         for screen, contact in self._side_contacts(peer)
+                         for stretch in core_ways.crossing_stretches(contact, screen, state.get("lit_thirds", []))]
+                if found:
+                    contacts[(own, peer, "signal")] = found
+        peers = [key for key, state in self.states.items()
+                 if key in frames and state.get("state") in ("between", "set-elsewhere")]
+        for index, one in enumerate(peers):
+            for two in peers[index + 1:]:
+                if core_ways._rect_contact(self.tiles[one], self.tiles[two]):
+                    pair = tuple(sorted((one, two)))
+                    contacts[(pair[0], pair[1], "amber")] = [(None, core_ways._rect_contact(
+                        self.tiles[pair[0]], self.tiles[pair[1]]), set())]
+        for key in list(self.contact_layers):
+            if key not in contacts:
+                self.contact_layers.pop(key).removeFromSuperlayer()
+        for key, stretches in contacts.items():
+            one, two, kind = key
+            a, b = frames[one], frames[two]
+            layer = self.contact_layers.get(key)
+            if layer is None:
+                layer = Quartz.CAShapeLayer.layer()
+                layer.setFillColor_(AppKit.NSColor.clearColor().CGColor())
+                layer.setStrokeColor_(theme.cg("signal" if kind == "signal" else "amber"))
+            for _screen, (side, start, end), _breaks in stretches:
+                if kind == "signal":
+                    layer.setFillColor_(theme.cg("signal"))
+                layer.setLineWidth_(4 if kind == "signal" else 2)
+                if kind == "amber":
+                    layer.setLineDashPattern_([4, 3])
+                layer.setLineCap_(Quartz.kCALineCapRound)
+                layer.setZPosition_(20)
+                self.layer().addSublayer_(layer)
+                self.contact_layers[key] = layer
+            path = Quartz.CGPathCreateMutable()
+            scale = a[2] / self.tiles[one]["w"]
+            layer.setStrokeColor_(theme.cg("signal" if kind == "signal" else "amber"))
+            layer.setOpacity_(0.55 if kind == "signal" and not self.states.get(two, {}).get("linked", True) else 1.0)
+            for screen, (side, start, end), breaks in stretches:
+                if side == "corner":
+                    corner = start
+                    x = a[0] if corner.endswith("left") else a[0] + a[2]
+                    y = a[1] if corner.startswith("top") else a[1] + a[3]
+                    Quartz.CGPathMoveToPoint(path, None, x - 2, y - 2)
+                    Quartz.CGPathAddLineToPoint(path, None, x + 2, y + 2)
+                elif kind == "signal":
+                    for piece in _split_at_breaks((side, start, end), breaks):
+                        ends = self._seam_ends(frames, screen, *piece, breaks, 4.0)
+                        if ends is not None:
+                            Quartz.CGPathMoveToPoint(path, None, *ends[0])
+                            Quartz.CGPathAddLineToPoint(path, None, *ends[1])
+                            self.seam_segments.append({"peer": two, "kind": "seam", "side": side,
+                                                       "start": ends[0], "end": ends[1], "width": 4.0})
+                elif side in ("left", "right"):
+                    x = (a[0] + a[2]) if side == "right" else a[0]
+                    inset = min(2.0, max(0.0, (end - start) * scale / 2))
+                    y1 = a[1] + (start - self.tiles[one]["y"]) * scale + inset
+                    y2 = a[1] + (end - self.tiles[one]["y"]) * scale - inset
+                    if y2 > y1:
+                        Quartz.CGPathMoveToPoint(path, None, x, y1)
+                        Quartz.CGPathAddLineToPoint(path, None, x, y2)
+                else:
+                    y = (a[1] + a[3]) if side == "bottom" else a[1]
+                    inset = min(2.0, max(0.0, (end - start) * scale / 2))
+                    x1 = a[0] + (start - self.tiles[one]["x"]) * scale + inset
+                    x2 = a[0] + (end - self.tiles[one]["x"]) * scale - inset
+                    if x2 > x1:
+                        Quartz.CGPathMoveToPoint(path, None, x1, y)
+                        Quartz.CGPathAddLineToPoint(path, None, x2, y)
+            layer.setPath_(path)
+        self._draw_thirds(frames)
+
+    @objc.python_method
+    def _side_contacts(self, peer):
+        """[(screen, contact)]: this Mac's display frames that meet `peer`'s along a side, as the engine
+        finds them; thirds are measured along `screen`, the pointer's own display."""
+        return core_ways.side_contacts(self.tiles[self.own_id], self.tiles[peer])
+
+    @objc.python_method
+    def _third_breaks(self, contact, screen):
+        """The third boundaries of `screen`'s side inside `contact`, where the selected machine's
+        seam and tracks break."""
+        if not contact or contact[0] == "corner":
+            return set()
+        stretches = core_ways.third_stretches(contact, screen)
+        return {before[3] for before, after in zip(stretches, stretches[1:])
+                if before[1] == after[1] and abs(before[3] - after[2]) < 1e-6}
+
+    @objc.python_method
+    def _seam_ends(self, frames, screen, side, low, high, breaks, width):
+        """The path ends, in view points, of the stretch `low`..`high` of `screen`'s `side`: 2pt in
+        from an outer end and stopped at a corner halo; at a third boundary, far enough short that
+        the round cap leaves half of THIRD_GAP clear. None when nothing is left to draw."""
+        tile, frame = self.tiles[self.own_id], frames[self.own_id]
+        scale = frame[2] / tile["w"]
+        vertical = side in ("left", "right")
+        origin, base = (frame[1], tile["y"]) if vertical else (frame[0], tile["x"])
+        first, last = origin + (low - base) * scale, origin + (high - base) * scale
+        outer = min(2.0, max(0.0, (last - first) / 2))
+        first += THIRD_GAP / 2 + width / 2 if _at_break(low, breaks) else outer
+        last -= THIRD_GAP / 2 + width / 2 if _at_break(high, breaks) else outer
+        if vertical:
+            fixed = frame[0] + (screen["x"] + (screen["w"] if side == "right" else 0) - tile["x"]) * scale
+            start, end = self._stop_at_corner_halos(frames, side, (fixed, first), (fixed, last))
+        else:
+            fixed = frame[1] + (screen["y"] + (screen["h"] if side == "bottom" else 0) - tile["y"]) * scale
+            start, end = self._stop_at_corner_halos(frames, side, (first, fixed), (last, fixed))
+        along = 1 if vertical else 0
+        return (start, end) if end[along] > start[along] else None
+
+    @objc.python_method
+    def _stop_at_corner_halos(self, frames, side, start, end):
+        x, y, width, height = frames[self.own_id]
+        corners = {state.get("corner_way") for peer, state in self.states.items()
+                   if peer != self.own_id and peer in frames and state.get("in_use") is not False}
+        if side in ("left", "right"):
+            low = y + (11 if f"top_{side}" in corners else 0)
+            high = y + height - (11 if f"bottom_{side}" in corners else 0)
+            return (start[0], max(start[1], low)), (end[0], min(end[1], high))
+        low = x + (11 if f"{side}_left" in corners else 0)
+        high = x + width - (11 if f"{side}_right" in corners else 0)
+        return (max(start[0], low), start[1]), (min(end[0], high), end[1])
+
+    @objc.python_method
+    def _third_segments(self, frames):
+        peer, own = self.selected, self.own_id
+        state = self.states.get(peer, {})
+        if (peer == own or peer not in frames or own not in frames
+                or state.get("in_use") is False):
+            return []
+        tile, frame = self.tiles[own], frames[own]
+        scale = frame[2] / tile["w"]
+        segments = []
+        for screen, contact in self._side_contacts(peer):
+            for third, side, low, high in core_ways.third_stretches(contact, screen):
+                if side in ("left", "right"):
+                    x = frame[0] + (screen["x"] + (screen["w"] if side == "right" else 0) - tile["x"]) * scale
+                    start, end = (x, frame[1] + (low - tile["y"]) * scale), (x, frame[1] + (high - tile["y"]) * scale)
+                else:
+                    y = frame[1] + (screen["y"] + (screen["h"] if side == "bottom" else 0) - tile["y"]) * scale
+                    start, end = (frame[0] + (low - tile["x"]) * scale, y), (frame[0] + (high - tile["x"]) * scale, y)
+                segments.append((peer, third, side, start, end))
+        return segments
+
+    @objc.python_method
+    def _draw_thirds(self, frames):
+        marks = {}
+        segments = self._third_segments(frames)
+        peer = segments[0][0] if segments else None
+        state = self.states.get(peer, {})
+        if segments and not state.get("edge_off") and state.get("picked_thirds"):
+            contacts = self._side_contacts(peer)
+            for index, (screen, contact) in enumerate(contacts):
+                breaks = self._third_breaks(contact, screen)
+                for third, side, low, high in core_ways.third_stretches(contact, screen):
+                    if third in (state.get("lit_thirds") or state["picked_thirds"]):
+                        continue
+                    ends = self._seam_ends(frames, screen, side, low, high, breaks, 2.0)
+                    if ends is not None:
+                        marks[(peer, third, "track") if len(contacts) == 1 else (peer, index, third, "track")] = ends
+                        self.seam_segments.append({"peer": peer, "kind": "track", "side": side,
+                                                   "start": ends[0], "end": ends[1], "width": 2.0})
+        for key in list(self.third_layers):
+            if key not in marks:
+                self.third_layers.pop(key).removeFromSuperlayer()
+        for key, (start, end) in marks.items():
+            layer = self.third_layers.get(key)
+            if layer is None:
+                layer = Quartz.CAShapeLayer.layer()
+                layer.setFillColor_(AppKit.NSColor.clearColor().CGColor())
+                layer.setLineCap_(Quartz.kCALineCapRound)
+                layer.setZPosition_(21)
+                self.layer().addSublayer_(layer)
+                self.third_layers[key] = layer
+            layer.setStrokeColor_(theme.cg("signal"))
+            layer.setLineWidth_(2)
+            layer.setOpacity_(0.3)
+            path = Quartz.CGPathCreateMutable()
+            Quartz.CGPathMoveToPoint(path, None, *start)
+            Quartz.CGPathAddLineToPoint(path, None, *end)
+            layer.setPath_(path)
+
+    @objc.python_method
+    def _third_hit_segment(self, point):
+        frames, _scale = self._map()
+        for peer, third, side, start, end in self._third_segments(frames):
+            if side in ("left", "right"):
+                hit = abs(point.x - start[0]) <= 5 and start[1] <= point.y <= end[1]
+            else:
+                hit = abs(point.y - start[1]) <= 5 and start[0] <= point.x <= end[0]
+            if hit:
+                return peer, third, side
+        return None
+
+    @objc.python_method
+    def _third_hit(self, point):
+        hit = self._third_hit_segment(point)
+        return hit[:2] if hit else None
+
+    @objc.python_method
+    def _third_tooltip(self, peer, third, side=None):
+        side = side or core_ways._rect_contact(self.tiles[self.own_id], self.tiles[peer])[0]
+        name = core_ways.part_names(side)[third]
+        picked = self.states.get(peer, {}).get("picked_thirds", [])
+        detail = f"click to turn it {'off' if third in picked else 'on'}"
+        return f"{name} third: {detail}"
+
+    @objc.python_method
+    def _draw_marks(self, frames):
+        marks = {}
+        own_frame = frames.get(self.own_id)
+        if own_frame is not None:
+            x, y, width, height = own_frame
+            for peer, state in self.states.items():
+                if peer == self.own_id or peer not in frames or state.get("in_use") is False:
+                    continue
+                corner = state.get("corner_way")
+                if corner in core_ways.CORNERS:
+                    px = x if corner.endswith("left") else x + width
+                    py = y if corner.startswith("top") else y + height
+                    path = Quartz.CGPathCreateMutable()
+                    Quartz.CGPathAddRoundedRect(path, None, Quartz.CGRectMake(px - 8, py - 8, 16, 16), 4, 4)
+                    marks[(peer, "corner", corner)] = (path, (px, py))
+                if state.get("notch_way"):
+                    path = Quartz.CGPathCreateMutable()
+                    Quartz.CGPathAddRoundedRect(path, None, Quartz.CGRectMake(*self._notch_rect(own_frame)), 2, 2)
+                    marks[(peer, "notch")] = (path, None)
+        for key in list(self.mark_layers):
+            if key not in marks:
+                self.mark_layers.pop(key).removeFromSuperlayer()
+                if key in self.corner_halo_layers:
+                    self.corner_halo_layers.pop(key).removeFromSuperlayer()
+        for key, (path, vertex) in marks.items():
+            layer = self.mark_layers.get(key)
+            if layer is None:
+                layer = Quartz.CAShapeLayer.layer()
+                layer.setLineWidth_(4)
+                layer.setLineCap_(Quartz.kCALineCapRound)
+                layer.setLineJoin_(Quartz.kCALineJoinRound)
+                if vertex is not None:
+                    halo = Quartz.CAShapeLayer.layer()
+                    halo.setFillColor_(theme.cg("ground"))
+                    self.layer().addSublayer_(halo)
+                    self.corner_halo_layers[key] = halo
+                    chevron = Quartz.CAShapeLayer.layer()
+                    chevron.setFillColor_(AppKit.NSColor.clearColor().CGColor())
+                    chevron.setStrokeColor_(theme.cg("ground"))
+                    chevron.setLineWidth_(1.8)
+                    chevron.setLineCap_(Quartz.kCALineCapRound)
+                    chevron.setLineJoin_(Quartz.kCALineJoinRound)
+                    layer.addSublayer_(chevron)
+                self.layer().addSublayer_(layer)
+                self.mark_layers[key] = layer
+            clear = AppKit.NSColor.clearColor().CGColor()
+            layer.setFillColor_(theme.cg("signal"))
+            layer.setStrokeColor_(clear)
+            if vertex is not None:
+                px, py = vertex
+                halo = self.corner_halo_layers[key]
+                chevron = layer.sublayers()[0]
+                halo_path = Quartz.CGPathCreateMutable()
+                Quartz.CGPathAddRoundedRect(halo_path, None, Quartz.CGRectMake(px - 11, py - 11, 22, 22), 5, 5)
+                halo.setPath_(halo_path)
+                dx = 1 if key[2].endswith("left") else -1
+                dy = 1 if key[2].startswith("top") else -1
+                chevron_path = Quartz.CGPathCreateMutable()
+                Quartz.CGPathMoveToPoint(chevron_path, None, px - 4 * dx, py + 3 * dy)
+                Quartz.CGPathAddLineToPoint(chevron_path, None, px - 4 * dx, py - 4 * dy)
+                Quartz.CGPathAddLineToPoint(chevron_path, None, px + 3 * dx, py - 4 * dy)
+                chevron.setPath_(chevron_path)
+            selected = key[0] == self.selected
+            layer.setOpacity_(1.0 if selected else 0.55)
+            layer.setZPosition_(21 if selected else 20)
+            if vertex is not None:
+                halo.setZPosition_(19.5)
+            layer.setPath_(path)
+
+    @objc.python_method
+    def _notch_rect(self, frame):
+        """The notch dash, 4pt tall across the top edge: over the notch on the built-in display when
+        this Mac's tile has its displays and `notch_span`, else a 14pt dash at the tile's top centre."""
+        x, y, width, _height = frame
+        own = self.tiles[self.own_id]
+        span = self.states.get(self.own_id, {}).get("notch_span")
+        screen = next((screen for screen in core_ways._display_frames(own)
+                       if span and own.get("displays") and screen["display"] == span[0]), None)
+        if screen is None:
+            return x + width / 2 - 7, y - 2, 14, 4
+        scale = width / own["w"]
+        left = x + (screen["x"] - own["x"]) * scale
+        top = y + (screen["y"] - own["y"]) * scale
+        span_width = screen["w"] * scale
+        return left + span[1] * span_width, top - 2, (span[2] - span[1]) * span_width, 4
+
+    @objc.python_method
+    def snap_preview(self):
+        if self.dragging is None or self.dragging.get("display") is not None:
+            return None
+        key = self.dragging.get("key")
+        if key in (None, self.own_id) or key not in self.tiles or self.own_id not in self.tiles:
+            return None
+        _frames, scale = self._map()
+        radius = self.snap_radius_for_scale(scale)
+        tile = self.tiles[key]
+        layout = {ident: value for ident, value in self.tiles.items() if ident != key}
+        snapped = core_ways.snap_position(tile, self.own_id, layout, radius=radius)
+        if ((snapped["x"], snapped["y"]) == (tile["x"], tile["y"])
+                or not core_ways.within_snap_radius(tile, snapped, self.own_id, layout, radius)):
+            return None
+        return {**tile, **snapped}
+
+    @objc.python_method
+    def _draw_snap_preview(self, frames, scale):
+        snapped = self.snap_preview()
+        if snapped is None:
+            self.snap_ghost.setHidden_(True)
+            self.snap_seam.setHidden_(True)
+            return
+        key = self.dragging["key"]
+        own = self.tiles[self.own_id]
+        own_frame = frames[self.own_id]
+        offset_x = own_frame[0] - own["x"] * scale
+        offset_y = own_frame[1] - own["y"] * scale
+        peer_frame = (snapped["x"] * scale + offset_x, snapped["y"] * scale + offset_y,
+                      snapped["w"] * scale, snapped["h"] * scale)
+        path = Quartz.CGPathCreateMutable()
+        Quartz.CGPathAddRect(path, None, Quartz.CGRectMake(*peer_frame))
+        self.snap_ghost.setPath_(path)
+        self.snap_ghost.setZPosition_(19)
+        self.snap_ghost.setHidden_(False)
+        contact = core_ways._rect_contact(own, snapped)
+        self.snap_seam.setHidden_(contact is None)
+        if contact is None:
+            return
+        side, start, end = contact
+        x, y, width, height = frames[self.own_id]
+        seam = Quartz.CGPathCreateMutable()
+        if side == "corner":
+            px = x if start.endswith("left") else x + width
+            py = y if start.startswith("top") else y + height
+            Quartz.CGPathAddEllipseInRect(seam, None, Quartz.CGRectMake(px - 3.5, py - 3.5, 7, 7))
+            self.snap_seam.setStrokeColor_(AppKit.NSColor.clearColor().CGColor())
+        elif side in ("left", "right"):
+            px = x if side == "left" else x + width
+            inset = min(2.0, max(0.0, (end - start) * scale / 2))
+            self.snap_seam.setStrokeColor_(theme.cg("signal"))
+            Quartz.CGPathMoveToPoint(seam, None, px, y + (start - own["y"]) * scale + inset)
+            Quartz.CGPathAddLineToPoint(seam, None, px, y + (end - own["y"]) * scale - inset)
+        else:
+            py = y if side == "top" else y + height
+            inset = min(2.0, max(0.0, (end - start) * scale / 2))
+            self.snap_seam.setStrokeColor_(theme.cg("signal"))
+            Quartz.CGPathMoveToPoint(seam, None, x + (start - own["x"]) * scale + inset, py)
+            Quartz.CGPathAddLineToPoint(seam, None, x + (end - own["x"]) * scale - inset, py)
+        self.snap_seam.setPath_(seam)
+        self.snap_seam.setFillColor_(theme.cg("signal"))
+        self.snap_seam.setZPosition_(21)
+
+    @objc.python_method
+    def _draw_guides(self, frame):
+        own_frame = frame
+        while len(self.grid_layers) < 4:
+            grid = _box(("edge", 0.24), None)
+            self.layer().insertSublayer_atIndex_(grid, 0)
+            self.grid_layers.append(grid)
+        for layer in self.grid_layers:
+            layer.setHidden_(own_frame is None)
+        if own_frame is not None:
+            x, y, width, height = own_frame
+            for index, layer in enumerate(self.grid_layers):
+                if index < 2:
+                    gx = x + width * (index + 1) / 3
+                    layer.setFrame_(_rect((gx, 0, 1, self.bounds().size.height)))
+                else:
+                    gy = y + height * (index - 1) / 3
+                    layer.setFrame_(_rect((0, gy, self.bounds().size.width, 1)))
+        visible = self.dragging is not None and frame is not None
+        while len(self.guide_layers) < 16:
+            guide = _box(("ink_3", 0.36), None)
+            self.layer().addSublayer_(guide)
+            self.guide_layers.append(guide)
+        for guide in self.guide_layers:
+            guide.setHidden_(not visible)
+        if not visible:
+            return
+        x, y, width, height = frame
+        marks = []
+        for part in range(4):
+            cx, cy = x + width * part / 3, y + height * part / 3
+            marks.extend(((cx - 0.8, y - 7, 1.6, 6), (cx - 0.8, y + height + 1, 1.6, 6),
+                          (x - 7, cy - 0.8, 6, 1.6), (x + width + 1, cy - 0.8, 6, 1.6)))
+        for layer, rect in zip(self.guide_layers, marks):
+            layer.setFrame_(_rect(rect))
+
+    @objc.python_method
+    def _recentre_frame(self):
+        width = self.bounds().size.width
+        return width - 84, 7, 74, 24
+
+    @objc.python_method
+    def _recentre_screen_frame(self):
+        rect = AppKit.NSMakeRect(*self._recentre_frame())
+        window = self.window()
+        if window is None:
+            return rect
+        return window.convertRectToScreen_(self.convertRect_toView_(rect, None))
+
+    @objc.python_method
+    def _nearest_side(self, own, peer):
+        targets = {side: core_ways.place_beside({self.own_id: own, self.selected: peer},
+                                                self.own_id, self.selected, side)
+                   for side in ("left", "right", "top", "bottom")}
+        return min(targets, key=lambda side: (targets[side]["x"] - peer["x"]) ** 2
+                   + (targets[side]["y"] - peer["y"]) ** 2)
+
+    @objc.python_method
+    def _recentre_side(self, peer):
+        own = self.tiles.get(self.own_id)
+        tile = self.tiles.get(peer)
+        if own is None or tile is None:
+            return None
+        contact = core_ways._rect_contact(own, tile)
+        if contact and contact[0] != "corner":
+            return contact[0]
+        return self._nearest_side(own, tile)
+
+    @objc.python_method
+    def _is_centred(self, peer):
+        if peer not in self.tiles or self.own_id not in self.tiles:
+            return False
+        own, tile = self.tiles[self.own_id], self.tiles[peer]
+        for side in ("left", "right", "top", "bottom"):
+            target = core_ways.place_beside({self.own_id: own, peer: tile}, self.own_id, peer, side)
+            if target["x"] == tile["x"] and target["y"] == tile["y"]:
+                return True
+        return False
+
+    @objc.python_method
+    def _show_recentre(self):
+        return (self.selected not in (None, self.own_id) and self.selected in self.tiles
+                and self.own_id in self.tiles and not self._is_centred(self.selected))
+
+    @objc.python_method
+    def recentre_selected(self):
+        if self.dragging is not None:
+            return False
+        peer = self.selected
+        side = self._recentre_side(peer) if peer not in (None, self.own_id) else None
+        if side is None:
+            return False
+        self.tiles[peer] = core_ways.place_beside(self.tiles, self.own_id, peer, side)
+        self._draw(True)
+        if self.on_layout_change:
+            self.on_layout_change(self.tiles, peer, snap=False)
+        return True
+
+    @objc.python_method
+    def _recentre_hit(self, point):
+        if not self._show_recentre():
+            return False
+        x, y, width, height = self._recentre_frame()
+        return x <= point.x <= x + width and y <= point.y <= y + height
+
+    @objc.python_method
+    def tile_at(self, point):
+        frames, _scale = self._map()
+        return next((key for key, frame in reversed(list(frames.items()))
+                     if frame[0] <= point.x <= frame[0] + frame[2]
+                     and frame[1] <= point.y <= frame[1] + frame[3]), None)
+
+    @objc.python_method
+    def display_at(self, point):
+        frames, scale = self._map()
+        for key in reversed(list(self.tiles)):
+            if not self.tiles[key].get("displays"):
+                continue
+            frame = frames[key]
+            map_x, map_y = frame[0] - self.tiles[key]["x"] * scale, frame[1] - self.tiles[key]["y"] * scale
+            screens = reversed(core_ways._display_frames(self.tiles[key]))
+            for screen in screens:
+                rect = (screen["x"] * scale + map_x, screen["y"] * scale + map_y,
+                        screen["w"] * scale, screen["h"] * scale)
+                if rect[0] <= point.x <= rect[0] + rect[2] and rect[1] <= point.y <= rect[1] + rect[3]:
+                    return key, screen["display"]
+        return None, None
+
+    @objc.python_method
+    def _cycle_hit(self, key, point):
+        frames, _scale = self._map()
+        x, y, width, height = self._cycle_hit_rect(frames[key])
+        return self._shows_cycle(key) and x <= point.x <= x + width and y <= point.y <= y + height
+
+    @objc.python_method
+    def _stop_tile_animations(self, key):
+        layers = [self.layer_for_tile.get(key), self.label_for_tile.get(key),
+                  self.state_for_tile.get(key), self.outcome_for_tile.get(key),
+                  self.dot_for_tile.get(key), self.cycle_for_tile.get(key), self.focus_layer]
+        layers.extend(self.display_layers.get(key, ()))
+        for layer in layers:
+            if layer is not None:
+                layer.removeAllAnimations()
+
+    @objc.python_method
+    def toggle_cycle(self, key):
+        if not self.cycle_enabled or key == self.own_id or key not in self.tiles:
+            return
+        self.cycle[key] = not self.cycle.get(key, True)
+        if self.on_cycle_change:
+            self.on_cycle_change(key, self.cycle[key])
+        self._draw(False)
+
+    def updateTrackingAreas(self):
+        for area in self.trackingAreas():
+            self.removeTrackingArea_(area)
+        area = AppKit.NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            self.bounds(), AppKit.NSTrackingMouseEnteredAndExited | AppKit.NSTrackingMouseMoved |
+            AppKit.NSTrackingActiveInKeyWindow,
+            self, None)
+        self.addTrackingArea_(area)
+        objc.super(AtlasCanvas, self).updateTrackingAreas()
+
+    def mouseEntered_(self, event):
+        self.mouseMoved_(event)
+
+    def mouseMoved_(self, event):
+        point = self.convertPoint_fromView_(event.locationInWindow(), None)
+        recentre_hovered = self._recentre_hit(point)
+        hovered = self.tile_at(point)
+        if self._third_hit(point):
+            AppKit.NSCursor.pointingHandCursor().set()
+        elif hovered is not None and hovered != self.own_id:
+            AppKit.NSCursor.openHandCursor().set()
+        else:
+            AppKit.NSCursor.arrowCursor().set()
+        if hovered != self.hovered or recentre_hovered != self.recentre_hovered:
+            self.hovered = hovered
+            self.recentre_hovered = recentre_hovered
+            self._draw(False)
+
+    def mouseExited_(self, _event):
+        self.hovered = None
+        self.recentre_hovered = False
+        if self.dragging is None:
+            AppKit.NSCursor.arrowCursor().set()
+        self._draw(False)
+
+    def view_stringForToolTip_point_userData_(self, _view, _tag, point, _data):
+        hit = self._third_hit_segment(point)
+        if hit:
+            return self._third_tooltip(*hit)
+        return "In the shortcut's cycle"
+
+    def accessibilityPerformPress(self):
+        if self.selected in self.tiles and self.selected != self.own_id:
+            self.toggle_cycle(self.selected)
+            return True
+        return False
+
+    def mouseDown_(self, event):
+        self.window().makeFirstResponder_(self)
+        point = self.convertPoint_fromView_(event.locationInWindow(), None)
+        self.third_pressed = self._third_hit(point)
+        if self.third_pressed:
+            return
+        if self._recentre_hit(point):
+            self.recentre_selected()
+            return
+        key, display = self.display_at(point)
+        if key is None:
+            key = self.tile_at(point)
+        if key is None:
+            return
+        if event.clickCount() > 1 and key != self.own_id and self.on_rename:
+            self.selected = key
+            self.on_rename(key)
+            return
+        if event.clickCount() > 1 and key == self.own_id:
+            self.announce("Rename this Mac on Overview.")
+            return
+        if self._cycle_hit(key, point):
+            self.cycle[key] = not self.cycle.get(key, True)
+            if self.on_cycle_change:
+                self.on_cycle_change(key, self.cycle[key])
+            self._draw(False)
+            return
+        if key == self.own_id:
+            return
+        self._stop_tile_animations(key)
+        self.keyboard_focus = False
+        self.selected = key
+        self.last_announcement = ""
+        frames, scale = self._map()
+        origin_id = self.own_id if self.own_id in frames else key
+        origin = self.tiles[origin_id]
+        map_x = frames[origin_id][0] - origin["x"] * scale
+        map_y = frames[origin_id][1] - origin["y"] * scale
+        if self.on_select:
+            self.on_select(key)
+        offsets = self.tiles[key].get("display_offsets", {})
+        split = display is not None and display in offsets
+        option = bool(event.modifierFlags() & AppKit.NSEventModifierFlagOption)
+        if display is not None and (split or option):
+            self.dragging = {"key": key, "display": display, "display_offset": dict(offsets.get(display, {"x": 0, "y": 0})),
+                             "pointer_x": point.x, "pointer_y": point.y,
+                             "scale": scale,
+                             "map_x": map_x, "map_y": map_y,
+                             "moved": False,
+                             "split_toggle": option and not split, "group_toggle": option and split}
+            AppKit.NSCursor.closedHandCursor().set()
+            self._draw(False)
+            return
+        frame = frames[key]
+        self.dragging = {"key": key, "pointer_x": point.x - frame[0], "pointer_y": point.y - frame[1],
+                         "map_x": map_x, "map_y": map_y, "scale": scale,
+                         "moved": False}
+        AppKit.NSCursor.closedHandCursor().set()
+        self._draw(False)
+
+    def mouseDragged_(self, event):
+        if self.dragging is None:
+            return
+        point = self.convertPoint_fromView_(event.locationInWindow(), None)
+        scale = self.dragging["scale"]
+        key = self.dragging["key"]
+        if self.dragging.get("display") is not None:
+            display = self.dragging["display"]
+            dx = round((point.x - self.dragging["pointer_x"]) / scale)
+            dy = round((point.y - self.dragging["pointer_y"]) / scale)
+            tile = dict(self.tiles[key])
+            offsets = dict(tile.get("display_offsets", {}))
+            start = self.dragging["display_offset"]
+            offsets[display] = {"x": start["x"] + dx, "y": start["y"] + dy}
+            tile["display_offsets"] = offsets
+            self.tiles[key] = tile
+            self.dragging["moved"] = self.dragging["moved"] or bool(dx or dy)
+            self._draw(False)
+            return
+        tile = dict(self.tiles[key])
+        tile["x"] = round((point.x - self.dragging["pointer_x"] - self.dragging["map_x"]) / scale)
+        tile["y"] = round((point.y - self.dragging["pointer_y"] - self.dragging["map_y"]) / scale)
+        self.dragging["moved"] = self.dragging["moved"] or tile["x"] != self.tiles[key]["x"] or tile["y"] != self.tiles[key]["y"]
+        self.tiles[key] = tile
+        self._draw(False)
+
+    def mouseUp_(self, event):
+        if self.third_pressed:
+            pressed, self.third_pressed = self.third_pressed, None
+            point = self.convertPoint_fromView_(event.locationInWindow(), None)
+            if self._third_hit(point) == pressed and self.on_third:
+                self.on_third(*pressed)
+            return
+        if self.dragging is None:
+            return
+        key, moved = self.dragging["key"], self.dragging["moved"]
+        display = self.dragging.get("display")
+        split_toggle = self.dragging.get("split_toggle", False)
+        group_toggle = self.dragging.get("group_toggle", False)
+        preview = self.snap_preview() if moved and display is None else None
+        if preview is not None:
+            self.tiles[key] = preview
+        self.dragging = None
+        if preview is not None:
+            self._draw(True)
+        AppKit.NSCursor.arrowCursor().set()
+        if key != self.own_id and self.on_layout_change and (moved or (display is not None and (split_toggle or group_toggle))):
+            point = self.convertPoint_fromView_(event.locationInWindow(), None)
+            if display is not None and not moved and (split_toggle or group_toggle):
+                tile = dict(self.tiles[key])
+                offsets = dict(tile.get("display_offsets", {}))
+                if split_toggle:
+                    offsets[display] = {"x": 0, "y": 0}
+                else:
+                    offsets.pop(display, None)
+                updated = {**tile, "display_offsets": offsets}
+                if not offsets:
+                    updated.pop("display_offsets", None)
+                self.tiles[key] = updated
+                self.on_layout_change(self.tiles, key, snap=False)
+                return
+            if display is None and point.y > self.bounds().size.height and self.on_leave_out:
+                self.on_leave_out(key)
+                return
+            # The preview already decided any snap; a second snap in the app, on the scale after the
+            # drop, could move a tile the preview said would stay.
+            self.on_layout_change(self.tiles, key, snap=False)
+
+    def keyDown_(self, event):
+        self.keyboard_focus = True
+        if event.keyCode() == 8 and self._show_recentre():
+            self.recentre_selected()
+            return
+        vectors = {123: (-1, 0), 124: (1, 0), 125: (0, 1), 126: (0, -1)}
+        vector = vectors.get(event.keyCode())
+        if event.keyCode() in (36, 120) and self.selected not in (None, self.own_id) and self.on_rename:
+            self.on_rename(self.selected)
+            return
+        if event.keyCode() == 49 and self.cycle_enabled and self.selected not in (None, self.own_id):
+            self.toggle_cycle(self.selected)
+            return
+        if event.keyCode() == 48 and self.selected is not None:
+            ordered = self.reading_order()
+            backwards = bool(event.modifierFlags() & AppKit.NSEventModifierFlagShift)
+            next_index = ordered.index(self.selected) + (-1 if backwards else 1) if self.selected in ordered else 0
+            if 0 <= next_index < len(ordered):
+                self.select_tile(ordered[next_index])
+                return
+            self.keyboard_focus = False
+            self._draw(False)
+        if vector is not None and self.selected not in self.tiles:
+            return
+        if vector is None or self.selected is None or self.selected == self.own_id:
+            objc.super(AtlasCanvas, self).keyDown_(event)
+            return
+        tile = dict(self.tiles[self.selected])
+        tile["x"] += round(tile["w"] / 3) * vector[0]
+        tile["y"] += round(tile["h"] / 3) * vector[1]
+        self.tiles[self.selected] = tile
+        sentence = f"{self.labels.get(self.selected, 'Machine')} moved one third."
+        self._draw(True)
+        if self.on_layout_change:
+            self.on_layout_change(self.tiles, self.selected, snap=False)
+        else:
+            self.announce(sentence)
 
 
 class PushStrip(AppKit.NSView):
-    """The last stretch of this Mac's screen, the edge, and the other machine beyond it, with the push past the
-    edge drawn in: its depth is the resistance, out of the ruler's 500 px."""
+    """A single accessible resistance slider with live pressure on the same 0–500 track."""
 
-    HEIGHT = 44.0
-    EDGE_AT = 0.36
-    REST = 0.55
+    HEIGHT = 72.0
+    MAXIMUM = MAX_RESISTANCE
+    INSET = 18.0
+    TRACK_TOP = 20.0
+    TRACK_HEIGHT = 12.0
+    drawn_focus = False
 
     def isFlipped(self):
         return True
@@ -290,72 +1586,247 @@ class PushStrip(AppKit.NSView):
         root.setMasksToBounds_(True)
         theme.tint(root, background="ground", border="rule")
         root.setBorderWidth_(1)
-        self.this = _box("well")
-        self.fill = Quartz.CAGradientLayer.layer()
-        theme.tint(self.fill, colours=[("signal", 0.9), ("signal", 0.15)])
-        self.fill.setStartPoint_((0.0, 0.5))
-        self.fill.setEndPoint_((1.0, 0.5))
-        self.fill.setOpacity_(self.REST)
-        self.edge = _box("ink_3")
-        self.pointer = Quartz.CAShapeLayer.layer()
-        path = Quartz.CGPathCreateMutable()
-        for index, (x, y) in enumerate(((0, 0), (0, 14), (3.6, 10.6), (6.2, 16), (8.2, 15), (5.7, 9.8), (10, 9.8))):
-            (Quartz.CGPathMoveToPoint if index == 0 else Quartz.CGPathAddLineToPoint)(path, None, x, y)
-        Quartz.CGPathCloseSubpath(path)
-        self.pointer.setPath_(path)
-        theme.tint(self.pointer, fill="ink", stroke="ground")
-        self.pointer.setLineWidth_(1)
-        self.pointer.setBounds_(((0, 0), (10, 16)))
-        self.pointer.setAnchorPoint_((0.0, 0.0))
-        self.this_label = _text_layer(theme.TYPE["eyebrow"], "ink_3", Quartz.kCAAlignmentLeft)
-        self.other_label = _text_layer(theme.TYPE["eyebrow"], "ink_3", Quartz.kCAAlignmentRight)
-        for layer in (self.this, self.fill, self.edge, self.this_label, self.other_label, self.pointer):
-            root.addSublayer_(layer)
-        self.fraction = None
+        self._value = 120
+        self._pressure = 0.0
+        self._active_edge = "right"
+        self._crossing = False
+        self._flash_timer = None
+        self.on_change = None
         self.other_name = "Other machine"
-        self.setAccessibilityElement_(False)
+        self.setAccessibilityElement_(True)
+        self.setAccessibilityRole_(AppKit.NSAccessibilitySliderRole)
+        self.setAccessibilityLabel_("Resistance")
+        self.setAccessibilityValue_(self._value)
+        self._update_accessibility_description()
         return self
 
-    def layout(self):
-        objc.super(PushStrip, self).layout()
-        if self.fraction is not None:
-            self._draw(False)
+    def acceptsFirstResponder(self):
+        return True
+
+    def becomeFirstResponder(self):
+        self.setNeedsDisplay_(True)
+        return True
+
+    def resignFirstResponder(self):
+        self.setNeedsDisplay_(True)
+        return True
+
+    @objc.python_method
+    def refresh_keyboard_focus(self):
+        from widgets import keyboard_focus_visible
+
+        if keyboard_focus_visible(self) != self.drawn_focus:
+            self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def set_value(self, value, notify=False):
+        value = max(0, min(self.MAXIMUM, int(round(float(value)))))
+        if value == self._value:
+            return
+        self._value = value
+        self.setAccessibilityValue_(value)
+        self._update_accessibility_description()
+        self.setNeedsDisplay_(True)
+        if notify and self.on_change is not None:
+            self.on_change(value)
+
+    @objc.python_method
+    def set_other_name(self, name):
+        name = name or "Other machine"
+        if name != self.other_name:
+            self.other_name = name
+            self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def peer_label_text(self, width=None):
+        width = self.bounds().size.width if width is None else width
+        font = theme.font(theme.TYPE["eyebrow"], 600)
+        attributes = {AppKit.NSFontAttributeName: font,
+                      AppKit.NSForegroundColorAttributeName: theme.colour("ink_3"),
+                      AppKit.NSKernAttributeName: 1.45}
+        text = AppKit.NSString.stringWithString_(self.other_name.upper())
+        available = max(1.0, width / 2 - 16)
+        value = self.other_name.upper()
+        while value and AppKit.NSString.stringWithString_(value + "…").sizeWithAttributes_(attributes).width > available:
+            value = value[:-1]
+        return value + "…" if value != self.other_name.upper() else self.other_name.upper()
 
     @objc.python_method
     def show(self, fraction, other_name="Other machine"):
-        fraction = min(1.0, max(0.0, float(fraction)))
-        if fraction == self.fraction and other_name == self.other_name:
-            return
-        moving = self.fraction is not None and motion.live(self)
-        self.fraction, self.other_name = fraction, other_name
-        self._draw(moving)
-        if moving and fraction > 0:
-            # The push brightens as it moves, then settles back.
-            pulse = Quartz.CABasicAnimation.animationWithKeyPath_("opacity")
-            pulse.setFromValue_(1.0)
-            pulse.setToValue_(self.REST)
-            pulse.setDuration_(0.6)
-            pulse.setTimingFunction_(motion.timing())
-            self.fill.addAnimation_forKey_(pulse, "pulse")
+        self.set_value(float(fraction) * self.MAXIMUM)
+        self.set_other_name(other_name)
 
     @objc.python_method
-    def _draw(self, animate):
-        width, height = self.bounds().size.width, self.bounds().size.height
+    def set_pressure(self, pressure, edge=None, crossed=False):
+        if self._flash_timer is not None:
+            self._flash_timer.invalidate()
+            self._flash_timer = None
+        self._crossing = bool(crossed)
+        if edge:
+            self._active_edge = edge
+        self._pressure = max(0.0, min(float(pressure), self.MAXIMUM))
+        if self._crossing:
+            timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.12, self, "clearCrossingFlash:", None, False
+            )
+            AppKit.NSRunLoop.mainRunLoop().addTimer_forMode_(timer, AppKit.NSRunLoopCommonModes)
+            self._flash_timer = timer
+        self._update_accessibility_description()
+        self.setNeedsDisplay_(True)
+
+    def clearCrossingFlash_(self, _timer):
+        self._flash_timer = None
+        self._crossing = False
+        self._pressure = 0.0
+        self._update_accessibility_description()
+        self.setNeedsDisplay_(True)
+
+    def accessibilityHelp(self):
+        return self._accessibility_description
+
+    def accessibilityPerformIncrement(self):
+        self.nudge(1)
+        return True
+
+    def accessibilityPerformDecrement(self):
+        self.nudge(-1)
+        return True
+
+    @objc.python_method
+    def _update_accessibility_description(self):
+        pressure = int(round(self._pressure))
+        self._accessibility_description = (
+            f"Current pressure {pressure} of {self._value} pointer units at the {self._active_edge} edge."
+            if pressure > 0 else f"No push. Current pressure is 0 of {self._value} pointer units."
+        )
+        self.setAccessibilityHelp_(self._accessibility_description)
+
+    @objc.python_method
+    def move_to(self, fraction):
+        self.set_value(max(0, min(1, float(fraction))) * self.MAXIMUM, notify=True)
+
+    @objc.python_method
+    def nudge(self, direction, fine=False):
+        self.set_value(self._value + direction * (1 if fine else 10), notify=True)
+
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, value):
+        self.set_value(value)
+
+    def mouseDown_(self, event):
+        self._drag(event)
+
+    def mouseDragged_(self, event):
+        self._drag(event)
+
+    @objc.python_method
+    def _drag(self, event):
+        self.window().makeFirstResponder_(self)
+        point = self.convertPoint_fromView_(event.locationInWindow(), None)
+        width = self.bounds().size.width
+        self.move_to((point.x - self.INSET) / max(1.0, width - 2 * self.INSET))
+
+    def keyDown_(self, event):
+        keys = event.charactersIgnoringModifiers()
+        steps = {AppKit.NSLeftArrowFunctionKey: -1, AppKit.NSDownArrowFunctionKey: -1,
+                 AppKit.NSRightArrowFunctionKey: 1, AppKit.NSUpArrowFunctionKey: 1}
+        direction = steps.get(keys[0]) if keys else None
+        if direction is None:
+            objc.super(PushStrip, self).keyDown_(event)
+            return
+        self.nudge(direction, fine=bool(event.modifierFlags() & AppKit.NSEventModifierFlagOption))
+
+    def drawRect_(self, _rect):
+        from Foundation import NSMakeRect, NSString
+
+        width = self.bounds().size.width
         if width <= 0:
             return
-        edge = max(round(width * self.EDGE_AT), 20 + _text_width("THIS MAC", self.this_label.font()))
-        needed_height = max(self.HEIGHT, math.ceil(_text_height(
-            self.other_name.upper(), self.other_label.font(), width - edge - 20)) + 8)
-        if self.minimum_height.constant() != needed_height:
-            self.minimum_height.setConstant_(needed_height)
-        # The full 500 px stops short of the other machine's name, so the name is never under the push.
-        room = max(0, width - edge - min(120, _text_width(self.other_name.upper(), self.other_label.font()) + 20))
-        depth = room * self.fraction
-        motion.transaction(animate)
-        self.this.setFrame_(((0, 0), (edge, height)))
-        self.edge.setFrame_(((edge - 1, 0), (2, height)))
-        self.fill.setFrame_(((edge, 0), (depth, height)))
-        self.pointer.setPosition_((edge + depth - 1, (height - 16) / 2))
-        _fit_text(self.this_label, "THIS MAC", (10, 0, edge - 20, height))
-        _fit_text(self.other_label, self.other_name.upper(), (edge + 10, 0, width - edge - 20, height))
-        Quartz.CATransaction.commit()
+        left = resistance_x(width, 0)
+        right = resistance_x(width, self.MAXIMUM)
+        span = max(0.0, right - left)
+
+        def color(role):
+            theme.colour(role).set()
+
+        def text(value, x, y, w, h, font, role, align="center", kern=None):
+            value = str(value)
+            attributes = {AppKit.NSFontAttributeName: font,
+                          AppKit.NSForegroundColorAttributeName: theme.colour(role)}
+            if kern is not None:
+                attributes[AppKit.NSKernAttributeName] = kern
+            drawing = NSString.stringWithString_(value)
+            if align in ("left", "right") and drawing.sizeWithAttributes_(attributes).width > w:
+                while value and NSString.stringWithString_(value + "…").sizeWithAttributes_(attributes).width > w:
+                    value = value[:-1]
+                drawing = NSString.stringWithString_(value + "…")
+            size = drawing.sizeWithAttributes_(attributes)
+            if align == "right":
+                x += max(0, w - size.width)
+                w = size.width
+            elif align == "center":
+                x += max(0, (w - size.width) / 2)
+                w = size.width
+            drawing.drawInRect_withAttributes_(NSMakeRect(x, y, w, h), attributes)
+
+        track = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSMakeRect(left, self.TRACK_TOP, span, self.TRACK_HEIGHT), 3, 3
+        )
+        color("well")
+        track.fill()
+        color("ink_3")
+        track.setLineWidth_(1.0)
+        track.stroke()
+
+        head = resistance_x(width, self._pressure)
+        if self._pressure > 0:
+            fill = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(left, self.TRACK_TOP + 0.5, max(0.0, head - left), self.TRACK_HEIGHT - 1), 2.5, 2.5
+            )
+            color("signal")
+            fill.fill()
+
+        thumb_x = resistance_x(width, self._value)
+        path = AppKit.NSBezierPath.bezierPath()
+        path.moveToPoint_((thumb_x, 17.5))
+        path.lineToPoint_((thumb_x, 38.0))
+        from widgets import keyboard_focus_visible
+        focused = keyboard_focus_visible(self)
+        self.drawn_focus = focused
+        color("signal" if focused else "ink")
+        path.setLineWidth_(2.0)
+        path.stroke()
+
+        path = AppKit.NSBezierPath.bezierPath()
+        path.moveToPoint_((left, 17.0))
+        path.lineToPoint_((left, 41.0))
+        color("resistance_flash" if self._crossing else "signal" if self._pressure > 0 else "edge")
+        path.setLineWidth_(3.0 if self._crossing else 2.0)
+        path.stroke()
+
+        top_font = theme.font(theme.TYPE["eyebrow"], 600)
+        local_label = "THIS MAC"
+        peer_label = self.peer_label_text(width)
+        text(local_label, 8, 2, width / 2 - 8, 15, top_font, "ink_3", align="left", kern=1.45)
+        text(peer_label, width / 2, 2, width / 2 - 8, 15, top_font, "ink_3", align="right", kern=1.45)
+
+        scale_font = theme.mono_font(theme.TYPE["eyebrow"])
+        for value in range(0, self.MAXIMUM + 1, 25):
+            x = resistance_x(width, value)
+            major = value % 100 == 0
+            tick = AppKit.NSBezierPath.bezierPath()
+            tick.moveToPoint_((x, self.TRACK_TOP + self.TRACK_HEIGHT))
+            tick.lineToPoint_((x, self.TRACK_TOP + self.TRACK_HEIGHT + (12 if major else 4)))
+            color("ink_3" if major else "edge")
+            tick.setLineWidth_(1.0)
+            tick.stroke()
+            if major:
+                text(value, x - 22, 52, 44, 17, scale_font, "ink_2")
+
+    @property
+    def fraction(self):
+        return self._value / self.MAXIMUM

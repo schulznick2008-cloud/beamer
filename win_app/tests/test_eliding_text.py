@@ -112,20 +112,6 @@ class ElidingTextGeometryTests(unittest.TestCase):
                 self.assertGreaterEqual(button.height(), button.heightForWidth(button.width()))
                 self.assertEqual(button.accessibleName(), f"Machine, {LONG_NAME}")
 
-    def test_replacing_machine_choices_hides_the_old_container_before_deferred_deletion(self):
-        from PySide6.QtWidgets import QWidget
-        holder = QWidget()
-        slot = QVBoxLayout(holder)
-        previous = widgets.Choice((), 1, "")
-        slot.addWidget(previous.view)
-        holder.show()
-        self.addCleanup(holder.deleteLater)
-        self.settle()
-        owner = SimpleNamespace(_machine_items=(), machine_choice=previous, _machine_slot=slot,
-                                _choose_machine=lambda *_: None)
-        kvm.WindowsApplication._rebuild_machine_choice(owner, (("first", LONG_NAME), ("second", "Desk")))
-        self.assertTrue(previous.view.isHidden())
-
     def test_short_machine_name_stays_readable_between_long_names(self):
         self.app.setStyleSheet(theme.stylesheet())
         choice = widgets.Choice((("first", LONG_NAME[:48]), ("short", "Desk"),

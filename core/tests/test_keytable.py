@@ -135,6 +135,10 @@ class EvdevTests(unittest.TestCase):
         self.assertEqual(keytable.evdev_physical(194), "f24")
         self.assertEqual(keytable.evdev_physical(111), "delete")
         self.assertEqual(keytable.evdev_physical(113), "volume_mute")
+        self.assertEqual(keytable.evdev_physical(217), "search")
+        self.assertEqual(keytable.evdev_physical(224), "brightness_down")
+        self.assertEqual(keytable.evdev_physical(225), "brightness_up")
+        self.assertEqual(keytable.evdev_physical(248), "mic_mute")
 
     def test_every_name_it_returns_is_in_the_spec_and_no_name_twice_but_enter(self):
         names = list(keytable.EVDEV_NAMES.values())

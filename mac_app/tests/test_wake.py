@@ -110,6 +110,15 @@ class WakingControllerTests(unittest.TestCase):
             if thread.name == "wake":
                 thread.join(timeout=5)
 
+    def test_redirecting_for_an_edge_forwards_display_and_side(self):
+        with unittest.mock.patch.object(self.controller, "_awake", return_value=True), \
+                unittest.mock.patch.object(wake.KVMController, "set_redirecting", return_value=True) as base:
+            self.controller.set_redirecting(True, edge="right", offset=0.5, peer=PEER, reason="edge",
+                                             display="0", side="right")
+        base.assert_called_once_with(
+            True, "right", 0.5, came_home=True, peer=PEER, reason="edge", display="0", side="right"
+        )
+
     def test_a_pc_that_answered_and_refused_is_not_woken(self):
         for kind in REFUSED_KINDS:
             with self.subTest(kind=kind):

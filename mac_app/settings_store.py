@@ -21,6 +21,7 @@ from pathlib import Path
 
 import config as config_module
 from core import effects
+from core import crossing_state
 from core import ignored
 from core import peerlist
 from core import protocol
@@ -29,6 +30,7 @@ from core import return_edge
 from core import ways
 
 from crossing import CORNERS, EDGES, GLOW_COLOURS, GLOW_STYLES, HAPTIC_FEELS, HAPTIC_STEPS, METHODS, NOTCH_STYLES
+import dock_visibility
 from key_codes import KEY_NAME_TO_CODE
 from wake import parse_mac
 
@@ -45,7 +47,8 @@ MAX_PEERS = 32
 MOVED_CROSSING = ("methods", "edge", "edge_parts", "corner", "arrangement_set_at")
 ZONE_KINDS = tuple(method for method in METHODS if method != "shortcut")
 # Fields settings.json has that Config has no name for; everything else in it is Config's own.
-SETTINGS_ONLY = ("schema", "machine_id", "name", "port", "shortcut", "migrated_token_sha256", "peers", "zones", "crossing")
+SETTINGS_ONLY = ("schema", "machine_id", "name", "port", "shortcut", "migrated_token_sha256", "peers", "zones", "crossing",
+                 "layout", "layout_set_at", "layout_by", "show_in_dock")
 PEER_DEFAULTS = {
     "id": "", "name": "", "platform": "", "token": "", "host": "", "port": 0, "hw": "", "send": True,
     "allow_drive": True, "in_use": True, "side": "", "side_set_at": 0, "side_by": "", "paired_with": [], "paired_at": 0,
@@ -108,7 +111,9 @@ def editable_default_config():
         hide_addresses=False,
         same_on_both=False,
         same_set_at=0,
+        same_groups=[],
         same_by="",
+        same_stamps={},
         design_set_at=0,
         design_by="",
         design_follow_peer="",
@@ -143,7 +148,9 @@ def config_to_raw(cfg):
         "hide_addresses": cfg.hide_addresses,
         "same_on_both": cfg.same_on_both,
         "same_set_at": cfg.same_set_at,
+        "same_groups": list(cfg.same_groups),
         "same_by": cfg.same_by,
+        "same_stamps": {key: list(pair) for key, pair in cfg.same_stamps.items()},
         "design_set_at": cfg.design_set_at,
         "design_by": cfg.design_by,
         "design_follow_peer": cfg.design_follow_peer,
@@ -199,6 +206,12 @@ def _apply_zones(zones, peer_id, crossing):
 
 def _crossing_from_zones(settings, peer):
     """The crossing choices the zones and `shortcut` stand for, read for one peer."""
+    if isinstance(peer.get("ways"), dict):
+        intent = ways.ways(settings, peer["id"])
+        return dict(methods=(["shortcut"] if settings["shortcut"] else []) + intent["methods"],
+                    edge=peer["side"] or config_module.DEFAULT_CROSSING["edge"],
+                    edge_parts=intent["parts"], corner=intent["corner"],
+                    arrangement_set_at=peer["side_set_at"])
     mine = {}
     for zone in settings["zones"]:
         if zone.get("peer") == peer["id"] and zone.get("kind") in ZONE_KINDS:
@@ -329,6 +342,7 @@ class SettingsStore:
         of `replaced` when there is one. Raises SettingsError, writing nothing, if it cannot be saved."""
         with self.lock:
             settings = copy.deepcopy(self.current())
+            first_picture = set(settings.get("layout", {})) <= {settings["machine_id"]}
             if replaced is not None:
                 held = next((peer for peer in settings["peers"] if peer["token"] == replaced.get("token")), None)
                 # The snapshot `replaced` came from was taken before this lock: it may have changed
@@ -336,7 +350,10 @@ class SettingsStore:
                 if held is None or held["id"] != replaced.get("id") or held["linked"] != replaced.get("linked"):
                     raise SettingsError("the machine being replaced changed while pairing")
             peerlist.add_peer(settings, entry, replaced)
-            self.save_settings(settings)
+            if first_picture:
+                settings["layout"] = {}
+            outcome = crossing_state.paired(settings, platform="mac", own_displays={}, now=time.time())
+            self.save_settings(outcome["settings"])
 
     def set_peer(self, token, **switches):
         """Turns `send`, `allow_drive` and `in_use` on or off for the machine holding `token`; returns
@@ -374,26 +391,19 @@ class SettingsStore:
                 self.save_settings(settings)
             return removed
 
-    def set_ways(self, peer, *, side, methods, parts, corner, live=None):
-        """Writes one machine's side and zones, as the Crossing page shows them for it (core/ways.py).
-        A machine with no link now (`live(id)` false) gives way to them. Returns whether its side
-        moved, which the caller sends it as `arrangement`; SettingsError, writing nothing, for a
-        machine not in the list or zones that would clash with another's."""
+    def set_ways(self, peer, *, side=None, methods, parts, corner, live=None, gone=None, capable=()):
+        """Compatibility controls write local intent; the picture alone supplies the side."""
         with self.lock:
-            settings = copy.deepcopy(self.current())
             try:
-                moved = ways.edit(settings, peer, side=side, methods=methods, parts=parts, corner=corner,
-                                  kinds=ZONE_KINDS, corner_edge=lambda corner, _side: _corner_edge(corner), now=time.time())
-            except KeyError:
-                raise SettingsError("that machine is no longer paired with this Mac") from None
-            if moved:
-                # Moved onto a side another machine's edge holds: the side stands and this machine's
-                # way there goes off, as when the side arrives from it; the page says who holds it.
-                ways.settle(settings, peer, "this Mac", live)
-            for notice in ways.give_way(settings, peer, "this Mac", live):
-                LOGGER.info("%s", notice)
-            self.save_settings(settings)
-            return moved
+                outcome = crossing_state.edit_ways(self.current(), peer, platform="mac",
+                    edge=bool(set(methods) & {"edge", "part"}),
+                    thirds=list(ways.PARTS) if "edge" in methods else parts,
+                    corner="corner" in methods, corner_at=corner, notch="notch" in methods,
+                    live=live, gone=gone, now=time.time(), capable=capable)
+            except (KeyError, ValueError) as exc:
+                raise SettingsError("that machine is no longer paired with this Mac") from exc
+            self.save_settings(outcome["settings"])
+            return False
 
     def share_side(self, side, thirds):
         """Split one side's zones under the store lock, returning every machine whose zones changed."""
@@ -418,30 +428,22 @@ class SettingsStore:
             return True
 
     def settle_presence(self, live, gone):
-        """What became of the zones set aside for a machine with no link (core/ways.py settle_presence).
-        Returns (changed, notices): whether the file was written, and a sentence for each zone that
-        stays off for good or could not be put back."""
-        with self.lock:
-            settings = copy.deepcopy(self.current())
-            notices = ways.settle_presence(settings, "this Mac", live, gone)
-            changed = settings != self.current()
-            if changed:
-                self.save_settings(settings)
-            return changed, notices
+        """Presence has no saved history in the picture model."""
+        return False, []
 
-    def arrangement(self, peer, edge, set_at, by, way_back=None, way_back_by=None, live=None):
-        """A machine's `arrangement`, kept when it is newer than the side held for that machine, and
-        its `way_back` whatever the side (core/ways.py). Returns (changed, notices), a sentence for each
-        zone it turned off."""
+    def arrangement(self, peer, edge, set_at, by, way_back=None, way_back_by=None, live=None,
+                    gone=None, capable=()):
+        """Retain return status, taking side stamps only from old peers."""
         with self.lock:
-            settings = copy.deepcopy(self.current())
-            changed, notices = ways.arrangement(settings, peer, edge, set_at, by, "this Mac", way_back,
-                                                 way_back_by=way_back_by, live=live)
-            if changed:
-                self.save_settings(settings)
-            return changed, notices
+            outcome = crossing_state.receive_arrangement(self.current(), peer,
+                dict(edge=edge, set_at=set_at, by=protocol.read_id(by), way_back=way_back,
+                     way_back_by=protocol.read_id(way_back_by)), platform="mac", capable=capable,
+                live=live, gone=gone, now=time.time())
+            if outcome["changed"]:
+                self.save_settings(outcome["settings"])
+            return outcome["changed"], []
 
-    def save(self, raw):
+    def save(self, raw, settings_changes=None, remove_settings=()):
         try:
             cfg = config_module.parse_config(raw)
         except (config_module.ConfigError, TypeError, ValueError, OverflowError) as exc:
@@ -457,6 +459,10 @@ class SettingsStore:
                 except ValueError as exc:
                     raise SettingsError(str(exc)) from exc
             cfg = self._without_stale_pairing(cfg, base, handed)
+            if settings_changes:
+                base.update(copy.deepcopy(settings_changes))
+            for key in remove_settings:
+                base.pop(key, None)
             return self._config(self.save_settings(_merge_config(base, cfg)))
 
     @staticmethod
@@ -479,12 +485,34 @@ class SettingsStore:
     def load_settings(self):
         """The whole of settings.json, made from config.json on the first start and kept in step with it after."""
         with self.lock:
+            files = self._file_state()
+            if self._cache is not None and files == getattr(self, "_loaded_files", None):
+                return copy.deepcopy(self._cache)
             if not self.path.exists():
                 settings = self._migrate()
             else:
                 settings = self._reimport(self._read())
+            before = copy.deepcopy(settings)
+            ways.prune_layout(settings)
+            self._ensure_zones(settings)
+            if settings != before or getattr(self, "_read_migrated", False):
+                settings = self._save_settings(settings)
             self._cache = copy.deepcopy(settings)
+            # A writer replacing the file during the read must be noticed next time.
+            self._loaded_files = files
             return settings
+
+    def _file_state(self):
+        result = []
+        for path in (self.path, self.legacy_path):
+            try:
+                stat = path.stat()
+                result.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+            except FileNotFoundError:
+                result.append(None)
+            except OSError as exc:
+                raise SettingsError(str(exc)) from exc
+        return tuple(result)
 
     def save_settings(self, settings):
         """Check and write `settings` atomically; returns what was written."""
@@ -494,17 +522,24 @@ class SettingsStore:
             return written
 
     def _save_settings(self, settings):
-        settings = self._complete(settings)
+        settings = copy.deepcopy(settings)
         try:
             before = self._read()
         except SettingsError:
             before = None
-        if before:
+        if (before and isinstance(settings, dict) and isinstance(settings.get("peers"), list)
+                and isinstance(settings.get("zones"), list)
+                and all(isinstance(zone, dict) for zone in settings["zones"])):
             unnamed = next((peer for peer in before["peers"] if peer["id"] == ""), None)
             if unnamed:
-                learnt = next((peer for peer in settings["peers"] if peer["token"] == unnamed["token"] and peer["id"]), None)
+                learnt = next((peer for peer in settings["peers"] if isinstance(peer, dict)
+                               and peer.get("token") == unnamed["token"] and peer.get("id")), None)
                 if learnt:
                     settings["zones"] = _rename_zones(settings["zones"], "", learnt["id"])
+                elif any(peer.get("id") == "" and peer.get("token") == unnamed["token"]
+                         for peer in settings["peers"]) and not any(zone.get("peer") == "" for zone in settings["zones"]):
+                    settings["zones"].extend(copy.deepcopy(zone) for zone in before["zones"] if zone.get("peer") == "")
+        settings = self._complete(settings)
         self._ensure_zones(settings)
         self._check(settings)
         self._write(settings)
@@ -530,6 +565,11 @@ class SettingsStore:
             "peers": [],
             "zones": [],
             "crossing": {},
+            "layout": {},
+            "layout_set_at": 0,
+            "layout_by": "",
+            "same_groups": [],
+            "show_in_dock": True,
         }
 
     def _read(self):
@@ -539,16 +579,21 @@ class SettingsStore:
             raise SettingsError(f"{self.path.name} could not be read: {exc}") from exc
         if not isinstance(settings, dict) or settings.get("schema") != SCHEMA:
             raise SettingsError(f"{self.path.name} is not a schema {SCHEMA} settings file")
+        original = copy.deepcopy(settings)
         settings = self._complete(settings)
         self._ensure_zones(settings)
         self._check(settings)
+        self._read_migrated = settings != original
         return settings
 
     def _complete(self, settings):
         """A copy with every field the format has, so a hand-edited file missing one does not break a read."""
         settings = copy.deepcopy(settings)
-        for name in ("name", "port", "shortcut", "migrated_token_sha256", "crossing"):
+        for name in ("name", "port", "shortcut", "migrated_token_sha256", "crossing", "layout", "layout_set_at", "layout_by"):
             settings.setdefault(name, self._fresh()[name])
+        dock_visibility.complete_settings(settings)
+        settings.setdefault("same_groups", ["crossing", "design", "shortcut", "names"]
+                            if settings.get("same_on_both", False) else [])
         for name in ("machine_id", "peers", "zones"):
             if name not in settings:
                 raise SettingsError(f"{name} is missing; settings.json is not written over a file that lacks it")
@@ -558,21 +603,38 @@ class SettingsStore:
         peerlist.normalise_phones(settings)
         if not isinstance(settings["crossing"], dict):
             raise SettingsError("crossing must be a JSON object")
+        if (not isinstance(settings["layout"], dict) or type(settings["layout_set_at"]) is not int
+                or not 0 <= settings["layout_set_at"] <= 2 ** 53 - 2
+                or not isinstance(settings["layout_by"], str)
+                or settings["layout_by"] and not is_machine_id(settings["layout_by"])):
+            raise SettingsError("layout and its stamp are invalid")
         settings["crossing"] = {
             **{name: value for name, value in config_module.DEFAULT_CROSSING.items() if name not in MOVED_CROSSING},
             **settings["crossing"],
         } if peerlist.first_desktop(settings["peers"]) is not None else {**config_module.DEFAULT_CROSSING, **settings["crossing"]}
+        self._check(settings)
+        self._ensure_zones(settings)
+        if not settings["layout"]:
+            settings["layout"] = ways.derive_layout(settings, gap=0)
+        if len(settings["layout"]) > MAX_PEERS + 1 or settings["machine_id"] not in settings["layout"] or any(
+                not is_machine_id(machine) or not isinstance(tile, dict)
+                or any(type(tile.get(key)) is not int for key in ("x", "y", "w", "h"))
+                or tile["w"] < 1 or tile["h"] < 1 or not ways._valid_tile_displays(tile)
+                for machine, tile in settings["layout"].items()):
+            raise SettingsError("layout must have a valid tile for each machine id")
         return settings
 
-    @staticmethod
-    def _ensure_zones(settings):
-        """Give old pairs their edge and the one unplaced desktop its shown side on every read and save.
-        Run after a learnt id has renamed migrated zones, or that machine would get a second edge."""
+    def _ensure_zones(self, settings):
+        """Read legacy choices once and derive zones from the saved picture and intent."""
         if (isinstance(settings["zones"], list)
                 and all(isinstance(item, dict) for item in settings["peers"] + settings["zones"])
                 and all(isinstance(item.get("id"), str) for item in settings["peers"])):
-            ways.ensure_zones(settings)
-            ways.default_side(settings)
+            legacy = [copy.deepcopy(zone) for zone in settings["zones"] if zone.get("peer") == ""
+                      and any(peer.get("id") == "" for peer in settings["peers"])]
+            outcome = crossing_state.migrate(settings, "mac", capable=getattr(self, "_crossing_capable", ()))
+            settings.clear()
+            settings.update(outcome["settings"])
+            settings["zones"].extend(legacy)
 
     def _check(self, settings):
         if not is_machine_id(settings["machine_id"]):
@@ -580,6 +642,10 @@ class SettingsStore:
         for name, kind in (("name", str), ("shortcut", bool), ("migrated_token_sha256", str), ("zones", list)):
             if not isinstance(settings[name], kind):
                 raise SettingsError(f"{name} must be {kind.__name__}")
+        try:
+            dock_visibility.validate_settings(settings)
+        except ValueError as exc:
+            raise SettingsError(str(exc)) from exc
         if isinstance(settings["port"], bool) or not isinstance(settings["port"], int) or not 1 <= settings["port"] <= 65535:
             raise SettingsError("port must be between 1 and 65535")
         if not all(isinstance(zone, dict) and isinstance(zone.get("peer"), str) and zone.get("kind") in ZONE_KINDS
@@ -621,14 +687,6 @@ class SettingsStore:
                 key_ids.add(protocol.key_id(peer["token"]))
         if any(zone["peer"] not in ids for zone in settings["zones"]):
             raise SettingsError("a zone names a peer that is not in the list")
-        self._check_overlap(settings)
-
-    def _check_overlap(self, settings):
-        """Two zones in use never cover one stretch (WIRE.md section 8); a corner inside an edge is the
-        exception, and the notch stands beside the top edge, as 1.4.x let it, but leads to one machine."""
-        sentence = ways.clash(settings, "this Mac")
-        if sentence is not None:
-            raise SettingsError(sentence)
 
     def _write(self, settings):
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -767,6 +825,14 @@ class SettingsStore:
         for name, allowed in choices:
             if crossing[name] not in allowed:
                 raise SettingsError(f"crossing.{name} must be one of: {', '.join(allowed)}")
+        for name, low, high in (("effect_pace", effects.MIN_EFFECT_PACE, effects.MAX_EFFECT_PACE),
+                                ("effect_size_fraction", effects.MIN_EFFECT_SIZE_FRACTION,
+                                 effects.MAX_EFFECT_SIZE_FRACTION)):
+            value = crossing[name]
+            valid = (effects.valid_effect_pace(value) if name == "effect_pace"
+                     else effects.valid_effect_size_fraction(value))
+            if not valid:
+                raise SettingsError(f"crossing.{name} must be a number between {low} and {high}")
         for name in ("haptics", "glow", "block_while_dragging", "shortcut_arrival", "hold_full_screen"):
             if not isinstance(crossing[name], bool):
                 raise SettingsError(f"crossing.{name} must be true or false")

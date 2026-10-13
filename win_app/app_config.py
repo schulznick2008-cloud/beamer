@@ -3,10 +3,9 @@
 The file is settings.json (WIRE.md section 1), migrated from 1.4.x's config.json on the first start
 and never written back to it. `Config` is the flat view the window, the sender and the receiver have
 always read: this PC's own settings, and the first desktop peer as the fields that used to be the Mac's
-(`mac_host`, `auth_token`, `send_to_mac` and the rest). Each peer's side and zones are written only by
-`set_ways` and `apply_arrangement`, one peer at a time, never by a save of the flat view, so a view read
-before another machine sent its side cannot put the old one back. The settings carry whatever else
-the file holds through every save untouched."""
+(`mac_host`, `auth_token`, `send_to_mac` and the rest). Crossing events use core.crossing_state;
+the picture derives each peer's side and zones while ways retain the user's choices. Saving the
+flat view cannot restore stale crossing state. Unrelated settings survive every save."""
 
 import base64
 import binascii
@@ -28,7 +27,7 @@ from core import peerlist
 from core import protocol
 from core import receiver
 from core import return_edge
-from core import ways
+from core import ways, crossing_state
 from core.pairing import local_address_towards
 import tokens
 
@@ -69,11 +68,6 @@ class ConfigError(Exception):
     pass
 
 
-class ClashError(ConfigError):
-    """Two machines' zones would lead from one stretch of this PC's screen; the message is the
-    sentence that names both. Nothing was written."""
-
-
 class SettingsFileError(ConfigError):
     """settings.json exists but this version cannot use it (another schema, a hand edit that broke
     it). Nothing is written over it."""
@@ -97,6 +91,8 @@ class Config:
     # How long an effect takes to play through once the pointer crosses: see effects.LENGTHS.
     effect_length: str = "normal"
     effect_size: str = "medium"
+    effect_pace: float = 1.0
+    effect_size_fraction: float = 0.045
     # The Mac's name from the last pairing, for the window to say who this PC is paired with.
     paired_with: str = ""
     # Whether each machine may take the other's input. Two plain switches: the
@@ -110,8 +106,12 @@ class Config:
     # seconds of the last change to that or to a shared value; see settings_sync.
     same_on_both: bool = False
     same_set_at: int = 0
+    same_groups: list = field(default_factory=list)
     # The machine that made that last change, its id as base64: the larger id wins a tie.
     same_by: str = ""
+    # Each shared value's own stamp, {key: [set_at, by]}, since 1.5.2; a key with none takes
+    # same_set_at and same_by (settings_sync.held_stamps).
+    same_stamps: dict = field(default_factory=dict)
     design_set_at: int = 0
     design_by: str = ""
     design_follow_peer: str = ""
@@ -128,6 +128,7 @@ class Config:
     # "Part of the edge": the thirds of the edge to the Mac that cross, as return_edge.PARTS names them.
     crossing_edge_parts: list = field(default_factory=lambda: ["middle"])
     crossing_resistance_px: int = 120
+    shortcut_goes_to: str = "last"
     trigger_key: str = "cmd_r"
     trigger_style: str = "double_tap"
     double_tap_ms: int = 300
@@ -159,6 +160,9 @@ class Config:
     # machines; empty until a settings file has given it one. The id never changes once made.
     machine_id: str = ""
     name: str = ""
+    layout: dict = field(default_factory=dict)
+    layout_set_at: int = 0
+    layout_by: str = ""
 
 
 def _stamp(value) -> int:
@@ -209,10 +213,14 @@ def validate_config(config: Config) -> None:
         raise ConfigError("auth_token must be text")
     if config.auth_token == "CHANGE_ME":
         raise ConfigError("auth_token is still the placeholder")
+    if not isinstance(config.layout, dict) or not isinstance(config.layout_by, str):
+        raise ConfigError("layout is invalid")
     if config.trigger_key not in TRIGGER_KEYS:
         raise ConfigError(f"trigger_key must be one of: {', '.join(TRIGGER_KEYS)}")
     if config.trigger_style not in TRIGGER_STYLES:
         raise ConfigError(f"trigger_style must be one of: {', '.join(TRIGGER_STYLES)}")
+    if config.shortcut_goes_to not in ("last", "next", "ticked"):
+        raise ConfigError("shortcut_goes_to must be last, next or ticked")
     try:
         double_tap_ms = int(config.double_tap_ms)
     except (TypeError, ValueError) as exc:
@@ -252,6 +260,11 @@ def validate_config(config: Config) -> None:
         raise ConfigError("hide_addresses must be true or false")
     if not isinstance(config.same_on_both, bool):
         raise ConfigError("same_on_both must be true or false")
+    if (not isinstance(config.same_groups, list)
+            or any(group not in ("crossing", "design", "shortcut", "names") for group in config.same_groups)):
+        raise ConfigError("same_groups must contain known group names")
+    if not isinstance(config.same_stamps, dict):
+        raise ConfigError("same_stamps must be an object")
     for name in ("pointer_speed", "scroll_speed"):
         value = getattr(config, name)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.25 <= value <= 4.0:
@@ -280,6 +293,10 @@ def validate_config(config: Config) -> None:
     sizes = tuple(value for value, _name in effects.SIZES)
     if config.effect_size not in sizes:
         raise ConfigError(f"effect_size must be one of: {', '.join(sizes)}")
+    if not effects.valid_effect_pace(config.effect_pace):
+        raise ConfigError("effect_pace must be a number from 0.25 to 2.5")
+    if not effects.valid_effect_size_fraction(config.effect_size_fraction):
+        raise ConfigError("effect_size_fraction must be a number from 0.02 to 0.08")
     if not isinstance(config.paired_with, str):
         raise ConfigError("paired_with must be text")
     if not isinstance(config.send_to_mac, bool):
@@ -306,6 +323,12 @@ def config_from_dict(raw: dict) -> Config:
     missing = [key for key in ("host", "port", "auth_token") if key not in raw]
     if missing:
         raise ConfigError(f"config.json is missing required field(s): {', '.join(missing)}")
+    lengths = tuple(value for value, _name in effects.LENGTHS)
+    if raw.get("effect_length", "normal") not in lengths:
+        raise ConfigError(f"effect_length must be one of: {', '.join(lengths)}")
+    sizes = tuple(value for value, _name in effects.SIZES)
+    if raw.get("effect_size", "medium") not in sizes:
+        raise ConfigError(f"effect_size must be one of: {', '.join(sizes)}")
     trigger_key = raw.get("trigger_key", "cmd_r")
     try:
         glow_style, glow_colour, switch_style = effects.offered(
@@ -322,13 +345,18 @@ def config_from_dict(raw: dict) -> Config:
             shortcut_arrival_style=switch_style,
             effect_length=raw.get("effect_length", "normal"),
             effect_size=raw.get("effect_size", "medium"),
+            effect_pace=raw.get("effect_pace"),
+            effect_size_fraction=raw.get("effect_size_fraction"),
             paired_with=raw.get("paired_with", "") or "",
             allow_mac_to_drive=raw.get("allow_mac_to_drive", True),
             check_updates=raw.get("check_updates", True),
             hide_addresses=raw.get("hide_addresses", False),
             same_on_both=raw.get("same_on_both", False),
             same_set_at=_stamp(raw.get("same_set_at", 0)),
+            same_groups=raw.get("same_groups", ["crossing", "design", "shortcut", "names"]
+                                if raw.get("same_on_both", False) else []),
             same_by=raw.get("same_by", "") or "",
+            same_stamps=dict(raw["same_stamps"]) if isinstance(raw.get("same_stamps"), dict) else {},
             design_set_at=_stamp(raw.get("design_set_at", 0)),
             design_by=raw.get("design_by", "") or "",
             design_follow_peer=raw.get("design_follow_peer", "") or "",
@@ -340,6 +368,7 @@ def config_from_dict(raw: dict) -> Config:
             crossing_corner=raw.get("crossing_corner", "top_left"),
             crossing_edge_parts=raw.get("crossing_edge_parts", ["middle"]),
             crossing_resistance_px=int(raw.get("crossing_resistance_px", 120)),
+            shortcut_goes_to=raw.get("shortcut_goes_to", "last"),
             trigger_key=trigger_key,
             trigger_style=raw.get("trigger_style", "double_tap"),
             double_tap_ms=int(raw.get("double_tap_ms", 300)),
@@ -355,9 +384,15 @@ def config_from_dict(raw: dict) -> Config:
             appearance=raw.get("appearance") if raw.get("appearance") in tokens.APPEARANCES else "system",
             machine_id=raw.get("machine_id", "") or "",
             name=raw.get("name", "") or "",
+            layout=raw.get("layout", {}) or {},
+            layout_set_at=_stamp(raw.get("layout_set_at", 0)),
+            layout_by=raw.get("layout_by", "") or "",
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"config.json contains an invalid value: {exc}") from exc
+    (config.effect_pace, config.effect_size_fraction,
+     config.effect_length, config.effect_size) = effects.design_values(
+        config.effect_pace, config.effect_size_fraction, config.effect_length, config.effect_size)
     validate_config(config)
     return config
 
@@ -391,13 +426,17 @@ def config_to_dict(config: Config) -> dict:
         "shortcut_arrival_style": config.shortcut_arrival_style,
         "effect_length": config.effect_length,
         "effect_size": config.effect_size,
+        "effect_pace": config.effect_pace,
+        "effect_size_fraction": config.effect_size_fraction,
         "paired_with": config.paired_with,
         "allow_mac_to_drive": config.allow_mac_to_drive,
         "check_updates": config.check_updates,
         "hide_addresses": config.hide_addresses,
         "same_on_both": config.same_on_both,
         "same_set_at": int(config.same_set_at),
+        "same_groups": list(config.same_groups),
         "same_by": config.same_by,
+        "same_stamps": copy.deepcopy(config.same_stamps),
         "design_set_at": int(config.design_set_at),
         "design_by": config.design_by,
         "design_follow_peer": config.design_follow_peer,
@@ -409,6 +448,7 @@ def config_to_dict(config: Config) -> dict:
         "crossing_corner": config.crossing_corner,
         "crossing_edge_parts": list(config.crossing_edge_parts),
         "crossing_resistance_px": int(config.crossing_resistance_px),
+        "shortcut_goes_to": config.shortcut_goes_to,
         "trigger_key": config.trigger_key,
         "trigger_style": config.trigger_style,
         "double_tap_ms": int(config.double_tap_ms),
@@ -424,6 +464,9 @@ def config_to_dict(config: Config) -> dict:
         "appearance": config.appearance,
         "machine_id": config.machine_id,
         "name": config.name,
+        "layout": config.layout,
+        "layout_set_at": int(config.layout_set_at),
+        "layout_by": config.layout_by,
     }
 
 
@@ -512,6 +555,7 @@ def _peer_entry(raw: dict, token: str, port: int, own_id: str) -> dict:
     side = raw.get("mac_return_edge")
     side = side if side in EDGES else ""
     set_at = _stamp(raw.get("arrangement_set_at", 0))
+    methods, corner, parts = _zone_fields(raw)
     return {
         "id": "", "name": _text(raw.get("paired_with")), "platform": "macos", "token": token,
         "host": _text(raw.get("mac_host")), "port": port, "hw": _text(raw.get("mac_hardware_address")),
@@ -519,6 +563,9 @@ def _peer_entry(raw: dict, token: str, port: int, own_id: str) -> dict:
         "in_use": True,
         "side": side, "side_set_at": set_at, "side_by": own_id if set_at else "",
         "paired_with": [], "paired_at": 0, "linked": False, "from_1_4": True,
+        "ways": {"edge": bool(set(methods) & {"edge", "part"}),
+                 "thirds": list(ways.PARTS) if "edge" in methods else parts,
+                 "corner": "corner" in methods, "corner_at": corner, "notch": False},
     }
 
 
@@ -545,7 +592,7 @@ def migrate(legacy, machine_id=None) -> dict:
     machine_id = machine_id or new_machine_id()
     settings = {
         "schema": SCHEMA, "machine_id": machine_id, "name": "", "port": protocol.DEFAULT_PORT, "shortcut": True,
-        "peers": [], "zones": [], "migrated_token_sha256": "",
+        "peers": [], "zones": [], "migrated_token_sha256": "", "layout": {}, "layout_set_at": 0, "layout_by": "",
     }
     if not isinstance(legacy, dict):
         return settings
@@ -648,6 +695,8 @@ def load_settings(path: Path) -> dict:
     legacy = _read_object(legacy_config_path(path))
     if not path.exists():
         settings = migrate(legacy)
+        settings = crossing_state.migrate(settings, "pc")["settings"]
+        settings = crossing_state.paired(settings, platform="pc", own_displays={}, now=time.time())["settings"]
         _write_json(path, settings)
         return settings
     settings = _read_object(path)
@@ -666,14 +715,41 @@ def load_settings(path: Path) -> dict:
                                     or (entry["jump_key"] and not ways.valid_jump_key(entry["jump_key"])))
            for entry in settings["peers"]):
         raise SettingsFileError(f"{path} has a peer jump_key that is not a recorded modifier chord, and is left as it is")
-    if _overlapping_zones(settings):
-        raise SettingsFileError(f"{path} has two zones in use over the same stretch of the screen, and is left as it is")
     settings.setdefault("name", "")
     settings.setdefault("port", protocol.DEFAULT_PORT)
     settings.setdefault("shortcut", True)
     settings.setdefault("migrated_token_sha256", "")
-    repaired = ways.ensure_zones(settings) or phones_repaired
-    if (legacy is not None and remigrate(settings, legacy)) or repaired:
+    settings.setdefault("layout", {})
+    settings.setdefault("layout_set_at", 0)
+    settings.setdefault("layout_by", "")
+    if (not isinstance(settings["layout"], dict) or type(settings["layout_set_at"]) is not int
+            or not 0 <= settings["layout_set_at"] <= 2 ** 53 - 2
+            or not isinstance(settings["layout_by"], str)
+            or settings["layout_by"] and not is_machine_id(settings["layout_by"])):
+        raise SettingsFileError(f"{path} has an invalid layout")
+    if (len(settings["layout"]) > MAX_PEERS + 1 or any(
+            not is_machine_id(machine) or not isinstance(tile, dict)
+            or any(type(tile.get(key)) is not int for key in ("x", "y", "w", "h"))
+            or tile["w"] < 1 or tile["h"] < 1 or not ways._valid_tile_displays(tile)
+            for machine, tile in settings["layout"].items())):
+        raise SettingsFileError(f"{path} has an invalid layout tile")
+    remigrated = legacy is not None and remigrate(settings, legacy)
+    legacy_edges = [zone.get("peer") for zone in settings["zones"]
+                    if zone.get("kind") == "edge" and not zone.get("off") and not zone.get("page_off")]
+    intents_repaired = False
+    for entry in settings["peers"]:
+        if "ways" not in entry and entry.get("port") != 0 and entry.get("id", "") in legacy_edges:
+            # Legacy whole edges covered thirds; retain that precedence before canonical allocation.
+            entry["ways"] = ways._read_intent(settings, entry.get("id", ""))
+            entry["ways"]["thirds"] = list(ways.PARTS)
+            intents_repaired = True
+        elif not entry.get("id") and entry.get("port") != 0 and "ways" not in entry:
+            entry["ways"] = ways._read_intent(settings, "")
+    outcome = crossing_state.migrate(settings, "pc")
+    settings = outcome["settings"]
+    if remigrated:
+        settings = crossing_state.paired(settings, platform="pc", own_displays={}, now=time.time())["settings"]
+    if remigrated or phones_repaired or intents_repaired or outcome["changed"]:
         _write_json(path, settings)
     return settings
 
@@ -687,28 +763,6 @@ def _own_address(target: str) -> str:
         return ""
 
 
-def _overlapping_zones(settings: dict) -> bool:
-    """Whether two zones in use cover one stretch (WIRE.md section 8): an edge zone covers its peer's side,
-    a part zone the chosen thirds of it, a corner zone its corner. A corner inside an edge is fine, and
-    a zone this reads as nothing (no such kind, no thirds) is left to the defaults as before."""
-    sides = {peer.get("id", ""): peer.get("side", "") for peer in settings["peers"]}
-    seen = set()
-    for zone in settings["zones"]:
-        if zone.get("off") is True:
-            continue
-        kind, side = zone.get("kind"), sides.get(zone.get("peer"), "")
-        if kind == "corner" and zone.get("corner") in CORNERS:
-            stretch = {("corner", zone["corner"])}
-        elif kind == "edge" and side in return_edge.EDGES:
-            stretch = {(side, part) for part in return_edge.PARTS}
-        elif kind == "part" and side in return_edge.EDGES and isinstance(zone.get("parts"), list):
-            stretch = {(side, part) for part in zone["parts"] if part in return_edge.PARTS}
-        else:
-            continue
-        if stretch & seen:
-            return True
-        seen |= stretch
-    return False
 
 
 def _zones_of(settings: dict, peer_id: str) -> dict:
@@ -833,7 +887,10 @@ def save_config(path: Path, config: Config) -> None:
                 ways.check_trigger_key(settings, config.trigger_key)
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
+        old_tokens = [entry.get("token") for entry in settings["peers"]]
         _apply_flat(settings, payload)
+        if old_tokens != [entry.get("token") for entry in settings["peers"]]:
+            settings = crossing_state.paired(settings, platform="pc", own_displays={}, now=time.time())["settings"]
         write_settings(path, settings)
 
 
@@ -875,7 +932,7 @@ def set_own(path: Path, **fields) -> None:
 
 def learned_fields(path: Path) -> dict:
     """What links write into the first peer's entry, in the flat view's names: its token, address,
-    hardware address and name, and the two direction switches."""
+    hardware address and name, the two direction switches, and the shared layout."""
     with SETTINGS_LOCK:
         flat = _flat_from_settings(load_settings(path))
     # With no peer there is nothing for links to have written, and the flat view has no such fields.
@@ -883,8 +940,9 @@ def learned_fields(path: Path) -> dict:
     return {name: flat[name] if name in flat else getattr(fallback, name) for name in LEARNED}
 
 
-# What links and a fold write into the first peer, in the flat view's names.
-LEARNED = ("auth_token", "mac_host", "mac_hardware_address", "paired_with", "send_to_mac", "allow_mac_to_drive")
+# What links and a fold write while the window holds its flat view.
+LEARNED = ("auth_token", "mac_host", "mac_hardware_address", "paired_with", "send_to_mac", "allow_mac_to_drive",
+           "layout", "layout_set_at", "layout_by")
 # The ones a link writes while the window is not looking, which a save must never overwrite.
 LINK_WRITTEN = ("mac_host", "mac_hardware_address", "paired_with")
 
@@ -901,68 +959,41 @@ def set_peer_hardware_address(path: Path, peer: str, address: str) -> bool:
         return True
 
 
-def set_ways(path: Path, peer: str, *, side=None, methods, parts, corner, live=None) -> bool:
-    """Writes one peer's ways across (WIRE.md section 8): its `side`, and its edge, part and corner
-    zones, in use when named in `methods`. `side` None keeps the side held now, so a change to a way
-    never puts back a side that arrived since the window last read it. A machine with no link now
-    (`live(id)` false) gives way to them (core/ways.py give_way). Raises ClashError, writing
-    nothing, when two machines' zones would then cover one stretch of this PC's screen; ConfigError
-    when no entry has `peer`. Returns whether the side moved, which the caller sends as `arrangement`."""
+def set_ways(path: Path, peer: str, *, side=None, methods, parts, corner, live=None, capable=()) -> bool:
+    """Save local intent through the shared crossing event; side belongs to the picture."""
     with SETTINGS_LOCK:
         settings = load_settings(path)
         entry = next((item for item in settings["peers"] if item.get("id") == peer), None)
         if entry is None:
             raise ConfigError("that machine is not paired with this PC")
-        moved = ways.edit(
-            settings, peer, side=entry.get("side", "") if side is None else side, methods=methods, parts=parts,
-            corner=corner, kinds=KINDS, corner_edge=_corner_edge, now=time.time(),
-        )
-        if moved:
-            # Moved onto a side another machine's edge holds: the side stands and this machine's way
-            # there goes off, as when the side arrives from it; the page says which machine holds it.
-            ways.settle(settings, peer, "this PC", live)
-        for notice in ways.give_way(settings, peer, "this PC", live):
-            LOGGER.info("%s", notice)
-        sentence = ways.clash(settings, "this PC")
-        if sentence is not None:
-            raise ClashError(sentence)
-        _write_json(path, settings)
-        return moved
+        outcome = crossing_state.edit_ways(
+            settings, peer, platform="pc", edge=bool(set(methods) & {"edge", "part"}),
+            thirds=list(ways.PARTS) if "edge" in methods else parts,
+            corner="corner" in methods, corner_at=corner, live=live, gone=None,
+            now=time.time(), capable=capable)
+        _write_json(path, outcome["settings"])
+        return entry.get("side", "") != ways._entry(outcome["settings"], peer).get("side", "")
 
 
 def share_side(path: Path, side: str, thirds: dict) -> list:
-    """Split one side's zones under the settings lock, returning every machine whose zones changed."""
-    with SETTINGS_LOCK:
-        settings = load_settings(path)
-        changed = ways.share(settings, side, thirds, kinds=KINDS)
-        _write_json(path, settings)
-        return changed
+    """Compatibility no-op: placement and thirds now allocate shared edges."""
+    return []
 
 
 def settle_presence(path: Path, live, gone):
-    """What became of the zones set aside for a machine with no link (core/ways.py settle_presence).
-    Returns (changed, notices): whether the file was written, and a sentence for each zone that stays
-    off for good or could not be put back."""
-    with SETTINGS_LOCK:
-        settings = load_settings(path)
-        before = copy.deepcopy(settings)
-        notices = ways.settle_presence(settings, "this PC", live, gone)
-        if settings == before:
-            return False, notices
-        _write_json(path, settings)
-        return True, notices
+    """Compatibility no-op: picture peers keep intent through link changes."""
+    return False, []
 
 
 def apply_arrangement(path: Path, peer: str, edge: str, set_at: int, by: str, way_back=None, way_back_by=None,
-                      live=None):
-    """A peer's `arrangement` (WIRE.md section 8), as core.ways takes it: `edge` is the edge of the peer
-    that faces this PC, so this PC's side for it is the opposite, and `way_back` is kept whatever the
-    side. Returns (changed, notices): whether the file was written, and a sentence for each of that
-    peer's zones turned off by a clash."""
+                      live=None, capable=()):
+    """Compatibility entry point for capability-aware arrangement reception."""
     with SETTINGS_LOCK:
         settings = load_settings(path)
-        changed, notices = ways.arrangement(settings, peer, edge, set_at, by, "this PC", way_back,
-                                             way_back_by=way_back_by, corner_edge=_corner_edge, live=live)
-        if changed:
-            _write_json(path, settings)
-        return changed, notices
+        outcome = crossing_state.receive_arrangement(
+            settings, peer, {"edge": edge, "set_at": set_at, "by": protocol.read_id(by),
+                             "way_back": way_back, "way_back_by": protocol.read_id(way_back_by)},
+            platform="pc", capable=capable, live=live, gone=None, now=time.time())
+        if outcome["changed"]:
+            _write_json(path, outcome["settings"])
+        return outcome["changed"], []

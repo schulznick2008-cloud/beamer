@@ -38,7 +38,7 @@ class ClickFocusTests(unittest.TestCase):
         cls.app.setStyleSheet(theme.stylesheet())
 
     def setUp(self):
-        scratch = ROOT / "renders" / "test-working"
+        scratch = ROOT / "win_app" / "renders" / "test-working"
         scratch.mkdir(parents=True, exist_ok=True)
         self.folder = tempfile.TemporaryDirectory(prefix="beamer-click-focus-", dir=scratch)
         self.window = SyntheticWindow(write_synthetic_settings(Path(self.folder.name)))

@@ -4,3 +4,5 @@ build/
 dist/
 *.pyc
 config.json
+.test-*/
+test-results-crossing/

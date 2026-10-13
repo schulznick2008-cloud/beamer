@@ -113,7 +113,7 @@ class SettingsLayoutAcceptanceTests(unittest.TestCase):
 
     def test_window_minimum_and_resize_constraints_cannot_drive_native_frame(self):
         control = self.control
-        self.assertEqual(tuple(control.window.minSize()), (320, 300))
+        self.assertEqual(tuple(control.window.minSize()), (640, 540))
         for key in control.pages:
             control._select_page(key)
             self.assertLess(control.page_width_constraints[key].priority(), 500)
@@ -148,16 +148,19 @@ class SettingsLayoutAcceptanceTests(unittest.TestCase):
         heading = control.panel.pair_button.view.superview().arrangedSubviews()[0]
         self.assertGreaterEqual(heading.bounds().size.width, heading.attributedStringValue().size().width)
 
-    def test_shortcut_diagram_legend_layers_fit_the_narrow_column(self):
+    def test_atlas_canvas_tiles_fit_the_narrow_column(self):
         control = self.control
         control._select_page('crossing')
         control.window.setFrame_display_(((100000, 100000), (320, 900)), False)
         settle(control.window)
-        diagram = control.arrangement_diagram
-        for layer in (diagram.key, diagram.key_how):
-            rect = layer.frame()
-            self.assertLessEqual(rect.origin.x + rect.size.width, diagram.bounds().size.width)
-            self.assertLessEqual(rect.origin.y + rect.size.height, diagram.bounds().size.height)
+        canvas = control.atlas_canvas
+        canvas.setFrame_(((0, 0), (canvas.superview().bounds().size.width, canvas.HEIGHT)))
+        frames, _scale = canvas._map()
+        for rect in frames.values():
+            self.assertGreaterEqual(rect[0], 0)
+            self.assertGreaterEqual(rect[1], 0)
+            self.assertLessEqual(rect[0] + rect[2], canvas.bounds().size.width)
+            self.assertLessEqual(rect[1] + rect[3], canvas.bounds().size.height)
 
     def test_key_recorders_keep_their_titles_readable_in_the_narrow_column(self):
         control = self.control
@@ -222,12 +225,13 @@ class SettingsLayoutAcceptanceTests(unittest.TestCase):
         control.window.makeFirstResponder_(control.window)
         control.window.selectNextKeyView_(None)
         self.assertEqual(control.window.firstResponder(), control.sidebar.rows['design'][1])
-        cell = control.length_select.cells[0][1]
-        control.window.makeFirstResponder_(cell)
-        self.assertFalse(cell.ring.isHidden())
+        slider = control.length_select.focusable_views[0]
+        self.assertTrue(slider.acceptsFirstResponder())
+        control.window.makeFirstResponder_(slider)
+        self.assertIs(control.window.firstResponder(), slider)
         control.window.keyboard_navigation = False
         control.window.refresh_input_focus()
-        self.assertTrue(cell.ring.isHidden())
+        self.assertFalse(control.window.keyboard_navigation)
 
     def test_length_size_stay_vertical_and_toggle_targets_remain_usable(self):
         control = self.control

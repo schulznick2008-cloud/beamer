@@ -19,6 +19,22 @@ def settle(window):
     assert not window.isVisible()
 
 
+def raster(view):
+    rep = view.bitmapImageRepForCachingDisplayInRect_(view.bounds())
+    view.cacheDisplayInRect_toBitmapImageRep_(view.bounds(), rep)
+    return rep
+
+
+def accent_pixels_near_top_edge(view):
+    rep = raster(view)
+    left, right = int(rep.pixelsWide() * .25), int(rep.pixelsWide() * .75)
+    return sum(
+        1 for y in range(2, min(16, rep.pixelsHigh())) for x in range(left, right)
+        if (lambda colour: colour.blueComponent() > .55 and
+            colour.blueComponent() - colour.redComponent() > .18)(rep.colorAtX_y_(x, y))
+    )
+
+
 def rect_list(rect):
     return [rect.origin.x, rect.origin.y, rect.size.width, rect.size.height]
 

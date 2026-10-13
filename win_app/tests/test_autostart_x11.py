@@ -58,6 +58,9 @@ class AutostartX11Test(unittest.TestCase):
     def enable(self, exe=EXE):
         autostart_x11.set_enabled(True, exe, base=self.base)
 
+    def test_it_answers_the_question_the_settings_page_asks_of_every_platform(self):
+        self.assertTrue(autostart_x11.can_run_for_current_user())
+
     def test_enable_writes_the_exact_file(self):
         self.enable()
         self.assertEqual(

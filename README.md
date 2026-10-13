@@ -16,13 +16,53 @@ still work, and what you type never leaves your network.
 
 ## Download
 
-Free, with no account. Mac and Windows downloads, and an experimental Linux Flatpak, are on the [releases page](https://github.com/kalkman-code/beamer/releases/latest).
+Free, with no account. Mac, Windows and Linux downloads are on the [releases page](https://github.com/kalkman-code/beamer/releases/latest). Linux uses Flatpak; there is no AppImage.
 
 | Platform | Get it | Notes |
 |---|---|---|
 | macOS 13 or later, Apple silicon or Intel | `Beamer-<version>.dmg` | One universal app, signed and notarised by Apple |
 | Windows 10 and 11 | `Beamer-Setup-<version>.exe` | Not code-signed; see step 1 below |
-| Linux, through Flatpak (experimental) | `Beamer-<version>-x86_64.flatpak`, or build it with [the Linux instructions](docs/flatpak-build.md) | GNOME on Wayland, or X11; tested on one GNOME Wayland desktop |
+| Linux, 64-bit x86 (Flatpak) | [Install from the Kalkman Code repository](https://flatpak.kalkmancode.co.uk/beamer.flatpakref); `Beamer-<version>-x86_64.flatpak` is available as an offline alternative | Tested on Fedora 44 GNOME under Wayland; KDE Plasma is experimental and not yet tested on real hardware; X11 is not yet verified |
+
+### Install on Linux
+
+Beamer for Linux is a Flatpak for 64-bit x86. There is no AppImage. Fedora, Linux
+Mint, Pop!_OS and other distributions with Flatpak can install it with one command:
+
+```sh
+flatpak install --user https://flatpak.kalkmancode.co.uk/beamer.flatpakref
+```
+
+Flatpak asks to add the Kalkman Code repository and fetches the KDE runtime from Flathub. The
+runtime download is a few hundred megabytes the first time only.
+
+On Ubuntu 24.04 or later and Debian 13 or later, install Flatpak first, then log out and back in
+or restart, then run the install command:
+
+```sh
+sudo apt install flatpak
+```
+
+```sh
+flatpak install --user https://flatpak.kalkmancode.co.uk/beamer.flatpakref
+```
+
+Older Ubuntu and Debian releases cannot send input out under Wayland because they lack the
+InputCapture portal; use an X11 session there. On Wayland, allow both desktop prompts: the first
+lets Beamer send input and the second lets it receive input. Start Beamer from the app menu; the
+Flatpak cannot start at sign-in yet. Update with `flatpak update` or your software centre's update
+tool, like any Flatpak.
+
+If you installed an earlier downloaded bundle, remove it first; your settings are kept:
+
+```sh
+flatpak uninstall --user uk.co.kalkman.beamer
+flatpak install --user https://flatpak.kalkmancode.co.uk/beamer.flatpakref
+```
+
+The downloadable `Beamer-<version>-x86_64.flatpak` bundle remains available from the [releases
+page](https://github.com/kalkman-code/beamer/releases/latest) as an offline alternative. To build
+for arm64, follow [the Linux instructions](docs/flatpak-build.md).
 
 ## Quick start
 
@@ -33,8 +73,7 @@ Free, with no account. Mac and Windows downloads, and an experimental Linux Flat
    run the installer. It is not code-signed, because a certificate costs money and Beamer is free,
    so Windows says "Windows protected your PC" the first time: choose More info, then Run anyway.
    Beamer on Windows runs as administrator, so expect one UAC prompt when you open it. On Linux,
-   install the Flatpak with `flatpak install --user Beamer-<version>-x86_64.flatpak`, or build it with
-   [the Flatpak instructions](docs/flatpak-build.md).
+   follow [Install on Linux](#install-on-linux) to install Beamer from the Kalkman Code repository.
 2. **Pair them.** On one machine, choose Pair a machine to show a six-digit code. On the other,
    choose that machine from the list and enter the code. It lasts a minute and works once. If it
    does not appear in the list, enter the address shown with its code on the other machine.
@@ -51,9 +90,9 @@ In your own appearance: light if your GitHub is light, dark if it is dark.
 
 <table>
 <tr><th>Mac</th><th>Windows</th></tr>
-<tr><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/mac-overview-light.png"><img src="assets/mac-overview-dark.png" width="400" alt="Beamer's Overview page on the Mac: where input is, whether the link is up, Send input and Pause crossing, and a switch for each direction"></picture></td><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/windows-overview-light.png"><img src="assets/windows-overview-dark.png" width="400" alt="Beamer's Overview page on Windows: where input is, Send input and Pause crossing, and a switch for each direction"></picture></td></tr>
-<tr><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/mac-crossing-light.png"><img src="assets/mac-crossing-dark.png" width="400" alt="Beamer's Crossing page on the Mac: a drawing of the Mac and the PC side by side with the crossing edge lit, and the ways in"></picture></td><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/windows-crossing-light.png"><img src="assets/windows-crossing-dark.png" width="400" alt="Beamer's Crossing page on Windows: a drawing of the Mac and the PC with the crossing edge lit, the ways in and where the Mac sits"></picture></td></tr>
-<tr><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/mac-design-light.png"><img src="assets/mac-design-dark.png" width="400" alt="Beamer's Design page on the Mac: a tile for each crossing style, shown at the edge, a corner or the notch, and the colours"></picture></td><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/windows-design-light.png"><img src="assets/windows-design-dark.png" width="400" alt="Beamer's Design page on Windows: a tile for each crossing style, shown at the edge, a corner or the notch, and the colours"></picture></td></tr>
+<tr><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/mac-overview-light.png"><img src="assets/mac-overview-dark.png" width="400" alt="Beamer's Overview page on the Mac: a Pair a machine button and a card for each paired machine, a desktop PC, a laptop and a Linux box, each showing it is linked, with an In use switch and Rename, Leave out, Directions and Remove buttons"></picture></td><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/windows-overview-light.png"><img src="assets/windows-overview-dark.png" width="400" alt="Beamer's Overview page on Windows: a Pair a machine button and a card for each paired machine, a Mac, a laptop and a Linux box, each showing it is linked, with an In use switch and Rename, Directions, Leave out and Remove buttons"></picture></td></tr>
+<tr><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/mac-crossing-light.png"><img src="assets/mac-crossing-dark.png" width="400" alt="Beamer's Crossing page on the Mac: a map with this Mac in the middle, a laptop to its left, a desktop PC to its right and a Linux box below, each edge lit where the pointer crosses, and a ledger of how each machine is reached"></picture></td><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/windows-crossing-light.png"><img src="assets/windows-crossing-dark.png" width="400" alt="Beamer's Crossing page on Windows: a map with this PC in the middle, a Mac to its left, a laptop to its right and a Linux box below, each edge lit where the pointer crosses, and a ledger of how each machine is reached"></picture></td></tr>
+<tr><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/mac-design-light.png"><img src="assets/mac-design-dark.png" width="400" alt="Beamer's Design page on the Mac: switches to animate crossings on this Mac and show where the pointer lands, a choice of style for crossing or for the shortcut and menu, shown at the edge, a corner or the notch, and a Light section of preview tiles"></picture></td><td><picture><source media="(prefers-color-scheme: light)" srcset="assets/windows-design-light.png"><img src="assets/windows-design-dark.png" width="400" alt="Beamer's Design page on Windows: switches to animate crossings on this PC and show where the pointer lands, a choice of style for crossing or for the shortcut and menu, shown at the edge or a corner, and a Light section of preview tiles"></picture></td></tr>
 </table>
 
 ## What it does
@@ -81,7 +120,8 @@ In your own appearance: light if your GitHub is light, dark if it is dark.
   arrives as the same physical key. On Windows, you can also choose a Mac keyboard layout, where
   Alt acts as Command and the Windows key acts as Option.
 - **Media keys follow you.** Play, pause, skip, mute and volume cross between supported machines.
-  Brightness and keyboard-backlight keys stay on the Mac.
+  While input is on a Windows laptop, the Mac's brightness keys change that laptop's built-in
+  screen; the keyboard-backlight keys stay on the Mac.
 - **Keys and buttons that stay put.** Each machine keeps a list of keys and mouse buttons that keep
   working where they were pressed while its input is on the other one: a mouse's back button for
   this machine's browser, a volume key for its speakers. Add one by pressing it. The back and
@@ -122,7 +162,7 @@ About Beamer.
 |---|---|---|
 | Overview | Paired machines, where input is, the links and their round trips, Send input and Pause crossing, a switch per direction, Same on all machines, start at login, the update check | Paired machines, where input is, the links and their round trips, Send input and Pause crossing, a switch per direction, Same on all machines, start at sign-in, the update check |
 | Permissions | Accessibility and Input Monitoring, with Relaunch Beamer | None; the firewall check is on Connection |
-| Crossing | A drawing of the arrangement, the ways in for each machine (edge, part of the edge, corner, notch), the full-screen hold, resistance, the shortcut and jump keys | A drawing of the arrangement, the ways in for each machine (edge, part of the edge, corner), the full-screen hold, resistance, the shortcut and jump keys |
+| Crossing | A map of the arrangement and a ledger of how each machine is reached (edge or its thirds, corner, notch) with its jump key, the full-screen hold, resistance, the shortcut | A map of the arrangement and a ledger of how each machine is reached (edge or its thirds, corner) with its jump key, the full-screen hold, resistance, the shortcut |
 | Keyboard | Key mapping, what stays on this Mac, each peer's pointer and scroll speed | Key mapping, including a Mac layout, what stays on this PC, each peer's pointer and scroll speed |
 | Design | Crossing and switch styles, colours, Size and Length, landing animation, Match design, notch and trackpad controls, window appearance (System, Light or Dark) | Crossing and switch styles, colours, Size and Length, landing animation, Match design, window appearance (System, Light or Dark) |
 | Connection | Hide addresses, a peer's address, port and pairing details | Whether Windows Firewall lets a peer in, with a one-button fix; hide addresses; this PC's address, port and pairing details |
@@ -179,12 +219,11 @@ time you overshoot a close button. The default is 120 points; zero switches on c
 | Way in | Where it triggers | Mac | Windows |
 |---|---|---|---|
 | Shortcut | Double-tap the trigger key, or hold it | Yes | Yes |
-| Edge | The whole of one outer edge | Yes | Yes |
-| Part of the edge | Only the thirds of that edge you pick (start, middle, end), measured on the display under the pointer | Yes | Yes |
+| Edge | The whole of one outer edge, or the thirds of it you pick in the ledger's Edge cell, measured on the display under the pointer | Yes | Yes |
 | Corner | An 8pt box in one corner, needing a diagonal push | Yes | Yes |
 | Notch | The top edge, only within the notch's width | Yes | No |
 
-Any combination can be on, except Edge and Part of the edge, which exclude each other. On the Mac,
+Edge, corner and notch can all be on at once; with all three thirds lit, the whole edge crosses. On the Mac,
 Shortcut and the right-hand edge are on to start with. On Linux under Wayland, the shortcut only
 brings input back; the desktop only lets it go to another machine at an edge.
 
@@ -247,7 +286,8 @@ trigger key cannot be added.
 
 The Mac's F7–F12 media row and volume keys cross as play/pause, next, previous, mute and volume.
 On the Mac they arrive as system events rather than key events and are captured separately
-(`mac_app/media_keys.py`). Brightness and keyboard-backlight keys stay with macOS.
+(`mac_app/media_keys.py`). The keyboard-backlight keys stay with macOS; the brightness keys reach a
+Windows laptop's built-in screen.
 
 Ctrl+Alt+Del is the Secure Attention Sequence, trapped by the kernel before any app sees it.
 `SendInput` cannot produce it, and `SendSAS()` needs a Windows service or a signed `uiAccess` app
@@ -361,13 +401,15 @@ password. Without it, the Mac reports `Windows is locked — unlock it at the PC
 <details>
 <summary><strong>Linux</strong></summary>
 
-Linux support is experimental. Install the x86_64 Flatpak from the release page with
-`flatpak install --user Beamer-<version>-x86_64.flatpak`, or build it with
-[the Flatpak instructions](docs/flatpak-build.md). On one Fedora 44 GNOME desktop under Wayland,
-paired with a Mac and with a Windows PC, the window and tray, pairing, crossing both ways, typing and the clipboard work;
-there, crossings show no edge animation on the Linux machine and the selected option in settings is
-not filled in. X11 on real hardware has not been tested. Flatpak needs Flathub to install the KDE runtime
-if it is not already present. The same package is built for GNOME under Wayland and for X11.
+Linux support has been tested on GNOME; KDE Plasma support is experimental. There is no AppImage. Install the 64-bit x86 Flatpak from the Kalkman
+Code repository using [Install on Linux](#install-on-linux), or build for arm64 with [the Flatpak
+instructions](docs/flatpak-build.md). On one Fedora 44 GNOME desktop under Wayland, paired with a
+Mac and a Windows PC, the window and tray, pairing, crossing both ways, typing and the clipboard
+work, and crossings show their effect through XWayland. X11 runs with Beamer's keyboard, pointer, pairing and clipboard features, but has not
+been tested on real hardware. Flatpak fetches the KDE runtime from Flathub if it is not already
+present. Beamer targets GNOME and KDE Plasma under Wayland and X11. KDE Plasma support is
+experimental and has not been tested on real hardware: KDE Wayland needs Plasma 6.1.1 or later
+with the matching host portal, and the clipboard needs Plasma 6.6 or later.
 
 On Wayland, the desktop limits what Beamer can do:
 
@@ -376,10 +418,14 @@ On Wayland, the desktop limits what Beamer can do:
   while input is away.”
 - “On Wayland Beamer cannot see a full-screen app, or a mouse button held before the pointer reaches
   an edge, so the edges are never held for one and a drag can cross.”
-- “On Wayland the desktop does not let Beamer draw at the edges of the screen, so crossings show no
-  effect on this machine. The other machines still show theirs.”
+- Without XWayland, or if drawing through it fails, Beamer says: “On Wayland the desktop does not let
+  Beamer draw at the edges of the screen, so crossings show no effect on this machine. The other
+  machines still show theirs.”
 
-Linux does not offer gestures. KDE Plasma has not been tested.
+Older Ubuntu and Debian releases lack the InputCapture portal, so they cannot send input out under
+Wayland; use an X11 session there. Linux does not offer gestures. KDE Plasma awaits hardware
+testing. On KDE Wayland, partly exposed sides in staggered monitor layouts are unavailable;
+use a completely exposed monitor edge. The Flatpak's start-at-sign-in toggle remains unavailable.
 
 </details>
 
@@ -406,7 +452,7 @@ shared token typed by hand, and they must match on both machines.
 From `mac_app`:
 
 ```sh
-.venv/bin/python3 -m unittest discover -s tests -v
+.venv/bin/python3 -m unittest discover -s tests -t .. -v
 ./build_dmg.sh
 ```
 

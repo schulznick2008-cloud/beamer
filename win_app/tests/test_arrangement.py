@@ -29,6 +29,8 @@ class Folder(unittest.TestCase):
             harness.entry(B, "Mac", side="left", side_set_at=100, side_by=LOW),
             harness.entry(C, "Other", platform="windows", side="top"),
         ]
+        for entry in settings["peers"]:
+            entry["caps"] = []
         settings["zones"] = [
             {"peer": BT, "kind": "edge"},
             {"peer": BT, "kind": "corner", "corner": "top_left", "edge": "left", "off": True},
@@ -65,15 +67,15 @@ class ArrangementTests(Folder):
         self.assertEqual(app_config.apply_arrangement(self.path, BT, "up", 200, HIGH), (False, []))
         self.assertEqual(app_config.apply_arrangement(self.path, BT, "left", 200, "not an id"), (False, []))
 
-    def test_a_side_that_clashes_with_another_peers_zone_turns_the_senders_zone_off_and_says_so(self):
+    def test_old_peer_arrangement_compiles_one_side_allocation_without_clash_notices(self):
         changed, notices = app_config.apply_arrangement(self.path, BT, "bottom", 200, HIGH)
         self.assertTrue(changed)
         self.assertEqual(self.peer(BT)["side"], "top")
         zones = [zone for zone in self.saved()["zones"] if zone["peer"] == BT and zone["kind"] == "edge"]
-        self.assertTrue(zones[0]["off"])
-        self.assertTrue(notices and "Mac" in notices[0] and "Other" in notices[0])
-        other = [zone for zone in self.saved()["zones"] if zone["peer"] == CT][0]
-        self.assertNotIn("off", other)
+        self.assertEqual(zones, [{"peer": BT, "kind": "edge"}])
+        self.assertEqual(notices, [])
+        self.assertFalse(any(zone["peer"] == CT for zone in self.saved()["zones"]))
+        self.assertTrue(self.peer(CT)["ways"]["edge"])
 
 
 class LearnedTests(Folder):
