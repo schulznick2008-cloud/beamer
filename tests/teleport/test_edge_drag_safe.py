@@ -20,6 +20,21 @@ def test_without_drag_state_queue_returns_false_and_no_start():
     assert started == []
 
 
+def test_drag_state_cursor_used_for_place():
+    placed = queue.Queue()
+
+    def start(intent):
+        placed.put((intent.place_x, intent.place_y))
+        return True
+
+    drag = EdgeDragController(start)
+    drag.on_drag_state({"dragging": True, "title_bar": True, "wid": 9, "x": 55.5, "y": 66.6})
+    assert drag.queue_edge_cross("pc", "right", 1.0, 2.0, dragging=True) is True
+    x, y = placed.get(timeout=2.0)
+    assert x == 55.5
+    assert y == 66.6
+
+
 def test_with_drag_state_starts_tp_offer_async():
     started = queue.Queue()
 
