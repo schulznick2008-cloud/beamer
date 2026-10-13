@@ -18,6 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PM_NOREMOVE, WM_USER,
 };
 
+use crate::identity;
 use crate::ipc::{self, Cmd, Out, RecvOpen};
 use crate::receiver::{self, FrameIn, SessionSlot};
 use crate::stats;
@@ -35,6 +36,8 @@ type Routes = Arc<Mutex<HashMap<u32, Route>>>;
 struct Recv {
     open: RecvOpen,
     win: ProxyWindow,
+    /// Icons leben so lange wie das Fenster (WM_SETICON kopiert sie nicht).
+    _icons: Option<identity::Icons>,
 }
 
 pub struct Options {
@@ -347,13 +350,27 @@ impl App {
         if self.recvs.contains_key(&tid) {
             return Err(("busy", format!("tid {tid} ist schon offen")));
         }
-        if o.fullscreen {
-            eprintln!("beamer-teleport: tid {tid} fullscreen kommt mit C05, zeige als Fenster");
-        }
         self.user_closed.remove(&tid);
         let title = ipc::window_title(&o.app, &o.title);
-        let win = window::create(tid, &title, o.w, o.h, self.main_thread, self.opened)
-            .map_err(|e| ("internal", format!("Fenster: {e}")))?;
+        let win = window::create(
+            tid,
+            &title,
+            o.w,
+            o.h,
+            self.main_thread,
+            self.opened,
+            self.out.clone(),
+            o.fullscreen,
+        )
+        .map_err(|e| ("internal", format!("Fenster: {e}")))?;
+        // Taskleiste: eigene Gruppe je App, App-Icon.
+        identity::set_app_id(win.hwnd, &o.app);
+        let icons = o.icon_png.as_deref().and_then(identity::Icons::from_png);
+        if let Some(i) = &icons {
+            i.apply(win.hwnd);
+        } else if o.icon_png.is_some() {
+            eprintln!("beamer-teleport: tid {tid} icon_png ist kein PNG, Standard-Icon");
+        }
         let handle = match receiver::spawn(receiver::Config {
             tid,
             codec: o.codec,
@@ -378,7 +395,14 @@ impl App {
         }
         lock(&self.routes).insert(tid, Route { handle });
         self.opened += 1;
-        self.recvs.insert(tid, Recv { open: o, win });
+        self.recvs.insert(
+            tid,
+            Recv {
+                open: o,
+                win,
+                _icons: icons,
+            },
+        );
         Ok(json!({}))
     }
 

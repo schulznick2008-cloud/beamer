@@ -79,6 +79,8 @@ pub struct RecvOpen {
     pub codec: Codec,
     pub fullscreen: bool,
     pub keys: StreamKeys,
+    /// App-Icon (PNG) fuer die Taskleiste, optional.
+    pub icon_png: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for RecvOpen {
@@ -217,6 +219,26 @@ pub fn parse_keys(v: Option<&Value>, id: i64) -> Result<StreamKeys, ParseError> 
     })
 }
 
+/// Hoechstgroesse von `icon_png` (dekodiert).
+pub const MAX_ICON_BYTES: usize = 1 << 20;
+
+fn parse_icon(v: Option<&Value>, id: i64) -> Result<Option<Vec<u8>>, ParseError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) => {
+            let b = base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|_| bad(id, "icon_png ist kein Base64"))?;
+            if b.len() > MAX_ICON_BYTES {
+                return Err(bad(id, "icon_png ist zu gross"));
+            }
+            Ok(Some(b))
+        }
+        Some(_) => Err(bad(id, "icon_png muss ein String sein")),
+    }
+}
+
 pub fn parse_line(line: &str) -> Result<Request, ParseError> {
     let v: Value = serde_json::from_str(line).map_err(|e| ParseError {
         id: None,
@@ -277,6 +299,7 @@ pub fn parse_line(line: &str) -> Result<Request, ParseError> {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 keys: parse_keys(o.get("keys"), id)?,
+                icon_png: parse_icon(o.get("icon_png"), id)?,
             }))
         }
         "recv.update" => Cmd::RecvUpdate(RecvUpdate {
@@ -420,6 +443,30 @@ mod tests {
         let line = json!({"v":1,"id":4,"cmd":"recv.open","tid":0,"w":8,"h":6,"codec":"h264","keys":keys_json()})
             .to_string();
         assert!(parse_line(&line).is_err());
+    }
+
+    #[test]
+    fn icon_png_optional_and_limited() {
+        let base = json!({"v":1,"id":3,"cmd":"recv.open","tid":5,"w":8,"h":6,"codec":"h264","keys":keys_json()});
+        let with = |icon: Value| {
+            let mut v = base.clone();
+            v["icon_png"] = icon;
+            parse_line(&v.to_string())
+        };
+        let get = |r: Result<Request, ParseError>| match r.unwrap().cmd {
+            Cmd::RecvOpen(o) => o.icon_png,
+            _ => panic!(),
+        };
+        assert_eq!(get(parse_line(&base.to_string())), None);
+        assert_eq!(get(with(json!(""))), None);
+        assert_eq!(
+            get(with(json!("iVBORw0K"))),
+            Some(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A])
+        );
+        assert!(with(json!("%%%")).is_err());
+        assert!(with(json!(7)).is_err());
+        let big = base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_ICON_BYTES + 1]);
+        assert!(with(json!(big)).is_err());
     }
 
     #[test]

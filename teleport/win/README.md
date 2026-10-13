@@ -1,11 +1,12 @@
-# beamer-teleport für Windows (C03: Empfänger)
+# beamer-teleport für Windows (C03 Empfänger, C05 Proxy)
 
 Rust-Crate `beamer-teleport-win` (windows-rs), Binary `beamer-teleport.exe`. Spezifikation:
 `docs/teleport/SCHNITTSTELLEN.md` §1, §4, §5, §7.
 
-Stand C03: Empfangen über `beamer-transport` (rlib), Hardware-Decode H.264/HEVC mit D3D11VA (FFmpeg),
-Anzeige je `tid` in einem eigenen Fenster. Eingabe, Fokus und Größen-Rückkanal (`proxy.input/focus/resize`)
-kommen mit C05, der Sender mit C06.
+Stand C05: Empfangen über `beamer-transport` (rlib), Hardware-Decode H.264/HEVC mit D3D11VA (FFmpeg),
+Anzeige je `tid` in einem eigenen Fenster. Das Proxy-Fenster meldet Eingabe, Fokus und Größe
+(`proxy.input/focus/resize`), hat Icon und eigene Taskleisten-Gruppe je App und kann randloses Vollbild.
+Der Sender kommt mit C06.
 
 ## Bauen
 
@@ -38,7 +39,8 @@ beamer-teleport.exe --selftest-send <host> <port> [--tid N] [--fps N] [--size Bx
 ```
 
 - `--ipc stdio`: JSON Lines nach §1. Befehle: `hello`, `transport.open/peer/close`, `recv.open/update/close`,
-  `shutdown`. Sender- und `proxy.*`-Befehle werden mit `unsupported` beantwortet. Ereignisse: `proxy.closed`
+  `shutdown`. Sender- und `proxy.*`-Befehle werden mit `unsupported` beantwortet. Ereignisse: `proxy.input`,
+  `proxy.focus`, `proxy.resize`, `proxy.closed`
   (Fenster geschlossen), `stats` (jede Sekunde), `error`. stdin-EOF: Aufräumen und Exit 0 (gemessen < 0,1 s).
 - `stats` enthält die Transportwerte (`fps`, `kbps`, `rtt_ms`, `loss_pct`, `peer`, …) und zusätzlich
   `decode_ms`, `present_ms`, `recv_to_present_ms` (+ `_p95_ms`, Empfang des letzten Fragments bis Rückkehr von
@@ -70,7 +72,10 @@ beamer-teleport.exe --selftest-send <host> <port> [--tid N] [--fps N] [--size Bx
 |---|---|
 | `src/app.rs` | Hauptthread: Nachrichtenschleife, IPC-Befehle, Session, Fenster |
 | `src/ipc.rs` | Protokoll (Parsen, Antworten, Ereignisse), ohne GPU testbar |
-| `src/window.rs` | Proxy-Fenster, Per-Monitor-DPI-Aware V2, Titel `<app> – <title>` |
+| `src/window.rs` | Proxy-Fenster, Per-Monitor-DPI-Aware V2, Titel `<app> – <title>`, Eingabe/Fokus/Resize, Vollbild |
+| `src/input.rs` | Eingabelogik ohne Fenster: Client- → Stream-Pixel, Tastennamen, Klickzähler, Loslassen bei Fokusverlust, Entprellung |
+| `src/keytable_gen.rs` | **generiert** (`tools/teleport/gen_rust_keytable.py`): virtuelle Taste → Beamer-Name |
+| `src/identity.rs` | AppUserModelID je App, Icon aus `icon_png` |
 | `src/receiver.rs` | Thread je `tid`: Decode, Present, Keyframe-Anforderung, Rückstau |
 | `src/decode.rs` | FFmpeg D3D11VA auf dem eigenen D3D11-Gerät, kein stiller Software-Fallback |
 | `src/gpu.rs` | D3D11-Gerät (leistungsstärkste GPU), Flip-Swapchain, V-Sync aus, Latenz 1, Video-Processor (NV12→BGRA, Letterbox) |
@@ -78,6 +83,7 @@ beamer-teleport.exe --selftest-send <host> <port> [--tid N] [--fps N] [--size Bx
 | `src/firewall.rs` | prüft die Firewall-Regel für „Öffentlich“ (§7), ändert nichts, nur Hinweis im Log |
 | `src/selftest.rs` | Testbild, Encoder, Sender |
 | `examples/ipc_driver.rs` | treibt den Helfer wie Python und startet Selbsttest-Sender (Abnahme C03) |
+| `examples/proxy_test.rs` | C05 ohne Mac: Fenster-Nachrichten an den Proxy, prüft `proxy.input/focus/resize`, Vollbild, Icon |
 
 Verhalten:
 - Jeder `tid` hat ein eigenes Fenster und einen eigenen Thread mit eigenem D3D11-Gerät und Swapchain.
@@ -96,6 +102,55 @@ Verhalten:
 - `transport.peer` wirkt auch bei laufenden Streams (`Session::set_peer`).
 - Firewall: Beim `transport.open` prüft ein Hintergrund-Thread die Regeln. Fehlt eine Erlaubnis für UDP im
   Profil „Öffentlich“ (Direktkabel), steht ein Hinweis mit dem passenden `New-NetFirewallRule`-Befehl im Log.
+
+## Proxy (C05)
+
+**Eingabe → `proxy.input`** (§3), Koordinaten in Stream-Pixeln: Client-Pixel × Streambreite / Clientbreite,
+bei Rand (Letterbox, z. B. während eines Resizes) abzüglich des Randes; Punkte im Rand liegen außerhalb des
+Bildes (der Sender verwirft sie).
+- Maus: `move`, `down`/`up` mit `b` = left/right/middle/back/forward und `n` (Klickzahl 1–3 nach der
+  Doppelklick-Zeit und dem Doppelklick-Rechteck von Windows). Während ein Button gedrückt ist, hält das Fenster
+  die Maus fest (Ziehen über den Rand hinaus).
+- Rad: `scroll` mit `unit: "line"` in Rastungen (`WHEEL_DELTA` = 1); positiv = vom Nutzer weg bzw. nach rechts,
+  wie Beamers Python-Seite (`wheel_notches` in `win_app/capture_win.py`; so kommt es in §3).
+- Tasten: `key` mit Beamer-Namen, **roh** (physisch: Strg = `ctrl`, Windows-Taste = `cmd`, Alt = `alt`, links/
+  rechts getrennt); die Cmd/Strg-Umsetzung macht Python. Zeichentasten melden ihr Zeichen mit nur Shift und
+  Feststelltaste (wie `capture_win.py`), z. B. Strg+C als `ctrl` + `c`. Gedrückt halten meldet nur **ein**
+  `down` (die Wiederholung macht der Sender selbst).
+- AltGr (rechtes Alt mit dem künstlichen linken Strg, das Windows bei AltGr-Layouts davor schickt): das Paar
+  wird nicht gemeldet, das erzeugte Zeichen geht als `text` (AltGr+Q auf Deutsch → `text` „@“). Auf Layouts
+  ohne AltGr (US) bleibt rechtes Alt `alt_r`.
+- Text: `text` für alles, was keine eigene Taste ist: Akzente über tote Tasten, IME,
+  Alt+Ziffern. Das `WM_CHAR`, das Windows zu einer schon gemeldeten Taste erzeugt (gleicher Scan-Code), wird
+  aus der Queue entfernt; fremde Zeichen bleiben unberührt.
+- Bleibt bei Windows: Windows-Taste (Start, Win+…), Alt+Tab, Strg+Alt+Entf, Alt+Leertaste (Systemmenü),
+  Alt+F4 (schließt den Proxy → `proxy.closed`). Alt allein öffnet kein Menü.
+- Fokusverlust (Alt+Tab, Klick woanders): alle gedrückten Buttons und Tasten bekommen ein `up`.
+
+**Tastentabelle:** `src/keytable_gen.rs` wird aus `win_app/capture_win.py` (`VK_TO_NAME`) und
+`core/keytable.py` (`_PC_SEMANTIC`, `SPEC_NAMES`) erzeugt – nicht von Hand ändern:
+`tools/teleport/gen_rust_keytable.py` (schreiben), `--check` (CI, `tests/teleport/test_keytable_win.py`).
+`VK_TO_NAME` setzt die Semantik schon beim Erfassen um; der Generator dreht das zurück (physische Namen).
+
+**`proxy.focus`** bei jedem Wechsel aktiv/inaktiv (nicht bei wiederholtem `WM_ACTIVATE`).
+
+**`proxy.resize`** wenn der Nutzer die Größe ändert (Ziehen, Maximieren, Einrasten, Monitor mit anderer
+DPI), höchstens 10/s, der letzte Wert kommt beim Loslassen. `w`/`h` in Punkten (Client-Pixel × 96 / DPI),
+dazu als Zusatzfelder (v1.3) `px_w`, `px_h` und `dpi`, damit der Sender so kodieren kann, dass ein
+Stream-Pixel ein Bildschirm-Pixel ist. `recv.update` mit neuer Größe (die Antwort darauf) löst kein
+`proxy.resize` aus. Bis das neue Bild kommt, wird das alte ohne Verzerrung skaliert (Letterbox).
+
+**Taskleiste:** eigene AppUserModelID je `app` (`Beamer.Teleport.<App>`, eigene Gruppe), Icon aus `icon_png`
+(PNG, Base64, höchstens 1 MB), Titel `<app> – <title>` (aktualisiert per `recv.update`). Normaler Mauszeiger.
+
+**Vollbild:** `recv.open` mit `fullscreen: true` öffnet randlos über den ganzen Monitor (unter dem Mauszeiger,
+nicht unter einem Vollbild-Programm). **Strg+Alt+Shift+F** schaltet in jedem Proxy zwischen Vollbild und
+Fenster um (die Tasten gehen nicht zum Sender).
+
+Test ohne Mac: `.\target\release\examples\proxy_test.exe` (Helfer + Selbsttest-Sender, Fenster-Nachrichten
+per `PostMessage`, keine echten Eingaben). Von Hand: Selbsttest-Sender und Helfer wie unten unter „Von Hand“
+starten; im Fenster klicken, tippen, scrollen, ziehen – die `proxy.input`-Zeilen erscheinen auf stdout des
+Helfers. Strg+Alt+Shift+F im Fenster schaltet das Vollbild um.
 
 ## Abnahmetest ohne Mac
 
