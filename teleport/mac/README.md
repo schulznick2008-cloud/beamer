@@ -22,8 +22,9 @@ Helfer startet (Systemeinstellungen > Datenschutz & Sicherheit). Ohne Freigabe a
 |---|---|
 | `Sources/CBeamerTransport` | C-Target; `include/beamer_transport.h` ist ein Symlink auf `../transport/include` |
 | `Sources/TeleportCore` | `IPC` (JSON, Zeilen), `Dispatcher` (Befehle), `SenderEngine`/`SenderPipeline` (Strom), `Capture` (ScreenCaptureKit), `VideoEncoder` (VideoToolbox), `AnnexB`, `Transport` (Swift-Hülle der C-ABI), Selbsttests |
+| `Sources/CVirtualDisplay` | ObjC-Target fuer den virtuellen Monitor (privates CGVirtualDisplay-API, eigene Deklarationen) |
 | `Sources/BeamerTeleport` | `main.swift`: Argumente, IPC-Schleife |
-| `Tests/TeleportCoreTests` | 59 Tests (Hardware-Encoder-Tests werden ohne Hardware übersprungen; die Pipeline-Tests laufen mit einer Attrappe als langsamem Encoder und brauchen keine) |
+| `Tests/TeleportCoreTests` | 99 Tests (Hardware-Encoder-Tests werden ohne Hardware übersprungen; die Pipeline-Tests laufen mit einer Attrappe als langsamem Encoder und brauchen keine) |
 
 ## IPC (Helfer-Seite)
 
@@ -92,3 +93,42 @@ Der Helfer haelt dafuer folgende Regeln ein:
   abgefragt; die Pipeline nutzt beim naechsten Takt das letzte Ergebnis.
 - Test-Haken: `BEAMER_TELEPORT_TEST_SOURCE=hang-start|hang-stop|hang-refresh` ersetzt die Quelle durch eine haengende.
 - Lasttest: `tools/teleport/measure_c02_load.sh hevc 30 3` (Messung plus zwei Helfer mit `--display 0`).
+
+## Eingabe, Fenstersteuerung, virtueller Monitor (C04)
+
+Neue Befehle: `inject` (§3), `send.activate`, `send.resize` (Antwort `width`/`height` in Stream-Pixeln, danach `send.size`);
+`hello` meldet jetzt `inject` in `caps`; `send.start` mit `virtual_display:true` ist umgesetzt (nur fuer `mode:"window"`).
+Ohne Bedienungshilfen-Freigabe antworten `inject`, `send.activate`, `send.resize` und `send.start` mit
+`virtual_display` mit `error.code = "permission"` (Test: `BEAMER_TELEPORT_FAKE_NO_ACCESSIBILITY=1`).
+
+- **Eingabe:** Stream-Pixel werden in globale Bildschirmpunkte umgerechnet (`InputGeometry`: Fensterrahmen oder
+  Monitorflaeche geteilt durch die Stream-Groesse, also bei Retina 2x ein Stream-Pixel = 0,5 pt). Eingaben ausserhalb des
+  Bildes werden verworfen; ein `up` ausserhalb laesst den Knopf trotzdem los. Maus (Bewegung, Drag bei gehaltenem Knopf,
+  Klickzahl aus `n`, Rechts-/Mitteltaste, Zusatztasten), Scrollen in Zeilen oder Pixeln (Bruchteile werden aufgespart;
+  der Zeiger wird vorher an die Stelle gesetzt; die Vorzeichen gibt der Helfer unveraendert an CoreGraphics weiter wie
+  Beamers Python-Injektor), Tasten ueber Beamers Tastennamen (Port von `plan_key_event`) und `text` als Unicode-Ereignis
+  (Stuecke zu 16 UTF-16-Einheiten, ohne Flags, damit ein gehaltener Modifier den Text nicht zum Kuerzel macht).
+  Die Tabellen kommen aus `mac_app/key_codes.py` und `mac_app/input_injector_mac.py`: `tools/teleport/gen_swift_keycodes.py`
+  erzeugt `KeyTables.swift`, und ein Test vergleicht sie mit dem Python-Quelltext. Zeichentasten folgen der aktuellen
+  Tastaturbelegung (aus Tastenereignissen gelesen, alle 10 s erneuert), Zeichen ohne Taste gehen als Text raus.
+- **Aktivierung:** vor `down`, `key` und `text` (hoechstens alle 0,5 s geprueft) und bei `send.activate`: AXFrontmost an
+  der App, `NSRunningApplication.activate()`, `AXRaise` auf genau dieses Fenster (gefunden ueber `_AXUIElementGetWindow`,
+  Rueckfall ueber den Rahmen).
+- **`send.resize`:** Groesse per `kAXSizeAttribute` setzen, Capture sofort neu lesen und `send.size` melden (Ziel unter
+  300 ms). Aendert die App ihre Groesse selbst, bemerkt das ein billiger Check alle 250 ms (CoreGraphics-Rahmen) und
+  stoesst dasselbe an.
+- **Virtueller Monitor:** Das Fenster wird per AX auf einen neuen virtuellen Monitor in Fenstergroesse mit HiDPI
+  geschoben (unter eine Platzreserve fuer die Menueleiste von 40 pt), der **ganze Monitor** wird aufgenommen (Menues,
+  Popover, Sheets kommen mit; `send.start` meldet dann die Monitorgroesse). Eingaben gelten fuer die Monitorflaeche.
+  `send.stop` (auch `restore:false`, sonst bliebe das Fenster auf einem verschwindenden Monitor) schiebt das Fenster an die
+  alte Stelle zurueck und entfernt den Monitor; ebenso EOF, `shutdown` und SIGTERM/SIGINT/SIGHUP. Bei einem Absturz
+  (SIGSEGV usw.) versucht ein Handler, die Fenster zurueckzuschieben; der Monitor verschwindet mit dem Prozess.
+- **Schlaf:** Solange ein Teleport laeuft, haelt eine `IOPMAssertion` (`PreventUserIdleSystemSleep`, Name „Beamer
+  Teleport aktiv“) den Mac wach (`pmset -g assertions`). **Zugeklappter Deckel:** diese Assertion verhindert nur den
+  Leerlauf-Schlaf. Klappt man den Deckel zu, schlaeft ein MacBook trotzdem, ausser im Clamshell-Betrieb (Netzteil und
+  externer Monitor angeschlossen). Dann stoppt der Strom, die Verbindung bricht ab und die Teleports enden.
+
+Abnahme: `tools/teleport/mac_inject_demo.py [--virtual] [--dump-dir DIR]` (startet das Pruef-Fenster
+`tools/teleport/input_probe.swift` mit Textfeld, Dropdown und Kontextmenue, den Selbsttest-Empfaenger, den Helfer und
+prueft Position, Klickzahl, Scrollen, Tippen und `send.resize` am Protokoll des Pruef-Fensters). Braucht die
+Bedienungshilfen- und die Bildschirmaufnahme-Freigabe fuer das startende Programm.
