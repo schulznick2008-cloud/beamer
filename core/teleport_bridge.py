@@ -62,7 +62,21 @@ def _attach_mac_edge_drag(controller, service: TeleportService) -> None:
             intent.peer_id, intent.wid, intent.place_x, intent.place_y
         )
 
-    controller.edge_drag = EdgeDragController(start, is_title_drag=lambda: controller._edge_drag_title_hint())
+    drag = EdgeDragController(start, logger=controller.logger)
+    controller.edge_drag = drag
+    service.set_drag_state_handler(drag.on_drag_state)
+
+
+def try_queue_edge_drag_teleport(controller, peer_id, edge, x, y, dragging) -> bool:
+    """Aus dem Event-Tap: nur nicht-blockierende Queue; Ausnahmen werden geloggt."""
+    edge_drag = getattr(controller, "edge_drag", None)
+    if edge_drag is None or not peer_id:
+        return False
+    try:
+        return edge_drag.queue_edge_cross(peer_id, edge, x, y, dragging)
+    except Exception:
+        controller.logger.exception("Kanten-Drag-Anfrage im Event-Tap fehlgeschlagen")
+        return False
 
 
 def _wrap_mac_link_handlers(controller, service: TeleportService) -> None:

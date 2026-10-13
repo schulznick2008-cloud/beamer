@@ -580,7 +580,6 @@ class KVMController:
         self.trigger_code = KEY_NAME_TO_CODE[cfg.trigger_key]
         self._jump_swallowed = set()
         self.jump_recording = False
-        self._edge_drag_title_hint = False
         self.edge_drag = None
         self.last_trigger_down = 0.0
         self.trigger_suppressed = False
@@ -1661,22 +1660,6 @@ class KVMController:
             return event
         if self.crossing_paused or self.full_screen_app is not None:
             return event
-        quartz = self.quartz
-        edge_drag = getattr(self, "edge_drag", None)
-        if event_type == quartz.kCGEventLeftMouseDown:
-            self._edge_drag_title_hint = True
-            wid = None
-            teleport = getattr(self, "teleport", None)
-            if teleport is not None and teleport._pick_front_window is not None:
-                win = teleport._pick_front_window()
-                if win is not None:
-                    wid = int(win.get("wid", 0))
-            if edge_drag is not None:
-                edge_drag.on_button(True, wid=wid)
-        elif event_type == quartz.kCGEventLeftMouseUp:
-            self._edge_drag_title_hint = False
-            if edge_drag is not None:
-                edge_drag.on_button(False)
         if event_type not in self.translator.movement_event_types:
             self.crossing.reset()
             return event
@@ -1731,9 +1714,9 @@ class KVMController:
             peer = self._zone_peer(step)
             quartz = self.quartz
             dragging = event_type != quartz.kCGEventMouseMoved
-            edge_drag = getattr(self, "edge_drag", None)
-            if edge_drag is not None and peer and dragging:
-                edge_drag.on_edge_cross(peer, step.edge, x, y, dragging=True)
+            from core.teleport_bridge import try_queue_edge_drag_teleport
+
+            try_queue_edge_drag_teleport(self, peer, step.edge, x, y, dragging)
             if self.set_redirecting(True, edge=step.edge, offset=step.offset, peer=peer, reason="edge",
                                     display=getattr(step, "display", None), side=getattr(step, "side", None)):
                 self._notify_crossing("cross", step)

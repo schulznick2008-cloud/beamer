@@ -101,6 +101,7 @@ class TeleportService:
         self._key_style = key_style
         self.logger = logger or log
         self._pick_front_window = pick_front_window
+        self._drag_state_handler: Optional[Callable[[Mapping[str, Any]], None]] = None
         self._lock = threading.RLock()
         self._links: Dict[LinkRef, PeerTeleportState] = {}
         self._seen_offers: Dict[LinkRef, Set[Tuple[bytes, int]]] = {}
@@ -119,6 +120,9 @@ class TeleportService:
 
     def set_helper_config(self, cfg: TeleportHelperConfig) -> None:
         self._helper_cfg = cfg
+
+    def set_drag_state_handler(self, handler: Optional[Callable[[Mapping[str, Any]], None]]) -> None:
+        self._drag_state_handler = handler
 
     def _ensure_helper(self) -> TeleportHelper:
         if self._helper is None:
@@ -498,6 +502,12 @@ class TeleportService:
 
     def _on_helper_event(self, ev: Mapping[str, Any]) -> None:
         name = ev.get("ev")
+        if name == "windows.drag_state" and self._drag_state_handler is not None:
+            try:
+                self._drag_state_handler(dict(ev))
+            except Exception:
+                self.logger.exception("windows.drag_state Handler fehlgeschlagen")
+            return
         tid = ev.get("tid")
         if not isinstance(tid, int):
             return

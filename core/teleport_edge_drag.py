@@ -1,8 +1,11 @@
-"""Kanten-Drag-Teleport (Python-Kern): Fenster an Titelleiste über Beamer-Kante ziehen."""
+"""Kanten-Drag-Teleport: nur mit Helfer-``windows.drag_state`` (asynchron), nie im Event-Tap."""
 from __future__ import annotations
 
+import logging
+import queue
+import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 
 @dataclass
@@ -15,27 +18,38 @@ class DragTeleportIntent:
 
 
 class EdgeDragController:
-    """Erkennt Ziehen mit gedrückter Taste Richtung Übergangskante; startet tp_offer mit Platzierung."""
+    """Aktiv nur wenn der Helfer ``ev: windows.drag_state`` mit ``title_bar`` und ``wid`` meldet."""
 
     def __init__(
         self,
         start_teleport: Callable[[DragTeleportIntent], bool],
-        *,
-        is_title_drag: Optional[Callable[[], bool]] = None,
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         self._start = start_teleport
-        self._is_title_drag = is_title_drag or (lambda: False)
-        self._drag_wid: Optional[int] = None
-        self._button_down = False
+        self._log = logger or logging.getLogger(__name__)
+        self._lock = threading.Lock()
+        self._dragging = False
+        self._title_bar = False
+        self._wid: Optional[int] = None
+        self._pending: "queue.SimpleQueue[Optional[tuple]]" = queue.SimpleQueue()
+        self._worker = threading.Thread(target=self._run, name="teleport-edge-drag", daemon=True)
+        self._worker.start()
 
-    def on_button(self, down: bool, wid: Optional[int] = None) -> None:
-        self._button_down = down
-        if down and wid is not None:
-            self._drag_wid = wid
-        if not down:
-            self._drag_wid = None
+    def on_drag_state(self, ev: dict) -> None:
+        """Vom Helfer-IPC (Hintergrundthread), nicht aus dem Event-Tap."""
+        with self._lock:
+            self._dragging = bool(ev.get("dragging"))
+            self._title_bar = bool(ev.get("title_bar"))
+            wid = ev.get("wid")
+            self._wid = int(wid) if wid is not None else None
+            if not (self._dragging and self._title_bar and self._wid):
+                self._wid = None
 
-    def on_edge_cross(
+    def is_armed(self) -> bool:
+        with self._lock:
+            return bool(self._dragging and self._title_bar and self._wid)
+
+    def queue_edge_cross(
         self,
         peer_id: str,
         edge: str,
@@ -43,24 +57,30 @@ class EdgeDragController:
         cursor_y: float,
         dragging: bool,
     ) -> bool:
-        """True wenn Teleport gestartet wurde (Kante überschritten, Titelleisten-Drag)."""
-        if not dragging or not self._button_down:
+        """Nur im Event-Tap: speichert Intent oder ignoriert. Kein IPC, kein Blockieren."""
+        if not dragging or not peer_id:
             return False
-        if not self._is_title_drag():
+        if not self.is_armed():
             return False
-        wid = self._drag_wid
+        with self._lock:
+            wid = self._wid
         if wid is None:
             return False
-        intent = DragTeleportIntent(
-            peer_id=peer_id,
-            wid=int(wid),
-            place_x=cursor_x,
-            place_y=cursor_y,
-            edge=edge,
-        )
-        return self._start(intent)
+        self._pending.put((peer_id, edge, cursor_x, cursor_y, wid))
+        return True
 
+    def _run(self) -> None:
+        while True:
+            item = self._pending.get()
+            if item is None:
+                break
+            peer_id, edge, x, y, wid = item
+            try:
+                self._start(
+                    DragTeleportIntent(peer_id=peer_id, wid=wid, place_x=x, place_y=y, edge=edge)
+                )
+            except Exception:
+                self._log.exception("Kanten-Drag-Teleport fehlgeschlagen")
 
-def win_title_bar_drag_from_hook(message: int) -> bool:
-    """Windows: WM_NCLBUTTONDOWN (0x00A1) o. ä. – Platzhalter bis C05/Win-Helfer meldet."""
-    return message == 0x00A1
+    def shutdown(self) -> None:
+        self._pending.put(None)

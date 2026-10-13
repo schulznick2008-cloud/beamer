@@ -43,12 +43,22 @@ Beide Seiten: **Beamer laufen lassen**, Link verbunden (grün / „Connected“)
 
 ## Fenster teleportieren und zurückholen
 
+### Jetzt nutzbar: Hotkey (Mac)
+
 | Aktion | Mac |
 |--------|-----|
-| **Vorderfenster zum PC** | Hotkey **Ctrl+Alt+Cmd+T** (Vorschlag, nicht im Vertrag dokumentiert) |
+| **Vorderfenster zum PC** | **Ctrl+Alt+Cmd+T** (Standard laut Vertrag v1.6) |
 | **Zurückholen** | Gleicher Hotkey erneut, oder Proxy auf dem PC schließen |
 
-Der PC zeigt ein Proxy-Fenster. Liegt der Fokus dort, gehen Tastatur und Maus über den Windows-Proxy zum Mac (Eingabe im teleportierten Fenster). Sonst bleibt Beamer-KVM wie bisher.
+Der PC zeigt ein Proxy-Fenster. Liegt der Fokus dort, gehen Tastatur und Maus über den Windows-Proxy zum Mac (Eingabe im teleportierten Fenster). Ohne Proxy-Fokus bleibt Beamer-KVM wie bisher.
+
+### Später: Fenster an der Kante ziehen (Hauptweg)
+
+Wie beim normalen Beamer-Übergang: Fenster an der **Titelleiste** halten und über die **Übergangskante** zum PC ziehen – Maus wechselt per KVM, das Fenster folgt an der Cursor-Position.
+
+**Stand E5:** Dieser Weg ist in Beamer **noch ausgeschaltet**, bis der Mac-Helfer **`windows.drag_state`** (Titelleiste, `wid`) per IPC meldet (**C04d**). Bis dahin verhält sich das Ziehen über die Kante **genau wie Beamer 1.5.2** (nur KVM, kein Teleport). Rückweg vom Proxy-Fenster an die Kante zum Mac: **C05b**.
+
+Kopierbefehle unverändert – Beamer-App auf beiden Seiten starten, Link verbunden, dann Hotkey auf dem Mac.
 
 ## Nur testen ohne volle App (M1-Demo)
 
