@@ -879,12 +879,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_NCHITTEST => {
                 if shared_of(hwnd).is_some() {
                     let dpi = GetDpiForWindow(hwnd).max(96);
-                    let mut pt = POINT {
-                        x: (lp.0 as i32 & 0xffff) as i16 as i32,
-                        y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
-                    };
-                    let _ = windows::Win32::UI::WindowsAndMessaging::ScreenToClient(hwnd, &mut pt);
-                    if client_y_is_title_bar(pt.y, dpi) {
+                    let screen_y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+                    let mut wr = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut wr);
+                    let band = caption_band_px(dpi);
+                    if screen_y >= wr.top && screen_y < wr.top + band {
                         return LRESULT(HTCAPTION as isize);
                     }
                 }
