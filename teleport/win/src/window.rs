@@ -678,16 +678,16 @@ fn on_key_inner(
     }
     // GetKeyState sieht per PostMessage eingespieltes Shift nicht; die gehaltene Taste schon.
     let shift = key_down(input::VK_SHIFT) || st.holds_shift();
-    if st.altgr && input::named_key(svk).is_none() {
-        if down {
-            let c = key_char(vk, scan, true, shift);
-            // Das WM_CHAR zur Taste darf nicht doppelt als Text raus. Tote Taste (kein Zeichen): nichts
-            // entfernen, das zusammengesetzte Zeichen kommt spaeter als WM_CHAR.
-            *drop_char = c.is_some();
-            drop(st);
-            if let Some(c) = c.filter(|_| !repeat) {
-                s.send_input(json!({"k": "text", "text": c}));
-            }
+    // Nur das Druecken wird unter AltGr zu Text; das Loslassen laeuft ueber den normalen Weg, damit eine vor
+    // AltGr gedrueckte Zeichentaste ihr `up` bekommt (sonst haengt sie beim Sender).
+    if st.altgr && down && input::named_key(svk).is_none() {
+        let c = key_char(vk, scan, true, shift);
+        // Das WM_CHAR zur Taste darf nicht doppelt als Text raus. Tote Taste (kein Zeichen): nichts
+        // entfernen, das zusammengesetzte Zeichen kommt spaeter als WM_CHAR.
+        *drop_char = c.is_some();
+        drop(st);
+        if let Some(c) = c.filter(|_| !repeat) {
+            s.send_input(json!({"k": "text", "text": c}));
         }
         return Some(LRESULT(0));
     }

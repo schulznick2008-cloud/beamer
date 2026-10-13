@@ -430,6 +430,22 @@ fn main() {
                 ),
                 &mut fails,
             );
+            // Zeichentaste vor AltGr gedrueckt und unter AltGr losgelassen: das up muss kommen.
+            post(hw, WM_KEYDOWN, 0x45, key_lp_ext(0x12, false, false)); // E
+            post(hw, WM_KEYDOWN, 0x11, key_lp_ext(0x1D, false, false));
+            post(hw, WM_KEYDOWN, 0x12, key_lp_ext(0x38, true, false));
+            post(hw, WM_KEYUP, 0x45, key_lp(0x12, true));
+            post(hw, WM_KEYUP, 0x11, key_lp(0x1D, true));
+            post(hw, WM_KEYUP, 0x12, key_lp(0x38, true) | (1 << 24));
+            let ev = inputs(&h.collect(Duration::from_millis(300)));
+            let e: Vec<&Value> = ev.iter().filter(|v| v["key"] == "e").collect();
+            check(
+                e.len() == 2 && e[0]["down"] == true && e[1]["down"] == false,
+                &format!(
+                    "Taste vor AltGr gedrueckt, unter AltGr losgelassen: down und up ({ev:?})"
+                ),
+                &mut fails,
+            );
         }
         None => println!("  (AltGr-Test uebersprungen: Layout ohne AltGr-Zeichen auf Q)"),
     }
