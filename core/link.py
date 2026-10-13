@@ -169,6 +169,11 @@ class OutboundLink:
     def caps(self):
         return self._caps
 
+    @property
+    def session(self):
+        """Aktive LinkSession nach Handshake (nur lesen, solange der Link lebt)."""
+        return self._session
+
     def start(self):
         old = self._thread
         if old is not None and old.is_alive() and self._stop.is_set() and old is not threading.current_thread():
@@ -452,7 +457,15 @@ class OutboundLink:
         except protocol.PreambleRefused:
             raise LinkEnded(f"A different Beamer answered at {host}", "different") from None
         hello = protocol.hello_v6(
-            own_id, identity["name"], identity["platform"], identity["app"], identity["caps"], int(identity.get("port") or 0), self._hardware_towards(host, identity))
+            own_id,
+            identity["name"],
+            identity["platform"],
+            identity["app"],
+            identity["caps"],
+            int(identity.get("port") or 0),
+            self._hardware_towards(host, identity),
+            teleport=bool(identity.get("teleport")),
+        )
         sock.settimeout(max(0.001, deadline - time.monotonic()))
         protocol.send_msg(sock, session, hello)
         try:
@@ -498,6 +511,7 @@ class OutboundLink:
             self.peer_id = protocol.id_text(fields["id"])
             self.peer_platform = fields["platform"]
             self.peer_name = fields["name"]
+            self._peer_teleport = bool(fields.get("teleport"))
             self._reset_link_state()
             self._last_rx = self._last_tx = self._last_progress = self._logged_at = now
             self._live = True
