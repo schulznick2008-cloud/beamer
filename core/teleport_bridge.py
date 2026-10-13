@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 from typing import Callable
 
 from core import protocol
@@ -51,7 +53,48 @@ def attach_mac_controller(controller) -> TeleportService:
     controller.teleport = service
     _wrap_mac_link_handlers(controller, service)
     _attach_mac_edge_drag(controller, service)
+    _attach_teleport_hotkey_worker(controller, service)
     return service
+
+
+def _peer_link_host(link) -> str:
+    dialled = getattr(link, "dialled", None)
+    if dialled:
+        return str(dialled[0])
+    host = getattr(link, "host", None)
+    if host:
+        return str(host)
+    entry_fn = getattr(link, "entry", None)
+    if entry_fn is not None:
+        ent = entry_fn() or {}
+        h = ent.get("host")
+        if h:
+            return str(h)
+    return ""
+
+
+def _attach_teleport_hotkey_worker(controller, service: TeleportService) -> None:
+    pending: "queue.SimpleQueue[object]" = queue.SimpleQueue()
+    controller._teleport_hotkey_queue = pending
+
+    def run() -> None:
+        while True:
+            item = pending.get()
+            if item is None:
+                break
+            try:
+                service.toggle_front_window_mac()
+            except Exception:
+                controller.logger.exception("Teleport-Hotkey fehlgeschlagen")
+
+    threading.Thread(target=run, name="teleport-hotkey", daemon=True).start()
+
+
+def enqueue_teleport_hotkey(controller) -> None:
+    """Event-Tap: nur in die Queue legen, kein Helfer-IPC."""
+    q = getattr(controller, "_teleport_hotkey_queue", None)
+    if q is not None:
+        q.put(True)
 
 
 def _attach_mac_edge_drag(controller, service: TeleportService) -> None:
@@ -96,6 +139,7 @@ def _wrap_mac_link_handlers(controller, service: TeleportService) -> None:
                 bool(fields.get("teleport")) and bool(controller.identity().get("teleport")),
                 session,
                 outbound=True,
+                peer_link_host=_peer_link_host(link),
             )
 
     def link_message(link, message):
@@ -135,6 +179,7 @@ def wire_responder_teleport(responder, service: TeleportService, token_for_peer:
             link.peer_teleport and bool(responder._identity().get("teleport")),
             link.session,
             outbound=False,
+            peer_link_host=_peer_link_host(link),
         )
 
     responder._callbacks["link"] = link_cb
@@ -187,6 +232,7 @@ def attach_win_sender(sender, identity_fn: Callable[[], dict], server=None) -> T
                 bool(getattr(link, "_peer_teleport", False)) and bool(identity_fn().get("teleport")),
                 session,
                 outbound=True,
+                peer_link_host=_peer_link_host(link),
             )
 
     sender.on_link = on_link

@@ -1762,7 +1762,9 @@ class KVMController:
         chord = ways.jump_chord(modifiers, key)
         if chord != TELEPORT_HOTKEY:
             return False
-        teleport.toggle_front_window_mac()
+        from core.teleport_bridge import enqueue_teleport_hotkey
+
+        enqueue_teleport_hotkey(self)
         return True
 
     def _handle_jump_key(self, event_type, event):

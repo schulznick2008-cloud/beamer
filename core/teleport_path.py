@@ -4,7 +4,7 @@ from __future__ import annotations
 import ipaddress
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 DEFAULT_CABLE_SUBNET = "192.168.77.0/24"
 DEFAULT_MAC_HOST = "192.168.77.1"
@@ -86,6 +86,7 @@ class PathChooser:
         self._clock = clock
         self._subnet = parse_cable_subnet(settings.cable_subnet)
         self._candidates: Dict[str, PathCandidate] = {}
+        self._link_hosts: Set[str] = set()
         self._active: PathName = "wlan"
         self._last_probe_at = 0.0
 
@@ -103,6 +104,16 @@ class PathChooser:
         cand.path = path
         if rtt_ms is not None:
             cand.rtt_ms = rtt_ms
+
+    def note_link_peer(self, addr: str) -> None:
+        """Beamer-TCP-Link: WLAN-first, Kabel wenn Adresse im cable_subnet / 169.254."""
+        if not addr:
+            return
+        self._link_hosts.add(addr)
+        path: PathName = "cable" if is_link_local_or_cable(addr, self._subnet) else "wlan"
+        self.note_beacon(addr, path, rtt_ms=5.0)
+        cand = self._candidates[addr]
+        cand.probe_ok_streak = max(cand.probe_ok_streak, 1)
 
     def fixed_cable_peers(self, peer_is_mac: bool) -> List[str]:
         """Gegenstelle .1/.2 im cable_subnet ohne Beacon."""
@@ -152,6 +163,12 @@ class PathChooser:
 
     def _best_host(self, path: PathName) -> Optional[str]:
         cands = [c for c in self._candidates.values() if c.path == path and c.probe_ok_streak > 0]
+        if not cands:
+            cands = [
+                c
+                for c in self._candidates.values()
+                if c.path == path and c.addr in self._link_hosts
+            ]
         if not cands:
             return None
         cands.sort(key=lambda c: (c.rtt_ms if c.rtt_ms is not None else 1e9, c.addr))
