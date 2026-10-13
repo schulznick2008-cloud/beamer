@@ -13,8 +13,12 @@ let package = Package(
     targets: [
         .target(name: "CBeamerTransport"),
         .target(
+            name: "CVirtualDisplay",
+            linkerSettings: [.linkedFramework("CoreGraphics"), .linkedFramework("Foundation")]
+        ),
+        .target(
             name: "TeleportCore",
-            dependencies: ["CBeamerTransport"],
+            dependencies: ["CBeamerTransport", "CVirtualDisplay"],
             linkerSettings: [
                 .unsafeFlags(["-L\(transportLib)", "-lbeamer_transport", "-liconv"]),
                 .linkedFramework("ScreenCaptureKit"),
@@ -23,6 +27,8 @@ let package = Package(
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("AppKit"),
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("IOKit"),
             ]
         ),
         .executableTarget(name: "BeamerTeleport", dependencies: ["TeleportCore"]),

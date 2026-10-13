@@ -86,7 +86,12 @@ final class IPCTests: XCTestCase {
         XCTAssertThrowsError(try SendParams.parse(bad))
         bad = m; bad["mode"] = "window"; bad.removeValue(forKey: "wid")
         XCTAssertThrowsError(try SendParams.parse(bad))
-        bad = m; bad["virtual_display"] = true
-        XCTAssertThrowsError(try SendParams.parse(bad)) { XCTAssertEqual(($0 as? IPCError)?.code, .unsupported) }
+        // virtual_display: fuer Fenster erlaubt, fuer Bildschirme ein Fehler.
+        var win = m; win["mode"] = "window"; win["wid"] = 9; win.removeValue(forKey: "display"); win["virtual_display"] = true
+        XCTAssertEqual(try SendParams.parse(win).virtualDisplay, true)
+        win["virtual_display"] = false
+        XCTAssertEqual(try SendParams.parse(win).virtualDisplay, false)
+        bad = m; bad["virtual_display"] = true // m ist hier mode display
+        XCTAssertThrowsError(try SendParams.parse(bad)) { XCTAssertEqual(($0 as? IPCError)?.code, .badRequest) }
     }
 }
