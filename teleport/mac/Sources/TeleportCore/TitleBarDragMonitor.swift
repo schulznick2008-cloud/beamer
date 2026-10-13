@@ -103,13 +103,11 @@ public final class AXTitleBarProbe: TitleBarHitTesting {
     private let timeout: Float = 0.05
     private static let titleBarRole = "AXTitleBar" as CFString
 
-    @_silgen_name("_AXUIElementGetWindow")
-    private static func axGetWindow(_ element: AXUIElement, _ out: UnsafeMutablePointer<CGWindowID>) -> AXError
-
     public init() {}
 
     public func hitTitleBar(screenX: CGFloat, screenY: CGFloat) -> (wid: UInt32, titleBar: Bool)? {
         let point = CGPoint(x: screenX, y: screenY)
+        guard let wid = windowID(at: point) else { return nil }
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, timeout)
         var element: AXUIElement?
@@ -117,15 +115,22 @@ public final class AXTitleBarProbe: TitleBarHitTesting {
         if err != .success || element == nil {
             return nil
         }
-        guard let wid = windowID(for: element!) else { return nil }
         let titleBar = isTitleBarRegion(element: element!, at: point)
         return (wid, titleBar)
     }
 
-    private func windowID(for element: AXUIElement) -> UInt32? {
-        var wid: CGWindowID = 0
-        if Self.axGetWindow(element, &wid) == .success {
-            return wid
+    private func windowID(at point: CGPoint) -> UInt32? {
+        let opts = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
+        guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
+        for info in list {
+            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+                  let num = info[kCGWindowNumber as String] as? UInt32,
+                  let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = bounds["X"], let y = bounds["Y"], let w = bounds["Width"], let h = bounds["Height"]
+            else { continue }
+            if point.x >= x, point.x < x + w, point.y >= y, point.y < y + h {
+                return num
+            }
         }
         return nil
     }
