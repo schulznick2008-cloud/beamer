@@ -207,12 +207,15 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
             throw CapturePermission.mapped(error)
         }
         let filter: SCContentFilter
+        var windowFramePoints: CGRect?
         switch mode {
         case .window(let id):
             guard let w = content.windows.first(where: { $0.windowID == id }) else {
                 throw IPCError(.notFound, "Fenster \(id) nicht gefunden")
             }
             filter = SCContentFilter(desktopIndependentWindow: w)
+            // Voller Fensterrahmen inkl. Titelleiste und Ampeln (nicht nur contentRect).
+            windowFramePoints = w.frame
         case .display(let id):
             if content.displays.isEmpty {
                 // Unter Last liefert ScreenCaptureKit manchmal eine leere Liste: kein Fehler des Aufrufers.
@@ -232,9 +235,13 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         }
         if let did = resolvedDisplay, let hint = Self.scaleHint(forDisplay: did) { pxScale = max(pxScale, hint) }
         scale = pxScale
+        let sizePoints: CGSize = {
+            if let f = windowFramePoints { return f.size }
+            return CGSize(width: Double(info.contentRect.width), height: Double(info.contentRect.height))
+        }()
         // Gerade Pixelzahlen, sonst verweigert mancher Encoder die Arbeit.
-        width = max(2, Int((Double(info.contentRect.width) * pxScale).rounded()) & ~1)
-        height = max(2, Int((Double(info.contentRect.height) * pxScale).rounded()) & ~1)
+        width = max(2, Int((Double(sizePoints.width) * pxScale).rounded()) & ~1)
+        height = max(2, Int((Double(sizePoints.height) * pxScale).rounded()) & ~1)
 
         let cfg = SCStreamConfiguration()
         cfg.width = width
@@ -242,6 +249,9 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(maxFps))
         cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         cfg.showsCursor = false
+        if #available(macOS 14.0, *) {
+            cfg.capturesShadow = false
+        }
         cfg.queueDepth = 4
         cfg.scalesToFit = true
         cfg.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2

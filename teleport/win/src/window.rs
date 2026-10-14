@@ -17,6 +17,10 @@ use serde_json::{json, Value};
 use windows::core::BOOL;
 use windows::core::{w, Result, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_ROUND,
+};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, GetStockObject, MonitorFromPoint, MonitorFromWindow,
     ScreenToClient, ValidateRect, BLACK_BRUSH, HBRUSH, HDC, HMONITOR, MONITORINFO,
@@ -46,7 +50,10 @@ pub const WM_APP_CLOSED: u32 = WM_APP + 3;
 pub const WM_APP_FAILED: u32 = WM_APP + 4;
 
 const CLASS: PCWSTR = w!("BeamerTeleportProxy");
-const STYLE: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
+/// Rahmenlos wie ein Mac-Fenster auf dem Desktop; WS_THICKFRAME für Kanten-Resize, Min/Max für Ampel gelb/grün.
+const STYLE: WINDOW_STYLE = WINDOW_STYLE(
+    WS_POPUP.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0 | WS_CLIPCHILDREN.0,
+);
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
 
 /// Gemeldete Groesse fuer `proxy.resize`: Client-Pixel und DPI (Punkte = Pixel * 96 / DPI).
@@ -201,6 +208,26 @@ fn work_area(m: HMONITOR) -> RECT {
         let _ = GetMonitorInfoW(m, &mut mi);
     }
     mi.rcWork
+}
+
+/// Abgerundete Ecken und Schatten (DWM); nach Stilwechsel (Vollbild) erneut aufrufen.
+fn apply_proxy_chrome(hwnd: HWND) {
+    unsafe {
+        let round = DWMWCP_ROUND.0 as u32;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &round as *const _ as *const _,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let margins = windows::Win32::Graphics::Dwm::MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
 }
 
 fn frame_rect(cw: u32, ch: u32, dpi: u32) -> RECT {
@@ -369,6 +396,8 @@ pub fn create(
         if fullscreen {
             // Fuer den Vollbild-Stream (mode "display"): randlos auf dem gewaehlten Monitor.
             set_fullscreen(hwnd, true, Some(mon));
+        } else {
+            apply_proxy_chrome(hwnd);
         }
         // Sichtbar und oben, aber ohne Aktivierung: kein Fokusklau (Tastatur bleibt beim Nutzer).
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -455,8 +484,10 @@ impl ProxyWindow {
             let mut wr = RECT::default();
             let _ = GetWindowRect(hwnd, &mut wr);
             let outer = (wr.right - wr.left, wr.bottom - wr.top);
-            let dpi = GetDpiForWindow(hwnd).max(96);
-            let grab = drag::title_grab(outer.0, -frame_rect(0, 0, dpi).top);
+            let grab = match self.shared.stream() {
+                Some(st) => input::title_grab_client(self.shared.size(), st),
+                None => drag::title_grab(outer.0, 0),
+            };
             let mon = MonitorFromPoint(POINT { x: px.0, y: px.1 }, MONITOR_DEFAULTTONEAREST);
             let w = work_area(mon);
             let (left, top) =
@@ -599,7 +630,7 @@ fn set_fullscreen(hwnd: HWND, on: bool, mon: Option<HMONITOR>) {
             SetWindowLongPtrW(
                 hwnd,
                 GWL_STYLE,
-                ((style.0 & !WS_OVERLAPPEDWINDOW.0) | WS_POPUP.0) as isize,
+                ((style.0 & !(WS_OVERLAPPEDWINDOW.0 | STYLE.0)) | WS_POPUP.0) as isize,
             );
             let _ = SetWindowPos(
                 hwnd,
@@ -624,6 +655,7 @@ fn set_fullscreen(hwnd: HWND, on: bool, mon: Option<HMONITOR>) {
                 r.bottom - r.top,
                 SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
+            apply_proxy_chrome(hwnd);
         }
         eprintln!(
             "beamer-teleport: tid {} Vollbild {}",
@@ -683,11 +715,7 @@ fn send_resize(s: &Shared, v: ResizeVal) {
     ));
 }
 
-/// Gestreamte Titelleiste im Client: Ziehen verschiebt den Proxy (HTCAPTION), nicht der Mac.
-fn hit_stream_title_bar(hwnd: HWND, s: &Shared, screen_x: i32, screen_y: i32) -> bool {
-    if s.windowed.lock().unwrap().is_some() {
-        return false;
-    }
+fn client_point(hwnd: HWND, screen_x: i32, screen_y: i32) -> (i32, i32) {
     let mut pt = POINT {
         x: screen_x,
         y: screen_y,
@@ -695,16 +723,43 @@ fn hit_stream_title_bar(hwnd: HWND, s: &Shared, screen_x: i32, screen_y: i32) ->
     unsafe {
         let _ = ScreenToClient(hwnd, &mut pt);
     }
-    match s.stream() {
-        Some(st) => input::in_stream_title_bar(pt.x as f64, pt.y as f64, s.size(), st),
-        None => false,
-    }
+    (pt.x, pt.y)
 }
 
 fn client_in_stream_title_bar(s: &Shared, client_x: i32, client_y: i32) -> bool {
     match s.stream() {
         Some(st) => input::in_stream_title_bar(client_x as f64, client_y as f64, s.size(), st),
         None => false,
+    }
+}
+
+fn toggle_maximize(hwnd: HWND) {
+    unsafe {
+        if IsZoomed(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        }
+    }
+}
+
+/// Ampel-Klick lokal (rot → zurück auf den Mac, gelb minimiert, grün maximiert).
+fn on_traffic_light(hwnd: HWND, s: &Shared, light: input::TrafficLight) {
+    match light {
+        input::TrafficLight::Close => {
+            let _ = PostThreadMessageW(
+                s.main_thread,
+                WM_APP_CLOSED,
+                WPARAM(s.tid as usize),
+                LPARAM(0),
+            );
+        }
+        input::TrafficLight::Minimize => {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            }
+        }
+        input::TrafficLight::Zoom => toggle_maximize(hwnd),
     }
 }
 
@@ -896,6 +951,15 @@ fn on_key_inner(
 
 fn on_button(hwnd: HWND, s: &Shared, b: Button, down: bool, lp: LPARAM) {
     let (x, y) = lparam_xy(lp);
+    if down && b == Button::Left {
+        if let Some(st) = s.stream() {
+            let (sx, sy) = input::to_stream(x as f64, y as f64, s.size(), st);
+            if let Some(light) = input::traffic_light_hit(sx, sy) {
+                on_traffic_light(hwnd, s, light);
+                return;
+            }
+        }
+    }
     if client_in_stream_title_bar(s, x, y) {
         return;
     }
@@ -952,8 +1016,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 if let Some(s) = shared_of(hwnd) {
                     let sx = (lp.0 & 0xffff) as i16 as i32;
                     let sy = ((lp.0 >> 16) & 0xffff) as i16 as i32;
-                    if hit_stream_title_bar(hwnd, s, sx, sy) {
-                        return LRESULT(HTCAPTION as isize);
+                    let fullscreen = s.windowed.lock().unwrap().is_some();
+                    let (cx, cy) = client_point(hwnd, sx, sy);
+                    let hit = input::client_hit_test(
+                        cx,
+                        cy,
+                        s.size(),
+                        s.stream(),
+                        !fullscreen,
+                    );
+                    if hit != input::HTCLIENT {
+                        return LRESULT(hit);
                     }
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
