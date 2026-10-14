@@ -8,6 +8,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -114,6 +115,9 @@ class TeleportService:
         self._path = PathChooser(path_settings or PathSettings(), path_probe or (lambda _h, _p: (False, 0.0)))
         self._helper_low_power = False
         self._bitrate_kbps = PathSettings().max_kbps_wlan
+        # Letzter teleport-fähiger Windows-Peer (für Hotkey kurz nach Reconnect).
+        self._last_win_peer: Optional[Tuple[str, bool]] = None
+        self._hotkey_peer_wait_s = float(os.environ.get("BEAMER_TELEPORT_PEER_WAIT", "1.5"))
 
     @property
     def proxy_swallow_input(self) -> bool:
@@ -172,20 +176,36 @@ class TeleportService:
         if link_host:
             self._path.note_link_peer(link_host)
         ref = link_ref(peer_id, outbound)
+        capable = bool(teleport_capable and key_session is not None)
+        direction = "outbound" if outbound else "inbound"
         with self._lock:
             self._links[ref] = PeerTeleportState(
                 peer_id=peer_id,
                 token=token,
                 peer_platform=peer_platform,
-                teleport_capable=teleport_capable and key_session is not None,
+                teleport_capable=capable,
                 key_session=key_session,
                 outbound=outbound,
                 peer_link_host=link_host,
             )
+        if capable:
+            self.logger.info("teleport peer ready %s %s", peer_id, direction)
+            if not keytable.is_mac(peer_platform):
+                self._last_win_peer = (peer_id, outbound)
+        elif teleport_capable and key_session is None:
+            self.logger.warning(
+                "teleport peer %s %s: Schlüsselsitzung fehlt (Handshake unvollständig?)",
+                peer_id,
+                direction,
+            )
 
     def on_link_down(self, peer_id: str, outbound: bool) -> None:
         ref = link_ref(peer_id, outbound)
+        direction = "outbound" if outbound else "inbound"
         with self._lock:
+            st = self._links.get(ref)
+            if st is not None and st.teleport_capable:
+                self.logger.info("teleport peer lost %s %s", peer_id, direction)
             for tid, tele in list(self._active.items()):
                 if tele.peer_id == peer_id and tele.link_outbound == outbound:
                     self._local_close(tid, "error")
@@ -219,17 +239,22 @@ class TeleportService:
         """Mac: Vorderfenster zum PC teleportieren oder zurückholen."""
         if self.platform not in keytable.MAC_PLATFORMS:
             return False
-        peer = peer_id or self._default_pc_peer()
-        if peer is None:
+        st = self._resolve_windows_peer(peer_id, wait=self._hotkey_peer_wait_s)
+        if st is None:
             self.logger.warning("Teleport: kein Windows-Peer mit teleport-Fähigkeit")
             return False
+        peer, link_outbound = st.peer_id, st.outbound
         with self._lock:
-            existing = [t for t in self._active.values() if t.peer_id == peer and t.role == "sender"]
+            existing = [
+                t
+                for t in self._active.values()
+                if t.peer_id == peer and t.role == "sender" and t.link_outbound == link_outbound
+            ]
             if existing:
                 t = existing[0]
                 self._request_close(peer, t.tid, "return", t.link_outbound)
                 return True
-        return self._start_outbound_mac(peer, outbound=True)
+        return self._start_outbound_mac(peer, outbound=link_outbound)
 
     def start_drag_teleport_mac(
         self,
@@ -247,21 +272,55 @@ class TeleportService:
         win = next((w for w in wl.get("windows", []) if int(w.get("wid", 0)) == int(wid)), None)
         if win is None:
             return False
+        st = self._pick_windows_peer(peer_id)
+        if st is None:
+            return False
         return self._start_outbound_mac(
             peer_id,
-            outbound=True,
+            outbound=st.outbound,
             win=win,
             place_x=place_x,
             place_y=place_y,
             drag=True,
         )
 
-    def _default_pc_peer(self) -> Optional[str]:
+    def _resolve_windows_peer(
+        self, peer_id: Optional[str], *, wait: float = 0.0
+    ) -> Optional[PeerTeleportState]:
+        """Teleport-fähigen Windows-Peer finden (outbound oder inbound). Optional kurz warten (Reconnect)."""
+        deadline = time.monotonic() + max(0.0, wait)
+        while True:
+            st = self._pick_windows_peer(peer_id)
+            if st is not None:
+                return st
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        return self._pick_windows_peer(peer_id)
+
+    def _pick_windows_peer(self, peer_id: Optional[str]) -> Optional[PeerTeleportState]:
         with self._lock:
-            for (pid, outbound), st in self._links.items():
-                if outbound and st.teleport_capable and not keytable.is_mac(st.peer_platform):
-                    return pid
+            candidates = [
+                st
+                for st in self._links.values()
+                if st.teleport_capable and st.key_session is not None and not keytable.is_mac(st.peer_platform)
+            ]
+        if peer_id is not None:
+            candidates = [st for st in candidates if st.peer_id == peer_id]
+        if candidates:
+            candidates.sort(key=lambda s: (not s.outbound, s.peer_id))
+            return candidates[0]
+        if peer_id is None and self._last_win_peer is not None:
+            last_id, last_out = self._last_win_peer
+            with self._lock:
+                st = self._links.get(link_ref(last_id, last_out))
+            if st is not None and st.teleport_capable:
+                return st
         return None
+
+    def _default_pc_peer(self) -> Optional[str]:
+        st = self._pick_windows_peer(None)
+        return st.peer_id if st is not None else None
 
     def _peer_state(self, peer_id: str, outbound: bool) -> Optional[PeerTeleportState]:
         with self._lock:
