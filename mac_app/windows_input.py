@@ -52,8 +52,10 @@ class WindowsInput:
         self.paired_callback = None
         teleport_cb = None
         if getattr(controller, "teleport", None) is not None:
+            from core.teleport_link import teleport_peer_id
+
             teleport_cb = lambda peer_id, message: controller.teleport.handle_link_message(
-                peer_id, message, outbound=False
+                teleport_peer_id(peer_id), message, outbound=False
             )
         self.server = LinkResponder(
             controller.book,

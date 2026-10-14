@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from core import keytable, protocol
-from core.teleport_link import LinkRef, link_ref
+from core.teleport_link import LinkRef, PeerIdLike, link_ref, teleport_peer_id
+from core.teleport_protocol import read_tp
 from core.teleport_input import map_input_for_inject
 from core.teleport_ipc import TeleportHelper, TeleportHelperConfig, TeleportIPCError, hello
 from core.teleport_keys import TeleportKeySession
@@ -99,7 +100,7 @@ class TeleportService:
         pick_front_window: Optional[Callable[[], Optional[Mapping[str, Any]]]] = None,
     ) -> None:
         self.platform = platform
-        self._post = post_to_peer
+        self._post_to_peer = post_to_peer
         self._key_style = key_style
         self.logger = logger or log
         self._pick_front_window = pick_front_window
@@ -156,6 +157,44 @@ class TeleportService:
                 self._helper.stop()
                 self._helper = None
 
+    def _post(self, peer_id: PeerIdLike, message: dict, outbound: bool) -> bool:
+        pid = teleport_peer_id(peer_id)
+        ok = self._post_to_peer(pid, message, outbound)
+        if not ok:
+            tp = read_tp(message)
+            name = tp[0] if tp else message.get("type", "?")
+            self.logger.warning(
+                "Teleport send fehlgeschlagen peer=%s richtung=%s nachricht=%s",
+                pid,
+                "outbound" if outbound else "inbound",
+                name,
+            )
+        return ok
+
+    def _open_transport(self, helper: TeleportHelper) -> Optional[int]:
+        """UDP-Transport im Helfer öffnen; bei ``busy`` vorher ``transport.close``."""
+        for attempt in range(4):
+            tr = helper.request_retry_busy(
+                "transport.open", tries=3, delay=0.2, local_port=0, peer_host="0.0.0.0", peer_port=0
+            )
+            if tr.get("ok") and tr.get("local_port") is not None:
+                return int(tr["local_port"])
+            err = tr.get("error") if isinstance(tr.get("error"), Mapping) else {}
+            code = err.get("code") if isinstance(err, Mapping) else None
+            if code == "busy" and attempt + 1 < 4:
+                self.logger.warning("transport.open busy, schließe alten Transport (Versuch %s)", attempt + 1)
+                self._close_transport(helper)
+                continue
+            self.logger.warning("transport.open fehlgeschlagen: %s", tr)
+            return None
+        return None
+
+    def _close_transport(self, helper: TeleportHelper) -> None:
+        try:
+            helper.request("transport.close")
+        except TeleportIPCError as exc:
+            self.logger.warning("transport.close: %s", exc)
+
     def on_link_up(
         self,
         peer_id: str,
@@ -167,6 +206,7 @@ class TeleportService:
         *,
         peer_link_host: Optional[str] = None,
     ) -> None:
+        peer_id = teleport_peer_id(peer_id)
         material = link_session.teleport_handshake_material()
         key_session = None
         if material is not None:
@@ -199,7 +239,8 @@ class TeleportService:
                 direction,
             )
 
-    def on_link_down(self, peer_id: str, outbound: bool) -> None:
+    def on_link_down(self, peer_id: PeerIdLike, outbound: bool) -> None:
+        peer_id = teleport_peer_id(peer_id)
         ref = link_ref(peer_id, outbound)
         direction = "outbound" if outbound else "inbound"
         with self._lock:
@@ -212,7 +253,8 @@ class TeleportService:
             self._links.pop(ref, None)
             self._seen_offers.pop(ref, None)
 
-    def handle_link_message(self, peer_id: str, message: dict, outbound: bool) -> None:
+    def handle_link_message(self, peer_id: PeerIdLike, message: dict, outbound: bool) -> None:
+        peer_id = teleport_peer_id(peer_id)
         parsed = read_tp(message)
         if parsed is None:
             return
@@ -306,7 +348,8 @@ class TeleportService:
                 if st.teleport_capable and st.key_session is not None and not keytable.is_mac(st.peer_platform)
             ]
         if peer_id is not None:
-            candidates = [st for st in candidates if st.peer_id == peer_id]
+            want = teleport_peer_id(peer_id)
+            candidates = [st for st in candidates if st.peer_id == want]
         if candidates:
             candidates.sort(key=lambda s: (not s.outbound, s.peer_id))
             return candidates[0]
@@ -322,7 +365,8 @@ class TeleportService:
         st = self._pick_windows_peer(None)
         return st.peer_id if st is not None else None
 
-    def _peer_state(self, peer_id: str, outbound: bool) -> Optional[PeerTeleportState]:
+    def _peer_state(self, peer_id: PeerIdLike, outbound: bool) -> Optional[PeerTeleportState]:
+        peer_id = teleport_peer_id(peer_id)
         with self._lock:
             st = self._links.get(link_ref(peer_id, outbound))
             if st is None or not st.teleport_capable or st.key_session is None:
@@ -359,8 +403,9 @@ class TeleportService:
         salt_b64 = base64.b64encode(os.urandom(16)).decode("ascii")
         salt16 = base64.b64decode(salt_b64)
         codec = choose_codec(self._helper_low_power)
-        tr = helper.request_retry_busy("transport.open", tries=5, delay=0.3, local_port=0, peer_host="0.0.0.0", peer_port=0)
-        local_port = int(tr["local_port"])
+        local_port = self._open_transport(helper)
+        if local_port is None:
+            return False
         tele = ActiveTeleport(
             tid=tid,
             peer_id=peer_id,
@@ -395,6 +440,7 @@ class TeleportService:
         if not self._post(peer_id, offer, outbound):
             with self._lock:
                 self._active.pop(tid, None)
+            self._close_transport(helper)
             return False
         return True
 
@@ -424,10 +470,10 @@ class TeleportService:
             seen.add(pair)
         helper = self._ensure_helper()
         codec = str(data.get("codec", "hevc"))
-        tr = helper.request_retry_busy(
-            "transport.open", tries=5, delay=0.3, local_port=0, peer_host="0.0.0.0", peer_port=0
-        )
-        local_port = int(tr["local_port"])
+        local_port = self._open_transport(helper)
+        if local_port is None:
+            self._post(peer_id, reject_msg(tid, "error"), outbound)
+            return
         keys = st.key_session.allocate(salt16, tid).as_ipc_dict()
         recv = helper.request(
             "recv.open",
@@ -443,6 +489,7 @@ class TeleportService:
             keys=keys,
         )
         if not recv.get("ok"):
+            self._close_transport(helper)
             self._post(peer_id, reject_msg(tid, "error"), outbound)
             return
         place_x = data.get("place_x")
