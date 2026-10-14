@@ -17,9 +17,10 @@ use serde_json::{json, Value};
 use windows::core::BOOL;
 use windows::core::{w, Result, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMNCRP_ENABLED, DWMWA_BORDER_COLOR,
+    DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, GetStockObject, MonitorFromPoint, MonitorFromWindow,
@@ -29,15 +30,17 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
-    AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetDoubleClickTime, GetKeyState, GetKeyboardLayout, ReleaseCapture,
-    SetCapture, ToUnicodeEx, VK_CAPITAL, VK_LBUTTON, VK_RBUTTON,
+    SetCapture, ToUnicodeEx, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CAPITAL, VK_LBUTTON,
+    VK_RBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::chrome::{self, BarSpec, Layout, Mode, StreamLights, TrafficLight};
 use crate::drag::{self, Follow, Throttle};
 use crate::input::{self, Button, Debounce, DebounceOut, InputState};
 use crate::ipc::{self, Out};
@@ -51,9 +54,17 @@ pub const WM_APP_CLOSED: u32 = WM_APP + 3;
 pub const WM_APP_FAILED: u32 = WM_APP + 4;
 
 const CLASS: PCWSTR = w!("BeamerTeleportProxy");
-/// Rahmenlos wie ein Mac-Fenster auf dem Desktop; WS_THICKFRAME für Kanten-Resize, Min/Max für Ampel gelb/grün.
+/// Rahmenlos wie ein Mac-Fenster auf dem Desktop. Sichtbar ist nur der Client: WM_NCCALCSIZE gibt 0 Rand
+/// zurueck, Windows zeichnet weder Titelleiste noch Rahmen noch den hellen Streifen oben. Die Rahmen-Bits
+/// bleiben gesetzt, weil DWM nur dann Schatten, Einrast-Funktion und Min/Max-Animation liefert.
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(
-    WS_POPUP.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0 | WS_CLIPCHILDREN.0,
+    WS_POPUP.0
+        | WS_CAPTION.0
+        | WS_SYSMENU.0
+        | WS_THICKFRAME.0
+        | WS_MINIMIZEBOX.0
+        | WS_MAXIMIZEBOX.0
+        | WS_CLIPCHILDREN.0,
 );
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
 
@@ -101,10 +112,98 @@ pub struct Shared {
     follow: Mutex<Option<Follow>>,
     /// Nutzer zieht das Fenster an der Titelleiste (modale Verschiebe-Schleife).
     moving: AtomicBool,
+    /// Modale Verschiebe-/Groessen-Schleife laeuft (Antworten vom Mac warten bis danach).
+    sizing: AtomicBool,
     drag_throttle: Mutex<Throttle>,
+    chrome: ChromeOpts,
+    /// Titel in der gezeichneten Leiste (Mac-Fenstertitel ohne App-Praefix).
+    bar_title: Mutex<String>,
+    /// Maus ueber der Ampelgruppe der gezeichneten Leiste (Symbole × − ⤢).
+    hover: AtomicBool,
+}
+
+/// Wie der Proxy aussieht (aus `recv.open`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChromeOpts {
+    pub mode: Mode,
+    pub dark: bool,
+    /// Stream-Pixel je Mac-Punkt.
+    pub stream_scale: f64,
+    pub lights: StreamLights,
+}
+
+impl Default for ChromeOpts {
+    fn default() -> Self {
+        ChromeOpts {
+            mode: Mode::Stream,
+            dark: true,
+            stream_scale: 1.0,
+            lights: StreamLights::default(),
+        }
+    }
+}
+
+impl ChromeOpts {
+    /// Zusaetzliche Hoehe der gezeichneten Leiste in Punkten.
+    fn bar_pt(&self) -> f64 {
+        match self.mode {
+            Mode::Synthetic => chrome::BAR_PT,
+            Mode::Stream => 0.0,
+        }
+    }
 }
 
 impl Shared {
+    fn fullscreen(&self) -> bool {
+        self.windowed.lock().unwrap().is_some()
+    }
+
+    fn dpi_scale(&self) -> f64 {
+        self.dpi.load(Ordering::Relaxed).max(1) as f64 / 96.0
+    }
+
+    /// Aktuelle Geometrie fuer Hit-Test, Umrechnung und Zeichnen. Im Vollbild ohne gezeichnete Leiste.
+    pub fn layout(&self, zoomed: bool) -> Layout {
+        let fullscreen = self.fullscreen();
+        Layout {
+            client: self.size(),
+            stream: self.stream(),
+            stream_scale: self.chrome.stream_scale,
+            dpi_scale: self.dpi_scale(),
+            mode: if fullscreen {
+                Mode::Stream
+            } else {
+                self.chrome.mode
+            },
+            lights: self.chrome.lights,
+            resizable: !fullscreen && !zoomed,
+        }
+    }
+
+    /// Was der Empfaenger-Thread als Titelleiste zeichnet (`None`: echte Leiste im Stream oder Vollbild).
+    pub fn bar_spec(&self) -> Option<BarSpec> {
+        let l = self.layout(false);
+        let h = l.bar();
+        if h == 0 {
+            return None;
+        }
+        Some(BarSpec {
+            width: l.client.0,
+            height: h,
+            scale: l.dpi_scale,
+            title: self.bar_title.lock().unwrap().clone(),
+            active: self.focused.load(Ordering::Acquire),
+            hover: self.hover.load(Ordering::Acquire),
+            dark: self.chrome.dark,
+        })
+    }
+
+    fn set_hover(&self, on: bool) {
+        if self.hover.swap(on, Ordering::AcqRel) != on {
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
     pub fn size(&self) -> (u32, u32) {
         let v = self.size.load(Ordering::Acquire);
         ((v >> 32) as u32, v as u32)
@@ -134,12 +233,9 @@ impl Shared {
         ));
     }
 
-    /// Client-Pixel -> Stream-Pixel; vor dem ersten Bild 1:1.
+    /// Client-Pixel -> Stream-Pixel (das Bild fuellt den Bereich unter der Leiste); vor dem ersten Bild 1:1.
     fn to_stream(&self, x: i32, y: i32) -> (f64, f64) {
-        match self.stream() {
-            Some(st) => input::to_stream(x as f64, y as f64, self.size(), st),
-            None => (x as f64, y as f64),
-        }
+        self.layout(false).to_stream(x as f64, y as f64)
     }
 }
 
@@ -211,55 +307,54 @@ fn work_area(m: HMONITOR) -> RECT {
     mi.rcWork
 }
 
-/// Abgerundete Ecken und Schatten (DWM); nach Stilwechsel (Vollbild) erneut aufrufen.
-fn apply_proxy_chrome(hwnd: HWND) {
+fn dwm_u32(hwnd: HWND, attr: windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE, v: u32) {
     unsafe {
-        let round = DWMWCP_ROUND.0 as u32;
         let _ = DwmSetWindowAttribute(
             hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &round as *const _ as *const _,
+            attr,
+            &v as *const _ as *const _,
             std::mem::size_of::<u32>() as u32,
         );
-        let margins = MARGINS {
-            cxLeftWidth: -1,
-            cxRightWidth: -1,
-            cyTopHeight: -1,
-            cyBottomHeight: -1,
-        };
+    }
+}
+
+/// DWM-Rahmen wie macOS: abgerundete Ecken (Windows 11, fest 8 px), Schatten, 1-px-Hairline in der
+/// Fensterrandfarbe statt des hellen Windows-Rands. Nach Stilwechsel (Vollbild) erneut aufrufen.
+fn apply_proxy_chrome(hwnd: HWND, dark: bool) {
+    dwm_u32(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_ENABLED.0 as u32);
+    dwm_u32(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND.0 as u32);
+    let rgb = chrome::palette(dark).border;
+    let colorref = ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
+    dwm_u32(hwnd, DWMWA_BORDER_COLOR, COLORREF(colorref).0);
+    // Schatten braucht einen Rest Rahmen in DWM: 1 px unten, verdeckt vom (deckenden) Bild. Oben bleibt 0,
+    // dort gibt es keinen hellen DWM-Streifen.
+    let margins = MARGINS {
+        cxLeftWidth: 0,
+        cxRightWidth: 0,
+        cyTopHeight: 0,
+        cyBottomHeight: 1,
+    };
+    unsafe {
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
     }
 }
 
-fn frame_rect(cw: u32, ch: u32, dpi: u32) -> RECT {
-    let mut r = RECT {
-        left: 0,
-        top: 0,
-        right: cw as i32,
-        bottom: ch as i32,
-    };
-    unsafe {
-        let _ = AdjustWindowRectExForDpi(&mut r, STYLE, false, EX_STYLE, dpi);
-    }
-    r
-}
-
-/// Aussengroesse fuer `w`×`h` Punkte auf einem Monitor mit `dpi`, begrenzt auf `work`.
+/// Aussengroesse fuer `w`×`h` Punkte auf einem Monitor mit `dpi`, begrenzt auf `work`. Ohne Windows-Rahmen
+/// (WM_NCCALCSIZE 0) ist das Fenster genau so gross wie sein Client.
 fn outer_size(w_pt: f64, h_pt: f64, dpi: u32, work: &RECT) -> (i32, i32, (u32, u32)) {
-    let f = frame_rect(0, 0, dpi);
-    let frame_w = (f.right - f.left) as u32;
-    let frame_h = (f.bottom - f.top) as u32;
     let max = (
-        ((work.right - work.left) as u32)
-            .saturating_sub(frame_w)
-            .max(64),
-        ((work.bottom - work.top) as u32)
-            .saturating_sub(frame_h)
-            .max(64),
+        ((work.right - work.left) as u32).max(64),
+        ((work.bottom - work.top) as u32).max(64),
     );
     let c = fit_into(client_px(w_pt, h_pt, dpi), max);
-    let r = frame_rect(c.0, c.1, dpi);
-    (r.right - r.left, r.bottom - r.top, c)
+    (c.0 as i32, c.1 as i32, c)
+}
+
+/// Rand, den Windows bei maximierten Fenstern mit WS_THICKFRAME ueber den Monitor hinausschiebt.
+fn maximized_inset(dpi: u32) -> i32 {
+    unsafe {
+        GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    }
 }
 
 /// Monitor fuer ein neues Fenster: der unter dem Mauszeiger, ausser dort liegt ein Vollbild-Programm im
@@ -331,6 +426,8 @@ pub fn create(
     index: usize,
     out: Out,
     fullscreen: bool,
+    chrome_opts: ChromeOpts,
+    bar_title: &str,
 ) -> Result<ProxyWindow> {
     register_class();
     unsafe {
@@ -340,7 +437,19 @@ pub fn create(
         let (mon, covered) = choose_monitor(cursor, &all_monitors(), fullscreen_monitor());
         let dpi = monitor_dpi(mon);
         let work = work_area(mon);
-        let (ow, oh, c) = outer_size(w_pt, h_pt, dpi, &work);
+        let (ow, oh, c) = outer_size(w_pt, h_pt + chrome_opts.bar_pt(), dpi, &work);
+        eprintln!(
+            "beamer-teleport: tid {tid} Proxy {}x{} px, Titelleiste {} ({} px), {}",
+            c.0,
+            c.1,
+            chrome_opts.mode.name(),
+            if chrome_opts.mode == Mode::Synthetic {
+                chrome::bar_px(dpi as f64 / 96.0)
+            } else {
+                0
+            },
+            if chrome_opts.dark { "dunkel" } else { "hell" }
+        );
         let step = (32 * dpi / 96) as i32 * (index % 8) as i32;
         let x = work.left + ((work.right - work.left - ow) / 2).max(0) + step;
         let y = work.top + ((work.bottom - work.top - oh) / 2).max(0) + step;
@@ -360,7 +469,11 @@ pub fn create(
             focused: AtomicBool::new(false),
             follow: Mutex::new(None),
             moving: AtomicBool::new(false),
+            sizing: AtomicBool::new(false),
             drag_throttle: Mutex::new(Throttle::new(drag::DRAG_EVERY)),
+            chrome: chrome_opts,
+            bar_title: Mutex::new(bar_title.to_owned()),
+            hover: AtomicBool::new(false),
         });
         let raw = Arc::into_raw(shared.clone());
         let hinst = GetModuleHandleW(None)?;
@@ -398,7 +511,17 @@ pub fn create(
             // Fuer den Vollbild-Stream (mode "display"): randlos auf dem gewaehlten Monitor.
             set_fullscreen(hwnd, true, Some(mon));
         } else {
-            apply_proxy_chrome(hwnd);
+            apply_proxy_chrome(hwnd, chrome_opts.dark);
+            // Rahmen neu berechnen lassen (WM_NCCALCSIZE greift erst damit fuer das erste Anzeigen).
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
         // Sichtbar und oben, aber ohne Aktivierung: kein Fokusklau (Tastatur bleibt beim Nutzer).
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -447,23 +570,44 @@ impl ProxyWindow {
         x >= r.left && x < r.right && y >= r.top && y < r.bottom
     }
 
-    pub fn set_title(&self, title: &str) {
+    /// `title`: Fenstertitel fuer Taskleiste und Alt+Tab; `bar`: Text der gezeichneten Titelleiste.
+    pub fn set_title(&self, title: &str, bar: &str) {
         unsafe {
             let _ = SetWindowTextW(self.hwnd, &HSTRING::from(title));
         }
+        *self.shared.bar_title.lock().unwrap() = bar.to_owned();
+        self.shared.dirty.store(true, Ordering::Release);
     }
 
-    /// Neue Groesse in Punkten (recv.update, also die Antwort auf ein `proxy.resize`). Meldet selbst kein
-    /// `proxy.resize`. Im Vollbild bleibt das Fenster, wie es ist (das Bild wird skaliert).
+    /// Neue Inhaltsgroesse in Punkten (recv.update, die Antwort des Macs auf ein `proxy.resize`): das
+    /// Proxy uebernimmt Groesse und Seitenverhaeltnis des echten Fensters. Meldet selbst kein `proxy.resize`.
+    /// Bleibt, wie es ist: im Vollbild, maximiert, waehrend der Nutzer noch zieht (die Antwort auf die
+    /// letzte Groesse kommt danach) und wenn es schon passt.
     pub fn resize_points(&self, w_pt: f64, h_pt: f64) {
-        if self.shared.windowed.lock().unwrap().is_some() {
+        let s = &self.shared;
+        if s.fullscreen() || s.sizing.load(Ordering::Acquire) || unsafe { IsZoomed(self.hwnd) }.as_bool()
+        {
+            eprintln!(
+                "beamer-teleport: tid {} recv.update {w_pt:.0}x{h_pt:.0} pt jetzt nicht uebernommen (Vollbild, maximiert oder Ziehen)",
+                s.tid
+            );
             return;
         }
-        self.shared.programmatic.store(true, Ordering::Release);
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96);
+        let bar = self.shared.layout(false).bar();
+        let (cw, ch) = s.size();
+        let (cur_w, cur_h) = input::px_to_points((cw, ch.saturating_sub(bar)), dpi);
+        if (cur_w - w_pt).abs() < 1.5 && (cur_h - h_pt).abs() < 1.5 {
+            return;
+        }
+        eprintln!(
+            "beamer-teleport: tid {} Mac-Fenster jetzt {w_pt:.0}x{h_pt:.0} pt (Proxy war {cur_w:.0}x{cur_h:.0}), Proxy passt sich an",
+            s.tid
+        );
+        s.programmatic.store(true, Ordering::Release);
         unsafe {
-            let dpi = GetDpiForWindow(self.hwnd).max(96);
             let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
-            let (ow, oh, _) = outer_size(w_pt, h_pt, dpi, &work_area(mon));
+            let (ow, oh, _) = outer_size(w_pt, h_pt + s.chrome.bar_pt(), dpi, &work_area(mon));
             let _ = SetWindowPos(
                 self.hwnd,
                 None,
@@ -503,10 +647,7 @@ impl ProxyWindow {
             let mut wr = RECT::default();
             let _ = GetWindowRect(hwnd, &mut wr);
             let outer = (wr.right - wr.left, wr.bottom - wr.top);
-            let grab = match self.shared.stream() {
-                Some(st) => input::title_grab_client(self.shared.size(), st),
-                None => drag::title_grab(outer.0, 0),
-            };
+            let grab = self.shared.layout(false).grab_point();
             let mon = MonitorFromPoint(POINT { x: px.0, y: px.1 }, MONITOR_DEFAULTTONEAREST);
             let w = work_area(mon);
             let (left, top) =

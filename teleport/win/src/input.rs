@@ -7,78 +7,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::gpu::letterbox;
 use crate::keytable_gen::VK_NAMES;
 
-/// Hoehe der gestreamten macOS-Titelleiste in Stream-Pixeln (≈ `TitleBarRules.fallbackHeight` auf dem Mac).
-pub const STREAM_TITLE_BAR_PX: f64 = 28.0;
-
-/// Liegt der Client-Punkt in der oberen Titelleiste des gestreamten Fensterbildes (nicht Letterbox-Rand)?
-pub fn in_stream_title_bar(x: f64, y: f64, client: (u32, u32), stream: (u32, u32)) -> bool {
-    let (sx, sy) = to_stream(x, y, client, stream);
-    sx >= 0.0 && (0.0..STREAM_TITLE_BAR_PX).contains(&sy) && sx <= stream.0 as f64
-}
-
-/// macOS-Ampelknöpfe (Stream-Pixel, linker Rand): rot / gelb / grün.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrafficLight {
-    Close,
-    Minimize,
-    Zoom,
-}
-
-/// Layout der Verkehrsampel in Stream-Koordinaten (≈ macOS 12+ Titelleiste).
-const TL_MARGIN: f64 = 8.0;
-const TL_DIAM: f64 = 12.0;
-const TL_GAP: f64 = 8.0;
-
-pub fn traffic_light_hit(sx: f64, sy: f64) -> Option<TrafficLight> {
-    if sy < 0.0 || sy > STREAM_TITLE_BAR_PX {
-        return None;
-    }
-    let mut x = sx - TL_MARGIN;
-    let row_w = 3.0 * TL_DIAM + 2.0 * TL_GAP;
-    if x < 0.0 || x > row_w {
-        return None;
-    }
-    let step = TL_DIAM + TL_GAP;
-    if x < TL_DIAM {
-        return Some(TrafficLight::Close);
-    }
-    x -= step;
-    if x < TL_DIAM {
-        return Some(TrafficLight::Minimize);
-    }
-    x -= step;
-    if x < TL_DIAM {
-        return Some(TrafficLight::Zoom);
-    }
-    None
-}
-
-/// Titelleiste ohne Ampelzone (Ziehen per HTCAPTION).
-pub fn in_stream_title_drag(x: f64, y: f64, client: (u32, u32), stream: (u32, u32)) -> bool {
-    if !in_stream_title_bar(x, y, client, stream) {
-        return false;
-    }
-    let (sx, sy) = to_stream(x, y, client, stream);
-    traffic_light_hit(sx, sy).is_none()
-}
-
-/// Griffpunkt in Client-Pixeln: Mitte der gestreamten Titelleiste (für recv.place).
-pub fn title_grab_client(client: (u32, u32), stream: (u32, u32)) -> (i32, i32) {
-    let r = letterbox(stream, client);
-    let dh = (r.bottom - r.top).max(1) as f64;
-    let title_h = (STREAM_TITLE_BAR_PX * dh / stream.1 as f64).round() as i32;
-    let cx = (r.left + r.right) / 2;
-    let cy = r.top + title_h / 2;
-    (cx, cy.max(0))
-}
-
-/// Kantenbreite für HTLEFT/HTRIGHT/… am rahmenlosen Proxy.
-pub const RESIZE_BORDER_PX: i32 = 8;
-
-/// Win32-HT*-Werte (für Tests und WM_NCHITTEST).
+/// Win32-HT*-Werte (für Tests und WM_NCHITTEST, Geometrie in chrome.rs).
 pub const HTCLIENT: isize = 1;
 pub const HTCAPTION: isize = 2;
 pub const HTLEFT: isize = 10;
@@ -89,71 +20,6 @@ pub const HTTOPLEFT: isize = 13;
 pub const HTTOPRIGHT: isize = 14;
 pub const HTBOTTOMLEFT: isize = 16;
 pub const HTBOTTOMRIGHT: isize = 17;
-
-/// Client-Hit-Test: Kanten zuerst, dann Titelleiste (ohne Ampeln) → Caption.
-pub fn client_hit_test(
-    x: i32,
-    y: i32,
-    client: (u32, u32),
-    stream: Option<(u32, u32)>,
-    allow_resize: bool,
-) -> isize {
-    let (cw, ch) = client;
-    if cw == 0 || ch == 0 {
-        return HTCLIENT;
-    }
-    if allow_resize {
-        let on_l = x < RESIZE_BORDER_PX;
-        let on_r = x >= cw as i32 - RESIZE_BORDER_PX;
-        let on_t = y < RESIZE_BORDER_PX;
-        let on_b = y >= ch as i32 - RESIZE_BORDER_PX;
-        if on_t && on_l {
-            return HTTOPLEFT;
-        }
-        if on_t && on_r {
-            return HTTOPRIGHT;
-        }
-        if on_b && on_l {
-            return HTBOTTOMLEFT;
-        }
-        if on_b && on_r {
-            return HTBOTTOMRIGHT;
-        }
-        if on_l {
-            return HTLEFT;
-        }
-        if on_r {
-            return HTRIGHT;
-        }
-        if on_t {
-            return HTTOP;
-        }
-        if on_b {
-            return HTBOTTOM;
-        }
-    }
-    if let Some(st) = stream {
-        if in_stream_title_drag(x as f64, y as f64, client, st) {
-            return HTCAPTION;
-        }
-    }
-    HTCLIENT
-}
-
-/// Client-Pixel -> Stream-Pixel. Das Bild liegt mit gleichem Seitenverhaeltnis mittig im Client
-/// (Letterbox, siehe gpu.rs); ohne Rand ist das genau `x * Streambreite / Clientbreite`.
-/// Punkte ausserhalb des Bildes ergeben Koordinaten ausserhalb von 0..Stream (der Sender verwirft sie).
-pub fn to_stream(x: f64, y: f64, client: (u32, u32), stream: (u32, u32)) -> (f64, f64) {
-    let r = letterbox(stream, client);
-    let (dw, dh) = (
-        (r.right - r.left).max(1) as f64,
-        (r.bottom - r.top).max(1) as f64,
-    );
-    (
-        (x - r.left as f64) * stream.0 as f64 / dw,
-        (y - r.top as f64) * stream.1 as f64 / dh,
-    )
-}
 
 /// Auf zwei Nachkommastellen (Stream-Pixel sind float; mehr Stellen sind nur Rauschen im JSON).
 fn r2(v: f64) -> f64 {
@@ -482,50 +348,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coordinates_without_letterbox_scale_linearly() {
-        // Client halb so gross wie der Stream: x * Streambreite / Clientbreite.
-        assert_eq!(to_stream(0.0, 0.0, (960, 540), (1920, 1080)), (0.0, 0.0));
-        assert_eq!(
-            to_stream(480.0, 270.0, (960, 540), (1920, 1080)),
-            (960.0, 540.0)
-        );
-        assert_eq!(
-            to_stream(100.5, 10.0, (1920, 1080), (1920, 1080)),
-            (100.5, 10.0)
-        );
-    }
-
-    #[test]
-    fn stream_title_bar_band() {
-        let client = (800, 600);
-        let stream = (1600, 1200);
-        assert!(in_stream_title_bar(400.0, 5.0, client, stream));
-        assert!(!in_stream_title_bar(400.0, 80.0, client, stream));
-        assert_eq!(traffic_light_hit(14.0, 14.0), Some(TrafficLight::Close));
-        assert_eq!(traffic_light_hit(34.0, 14.0), Some(TrafficLight::Minimize));
-        assert_eq!(traffic_light_hit(54.0, 14.0), Some(TrafficLight::Zoom));
-        assert!(traffic_light_hit(200.0, 14.0).is_none());
-        assert!(in_stream_title_drag(400.0, 5.0, client, stream));
-        assert!(!in_stream_title_drag(10.0, 5.0, client, stream));
-        // Letterbox-Rand oben: kein Titel (sy < 0).
-        assert!(!in_stream_title_bar(
-            500.0,
-            10.0,
-            (1000, 1000),
-            (1920, 1080)
-        ));
-    }
-
-    #[test]
-    fn coordinates_with_letterbox_skip_the_border() {
-        // 16:9-Stream in quadratischem Client 1000x1000: Bild 1000x563 ab y=218.
-        let (x, y) = to_stream(500.0, 218.0, (1000, 1000), (1920, 1080));
-        assert!((x - 960.0).abs() < 0.01 && y.abs() < 0.01, "{x} {y}");
-        // Im schwarzen Rand oben: negativ, der Sender verwirft es.
-        assert!(to_stream(500.0, 10.0, (1000, 1000), (1920, 1080)).1 < 0.0);
-    }
-
-    #[test]
     fn sides_of_modifiers() {
         assert_eq!(sided_vk(VK_SHIFT, 0x2A, false), 0xA0);
         assert_eq!(sided_vk(VK_SHIFT, 0x36, false), 0xA1);
@@ -724,27 +546,4 @@ mod tests {
         assert_eq!(px_to_points((1920, 1080), 144), (1280.0, 720.0));
     }
 
-    #[test]
-    fn client_hit_test_edges_and_title() {
-        let client = (800, 600);
-        let stream = (1600, 1200);
-        assert_eq!(client_hit_test(4, 300, client, Some(stream), true), HTLEFT);
-        assert_eq!(
-            client_hit_test(796, 300, client, Some(stream), true),
-            HTRIGHT
-        );
-        assert_eq!(
-            client_hit_test(400, 596, client, Some(stream), true),
-            HTBOTTOM
-        );
-        assert_eq!(
-            client_hit_test(400, 10, client, Some(stream), true),
-            HTCAPTION
-        );
-        assert_eq!(
-            client_hit_test(400, 300, client, Some(stream), true),
-            HTCLIENT
-        );
-        assert_eq!(client_hit_test(4, 4, client, Some(stream), true), HTTOPLEFT);
-    }
 }

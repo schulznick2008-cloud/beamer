@@ -5,6 +5,7 @@
 //! Fenster. `--selftest-send <host> <port>` sendet ein synthetisches Testbild.
 
 pub mod app;
+pub mod chrome;
 pub mod clock;
 pub mod decode;
 pub mod drag;
