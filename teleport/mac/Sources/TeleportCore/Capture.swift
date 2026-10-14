@@ -249,9 +249,6 @@ public final class ScreenCaptureSource: NSObject, FrameSource, SCStreamOutput, S
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(maxFps))
         cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         cfg.showsCursor = false
-        if #available(macOS 14.0, *) {
-            cfg.capturesShadow = false
-        }
         cfg.queueDepth = 4
         cfg.scalesToFit = true
         cfg.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
