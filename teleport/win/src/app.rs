@@ -391,7 +391,10 @@ impl App {
                 }
                 Ok(json!({}))
             }
-            None => Err(("not_found", "kein Proxy unter dem Punkt oder tid unbekannt")),
+            None => Err((
+                "not_found",
+                "kein Proxy unter dem Punkt oder tid unbekannt".to_owned(),
+            )),
         }
     }
 
