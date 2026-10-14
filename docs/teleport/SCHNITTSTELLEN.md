@@ -42,6 +42,7 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 | `transport.peer` | `peer_host`, `peer_port` | – (darf bei laufenden Streams kommen, siehe §7) | beide |
 | `transport.close` | – | – | beide |
 | `windows.list` | – | `windows`: `[{wid,pid,app,title,x,y,w,h,display,scale}]` (x..h in Punkten bzw. logischen Pixeln) | Sender |
+| `windows.chrome` | `wid` | `title_bar` (bool: echte AX-Titelleiste im Stream), `dark` (bool), optional `lights` (`[[x,y],…]` Ampel-Mitten in Punkten) | Sender |
 | `send.start` | `tid`, `mode` (`window`/`display`), `wid` oder `display`, `codec` (`hevc`/`h264`), `max_fps`, `bitrate_kbps`, `keys` (siehe 4.2), `virtual_display` (bool) | `width`, `height` (Stream-Pixel), `scale` | Sender |
 | `send.stop` | `tid`, `restore` (bool: Fenster zurück auf echten Monitor; gilt nur im Fenster-Rückfall, siehe unten) | – | Sender |
 | `send.resize` | `tid`, `w`, `h` (Punkte) | `width`, `height` | Sender |
@@ -49,7 +50,7 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 | `send.keyframe` | `tid` | – | Sender |
 | `send.bitrate` | `tid`, `bitrate_kbps` | – (neue Obergrenze, siehe §7) | Sender |
 | `inject` | `tid`, `input` (siehe 3) | – | Sender |
-| `recv.open` | `tid`, `title`, `app`, `icon_png` (b64, optional), `w`, `h` (Punkte), `scale`, `codec`, `fullscreen` (bool), `keys` | – | Empfänger |
+| `recv.open` | `tid`, `title`, `app`, `icon_png` (b64, optional), `w`, `h` (Punkte), `scale`, `codec`, `fullscreen` (bool), `keys`, optional `title_bar` (bool), `dark` (bool), `lights` | – | Empfänger |
 | `recv.update` | `tid`, optional `title`, `w`, `h` | – | Empfänger |
 | `recv.close` | `tid` | – | Empfänger |
 | `shutdown` | – | – | beide |
@@ -72,7 +73,7 @@ Alle Ganzzahlen auf dem Draht sind **Big-Endian**. JSON ist UTF-8, ohne NaN. Zei
 | `error` | `code`, `msg`, optional `tid` | asynchroner Fehler |
 
 - Zusatzfelder (v1.3): Helfer dürfen in Antworten und Ereignissen weitere Felder melden; Python ignoriert unbekannte Felder und verlässt sich nur auf die Felder dieser Tabelle. Dokumentiert werden Zusatzfelder in der README des Helfers (`teleport/mac/README.md`: u. a. `encoder_slow`, `effective_fps`, `low_power`, `backlog_drops`; `teleport/win/README.md`: u. a. `recv_to_present_ms`, `frames_presented`, `dropped_*`). Wird Python von einem Zusatzfeld abhängig (z. B. Codec-Wahl nach `low_power`/`encoder_slow`), wandert es zuerst per Vertrags-PR in diese Tabelle.
-- Pixel-Regel für `proxy.resize` (v1.4): Ziel ist **1 Stream-Pixel = 1 Bildschirm-Pixel** auf dem Empfänger. Meldet der Proxy `px_w`/`px_h`, rechnet Python daraus die Sendegröße: `send.resize` mit `w = round(px_w / s)`, `h = round(px_h / s)`, wobei `s` der `scale` des Senders aus der letzten `send.start`-Antwort bzw. `send.size` ist. Fehlen `px_w`/`px_h`, gilt `px = w × dpi / 96` (Windows) bzw. `px = w × scale` des Empfängers. Der Windows-Proxy meldet `w`/`h` = Client-Pixel × 96 / `dpi`. Weicht die Streamgröße danach leicht ab (Encoder-Ausrichtung, Mindest- oder Höchstgröße), skaliert der Proxy ohne Verzerrung (Letterbox). Ein Monitorwechsel mit anderer DPI löst ein `proxy.resize` aus; die Antwort `recv.update` löst keines aus.
+- Pixel-Regel für `proxy.resize` (v1.4): Ziel ist **1 Stream-Pixel = 1 Bildschirm-Pixel** auf dem Empfänger. Meldet der Proxy `px_w`/`px_h`, rechnet Python daraus die Sendegröße: `send.resize` mit `w = round(px_w / s)`, `h = round(px_h / s)`, wobei `s` der `scale` des Senders aus der letzten `send.start`-Antwort bzw. `send.size` ist. Fehlen `px_w`/`px_h`, gilt `px = w × dpi / 96` (Windows) bzw. `px = w × scale` des Empfängers. Der Windows-Proxy meldet `w`/`h` der **Inhaltsfläche** (Client minus gezeichneter Titelleiste) × 96 / `dpi`. Weicht die Streamgröße danach leicht ab, streckt der Proxy das letzte Bild auf die Inhaltsfläche (keine schwarzen Ränder); `send.size` wird als `tp_update` an den Proxy weitergegeben, der dann das Seitenverhältnis der Mac-Antwort übernimmt. Ein Monitorwechsel mit anderer DPI löst ein `proxy.resize` aus; die Antwort `recv.update` löst keines aus. `title_bar:true` in `tp_offer`/`recv.open`: die echte Mac-Titelleiste ist im Stream, der Proxy zeichnet keine zweite. Sonst (SwiftUI, transparente Titelleiste) zeichnet der Proxy eine Sonoma-Leiste (28 pt, Ampeln 12/8/20).
 - Python-seitige Ereignisse: `core/teleport_ipc.py` erzeugt selbst `helper_restarted` (`code` = Exit-Code; Helfer nach Absturz neu gestartet, alle Transporte und Streams sind weg und müssen mit **neuen** Schlüsseln neu geöffnet werden) und `error`/`bad_request` bei unlesbaren Zeilen. Sie kommen nie vom Helfer und gehören nicht zum IPC-Draht.
 
 ## 2. Beamer-Link: neue Nachrichten (Python ↔ Python, über den bestehenden verschlüsselten TCP-Link)

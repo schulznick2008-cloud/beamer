@@ -545,5 +545,4 @@ mod tests {
         assert_eq!(px_to_points((1920, 1080), 96), (1920.0, 1080.0));
         assert_eq!(px_to_points((1920, 1080), 144), (1280.0, 720.0));
     }
-
 }

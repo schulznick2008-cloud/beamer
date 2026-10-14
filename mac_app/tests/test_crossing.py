@@ -231,6 +231,35 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(step.hold)
         self.assertEqual(machine.pressure, 0.0)
 
+    def test_edge_under_pointer_uses_wider_drag_band(self):
+        from crossing import DRAG_EDGE_TOLERANCE
+
+        machine = engine(edge="top")
+        self.assertIsNone(machine.edge_under_pointer(800.0, 20.0, BOUNDS))
+        hit = machine.edge_under_pointer(
+            800.0, 20.0, BOUNDS, tolerance=DRAG_EDGE_TOLERANCE
+        )
+        self.assertEqual(hit[0], "top")
+
+    def test_jammed_right_while_still_pushing(self):
+        machine = engine(edge="right")
+        prev = (1200.0, 500.0)
+        # Cursor bleibt stehen, Trackpad schiebt weiter nach rechts.
+        hit = machine.jammed_transition(1200.0, 500.0, 12.0, 0.0, prev)
+        self.assertEqual(hit[0], "right")
+        moving = machine.jammed_transition(1210.0, 500.0, 12.0, 0.0, prev)
+        self.assertIsNone(moving)
+
+    def test_jammed_top_for_menu_bar(self):
+        machine = engine(edge="top")
+        prev = (400.0, 28.0)
+        hit = machine.jammed_transition(400.0, 28.0, 0.0, -8.0, prev)
+        self.assertEqual(hit[0], "top")
+
+    def test_jammed_ignores_unarmed_edge(self):
+        machine = engine(edge="right")
+        self.assertIsNone(machine.jammed_transition(400.0, 28.0, 0.0, -8.0, (400.0, 28.0)))
+
     def test_dragging_is_allowed_when_the_block_is_off(self):
         machine = engine(block_while_dragging=False)
         step = push_right(machine, 10, dx=40, dragging=True)

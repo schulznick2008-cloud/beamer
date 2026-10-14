@@ -155,10 +155,15 @@ public protocol WindowController: AnyObject {
     func isFrontmost(windowID: UInt32, pid: pid_t) -> Bool
     /// Optional: Fenster-Zugriff vorab aufbauen, damit das spaetere `setFrame` schneller ist.
     func prepare(windowID: UInt32, pid: pid_t)
+    /// Ob SCK eine echte Titelleiste mitschneidet, plus Ampel-Mittelpunkte in Fensterecken (Punkte).
+    func chrome(windowID: UInt32, pid: pid_t) -> (titleBar: Bool, lights: [(Double, Double)])
 }
 
 extension WindowController {
     public func prepare(windowID: UInt32, pid: pid_t) {}
+    public func chrome(windowID: UInt32, pid: pid_t) -> (titleBar: Bool, lights: [(Double, Double)]) {
+        (false, [])
+    }
 }
 
 public final class AXWindowController: WindowController {
@@ -244,6 +249,30 @@ public final class AXWindowController: WindowController {
 
     public func frame(windowID: UInt32, pid: pid_t) throws -> CGRect {
         try axFrame(try axWindow(windowID: windowID, pid: pid))
+    }
+
+    public func chrome(windowID: UInt32, pid: pid_t) -> (titleBar: Bool, lights: [(Double, Double)]) {
+        guard let w = try? cachedAXWindow(windowID: windowID, pid: pid),
+              let frame = try? axFrame(w) else { return (false, []) }
+        var kidsRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(w, kAXChildrenAttribute as CFString, &kidsRef)
+        let roles = ((kidsRef as? [AXUIElement]) ?? []).map { el -> String in
+            var v: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &v) == .success else { return "" }
+            return (v as? String) ?? ""
+        }
+        let titleBar = TitleBarRules.hasVisibleTitleBar(childRoles: roles)
+        func button(_ attr: CFString) -> CGRect? {
+            var v: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(w, attr, &v) == .success, let el = v else { return nil }
+            return try? axFrame(el as! AXUIElement)
+        }
+        let lights = TitleBarRules.lightCenters(
+            close: button(kAXCloseButtonAttribute as CFString),
+            minimize: button(kAXMinimizeButtonAttribute as CFString),
+            zoom: button(kAXZoomButtonAttribute as CFString),
+            window: frame)
+        return (titleBar, titleBar ? lights : [])
     }
 
     public func setFrame(windowID: UInt32, pid: pid_t, origin: CGPoint?, size: CGSize?) throws {

@@ -115,6 +115,24 @@ final class TitleBarRulesTests: XCTestCase {
     func testPointOutsideTheWindowIsNotATitleBar() {
         XCTAssertFalse(TitleBarRules.isTitleBar(roles: ["AXWindow"], point: CGPoint(x: 50, y: 110), windowFrame: frame))
     }
+
+    func testVisibleTitleBarIsTheAXTitleBarChild() {
+        XCTAssertTrue(TitleBarRules.hasVisibleTitleBar(childRoles: ["AXTitleBar", "AXGroup"]))
+        XCTAssertFalse(TitleBarRules.hasVisibleTitleBar(childRoles: ["AXButton", "AXGroup"]), "SwiftUI: Ampeln ohne AXTitleBar")
+    }
+
+    func testLightCentersAreRelativeToTheWindowOrigin() {
+        let w = CGRect(x: 100, y: 200, width: 800, height: 600)
+        let c = CGRect(x: 120, y: 208, width: 12, height: 12)
+        let m = CGRect(x: 140, y: 208, width: 12, height: 12)
+        let z = CGRect(x: 160, y: 208, width: 12, height: 12)
+        let pts = TitleBarRules.lightCenters(close: c, minimize: m, zoom: z, window: w)
+        XCTAssertEqual(pts.count, 3)
+        XCTAssertEqual(pts[0].0, 26, accuracy: 0.01)
+        XCTAssertEqual(pts[0].1, 14, accuracy: 0.01)
+        XCTAssertEqual(pts[2].0, 66, accuracy: 0.01)
+        XCTAssertEqual(TitleBarRules.lightCenters(close: c, minimize: nil, zoom: z, window: w).count, 0)
+    }
 }
 
 final class ReturnPlacementTests: XCTestCase {

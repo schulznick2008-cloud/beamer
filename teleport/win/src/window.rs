@@ -16,11 +16,10 @@ use serde_json::{json, Value};
 
 use windows::core::BOOL;
 use windows::core::{w, Result, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Foundation::COLORREF;
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMNCRP_ENABLED, DWMWA_BORDER_COLOR,
-    DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWMWA_CAPTION_COLOR, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, GetStockObject, MonitorFromPoint, MonitorFromWindow,
@@ -29,14 +28,15 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::MARGINS;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetDoubleClickTime, GetKeyState, GetKeyboardLayout, ReleaseCapture,
-    SetCapture, ToUnicodeEx, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CAPITAL, VK_LBUTTON,
-    VK_RBUTTON,
+    SetCapture, ToUnicodeEx, TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
+    VK_CAPITAL, VK_LBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -59,7 +59,6 @@ const CLASS: PCWSTR = w!("BeamerTeleportProxy");
 /// bleiben gesetzt, weil DWM nur dann Schatten, Einrast-Funktion und Min/Max-Animation liefert.
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(
     WS_POPUP.0
-        | WS_CAPTION.0
         | WS_SYSMENU.0
         | WS_THICKFRAME.0
         | WS_MINIMIZEBOX.0
@@ -326,6 +325,7 @@ fn apply_proxy_chrome(hwnd: HWND, dark: bool) {
     let rgb = chrome::palette(dark).border;
     let colorref = ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
     dwm_u32(hwnd, DWMWA_BORDER_COLOR, COLORREF(colorref).0);
+    dwm_u32(hwnd, DWMWA_CAPTION_COLOR, COLORREF(colorref).0);
     // Schatten braucht einen Rest Rahmen in DWM: 1 px unten, verdeckt vom (deckenden) Bild. Oben bleibt 0,
     // dort gibt es keinen hellen DWM-Streifen.
     let margins = MARGINS {
@@ -585,7 +585,9 @@ impl ProxyWindow {
     /// letzte Groesse kommt danach) und wenn es schon passt.
     pub fn resize_points(&self, w_pt: f64, h_pt: f64) {
         let s = &self.shared;
-        if s.fullscreen() || s.sizing.load(Ordering::Acquire) || unsafe { IsZoomed(self.hwnd) }.as_bool()
+        if s.fullscreen()
+            || s.sizing.load(Ordering::Acquire)
+            || unsafe { IsZoomed(self.hwnd) }.as_bool()
         {
             eprintln!(
                 "beamer-teleport: tid {} recv.update {w_pt:.0}x{h_pt:.0} pt jetzt nicht uebernommen (Vollbild, maximiert oder Ziehen)",
@@ -815,7 +817,7 @@ fn set_fullscreen(hwnd: HWND, on: bool, mon: Option<HMONITOR>) {
                 r.bottom - r.top,
                 SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-            apply_proxy_chrome(hwnd);
+            apply_proxy_chrome(hwnd, s.chrome.dark);
         }
         eprintln!(
             "beamer-teleport: tid {} Vollbild {}",
@@ -866,12 +868,19 @@ fn offer_resize(hwnd: HWND, s: &Shared, final_: bool) {
 }
 
 fn send_resize(s: &Shared, v: ResizeVal) {
-    let (w, h) = input::px_to_points(v.px, v.dpi);
+    // Inhaltsbereich ohne gezeichnete Leiste: der Mac aendert das echte Fenster um genau diese Groesse.
+    let bar = s.layout(false).bar();
+    let content = (v.px.0, v.px.1.saturating_sub(bar).max(1));
+    let (w, h) = input::px_to_points(content, v.dpi);
+    eprintln!(
+        "beamer-teleport: tid {} proxy.resize {w:.0}x{h:.0} pt ({}x{} px, Leiste {bar} px)",
+        s.tid, content.0, content.1
+    );
     // w/h in Punkten (Vertrag); px_w/px_h/dpi als Zusatzfelder (v1.3), damit der Sender so kodieren kann,
     // dass ein Stream-Pixel ein Bildschirm-Pixel ist.
     s.out.send(&ipc::event(
         "proxy.resize",
-        json!({"tid": s.tid, "w": w, "h": h, "px_w": v.px.0, "px_h": v.px.1, "dpi": v.dpi}),
+        json!({"tid": s.tid, "w": w, "h": h, "px_w": content.0, "px_h": content.1, "dpi": v.dpi}),
     ));
 }
 
@@ -886,11 +895,26 @@ fn client_point(hwnd: HWND, screen_x: i32, screen_y: i32) -> (i32, i32) {
     (pt.x, pt.y)
 }
 
-fn client_in_stream_title_bar(s: &Shared, client_x: i32, client_y: i32) -> bool {
-    match s.stream() {
-        Some(st) => input::in_stream_title_bar(client_x as f64, client_y as f64, s.size(), st),
-        None => false,
+fn layout_of(hwnd: HWND, s: &Shared) -> Layout {
+    s.layout(unsafe { IsZoomed(hwnd) }.as_bool())
+}
+
+fn track_leave(hwnd: HWND) {
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE | TME_NONCLIENT,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    unsafe {
+        let _ = TrackMouseEvent(&mut tme);
     }
+}
+
+fn on_hover(hwnd: HWND, s: &Shared, x: i32, y: i32) {
+    let l = layout_of(hwnd, s);
+    s.set_hover(l.in_light_group(x as f64, y as f64));
+    track_leave(hwnd);
 }
 
 fn toggle_maximize(hwnd: HWND) {
@@ -904,9 +928,9 @@ fn toggle_maximize(hwnd: HWND) {
 }
 
 /// Ampel-Klick lokal (rot → zurück auf den Mac, gelb minimiert, grün maximiert).
-fn on_traffic_light(hwnd: HWND, s: &Shared, light: input::TrafficLight) {
+fn on_traffic_light(hwnd: HWND, s: &Shared, light: TrafficLight) {
     match light {
-        input::TrafficLight::Close => unsafe {
+        TrafficLight::Close => unsafe {
             let _ = PostThreadMessageW(
                 s.main_thread,
                 WM_APP_CLOSED,
@@ -914,10 +938,10 @@ fn on_traffic_light(hwnd: HWND, s: &Shared, light: input::TrafficLight) {
                 LPARAM(0),
             );
         },
-        input::TrafficLight::Minimize => unsafe {
+        TrafficLight::Minimize => unsafe {
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
         },
-        input::TrafficLight::Zoom => toggle_maximize(hwnd),
+        TrafficLight::Zoom => toggle_maximize(hwnd),
     }
 }
 
@@ -1109,16 +1133,14 @@ fn on_key_inner(
 
 fn on_button(hwnd: HWND, s: &Shared, b: Button, down: bool, lp: LPARAM) {
     let (x, y) = lparam_xy(lp);
+    let l = layout_of(hwnd, s);
     if down && b == Button::Left {
-        if let Some(st) = s.stream() {
-            let (sx, sy) = input::to_stream(x as f64, y as f64, s.size(), st);
-            if let Some(light) = input::traffic_light_hit(sx, sy) {
-                on_traffic_light(hwnd, s, light);
-                return;
-            }
+        if let Some(light) = l.light_at(x as f64, y as f64) {
+            on_traffic_light(hwnd, s, light);
+            return;
         }
     }
-    if client_in_stream_title_bar(s, x, y) {
+    if l.in_title(x as f64, y as f64) {
         return;
     }
     let pos = s.to_stream(x, y);
@@ -1170,18 +1192,36 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
+            WM_NCCALCSIZE => {
+                // Client = ganzes Fenster, kein Windows-Rahmen und kein heller 1-px-Streifen oben.
+                // Maximiert: den von WS_THICKFRAME ueberstehenden Rand wieder abziehen, sonst
+                // liegt Inhalt hinter der Taskleiste.
+                if wp.0 != 0 {
+                    if IsZoomed(hwnd).as_bool() {
+                        let p = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
+                        let dpi = GetDpiForWindow(hwnd).max(96);
+                        let inset = maximized_inset(dpi);
+                        p.rgrc[0].left += inset;
+                        p.rgrc[0].top += inset;
+                        p.rgrc[0].right -= inset;
+                        p.rgrc[0].bottom -= inset;
+                    }
+                    return LRESULT(0);
+                }
+                LRESULT(0)
+            }
+            WM_NCPAINT | WM_NCACTIVATE => LRESULT(0),
             WM_NCHITTEST => {
                 if let Some(s) = shared_of(hwnd) {
                     let sx = (lp.0 & 0xffff) as i16 as i32;
                     let sy = ((lp.0 >> 16) & 0xffff) as i16 as i32;
-                    let fullscreen = s.windowed.lock().unwrap().is_some();
                     let (cx, cy) = client_point(hwnd, sx, sy);
-                    let hit = input::client_hit_test(cx, cy, s.size(), s.stream(), !fullscreen);
+                    let hit = layout_of(hwnd, s).hit_test(cx, cy);
                     if hit != input::HTCLIENT {
                         return LRESULT(hit);
                     }
                 }
-                DefWindowProcW(hwnd, msg, wp, lp)
+                LRESULT(input::HTCLIENT)
             }
             WM_SIZE => {
                 if let Some(s) = shared_of(hwnd) {
@@ -1197,6 +1237,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 LRESULT(0)
             }
+            WM_ENTERSIZEMOVE => {
+                if let Some(s) = shared_of(hwnd) {
+                    s.sizing.store(true, Ordering::Release);
+                }
+                LRESULT(0)
+            }
             WM_MOVING => {
                 // Nutzer zieht an der Titelleiste: Position fuer Pythons Rueckweg-Kante melden.
                 if let Some(s) = shared_of(hwnd) {
@@ -1207,6 +1253,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_EXITSIZEMOVE => {
                 if let Some(s) = shared_of(hwnd) {
+                    s.sizing.store(false, Ordering::Release);
                     offer_resize(hwnd, s, true);
                     if s.moving.swap(false, Ordering::AcqRel) {
                         emit_drag(s, cursor_px(), false, true);
@@ -1236,11 +1283,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_MOUSEMOVE => {
                 if let Some(s) = shared_of(hwnd) {
                     let (x, y) = lparam_xy(lp);
-                    if !client_in_stream_title_bar(s, x, y) {
+                    on_hover(hwnd, s, x, y);
+                    if !layout_of(hwnd, s).in_title(x as f64, y as f64) {
                         let pos = s.to_stream(x, y);
                         let v = s.input.lock().unwrap().moved(pos);
                         s.send_input(v);
                     }
+                }
+                LRESULT(0)
+            }
+            WM_NCMOUSEMOVE => {
+                if let Some(s) = shared_of(hwnd) {
+                    let sx = (lp.0 & 0xffff) as i16 as i32;
+                    let sy = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+                    let (x, y) = client_point(hwnd, sx, sy);
+                    on_hover(hwnd, s, x, y);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE | WM_NCMOUSELEAVE => {
+                if let Some(s) = shared_of(hwnd) {
+                    s.set_hover(false);
                 }
                 LRESULT(0)
             }
@@ -1309,6 +1372,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 if let Some(s) = shared_of(hwnd) {
                     let focused = (wp.0 & 0xffff) as u32 != WA_INACTIVE;
                     if s.focused.swap(focused, Ordering::AcqRel) != focused {
+                        s.dirty.store(true, Ordering::Release);
                         s.out.send(&ipc::event(
                             "proxy.focus",
                             json!({"tid": s.tid, "focused": focused}),

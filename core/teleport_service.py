@@ -37,6 +37,7 @@ from core.teleport_protocol import (
     offer_msg,
     read_tp,
     reject_msg,
+    update_msg,
 )
 
 log = logging.getLogger(__name__)
@@ -274,7 +275,7 @@ class TeleportService:
         elif kind == MSG_FOCUS:
             self._handle_focus(peer_id, tid, outbound)
         elif kind == MSG_UPDATE:
-            pass  # UI-Update auf Empfängerseite (später)
+            self._handle_update(peer_id, tid, data, outbound)
         elif kind == MSG_CLOSE:
             self._handle_close(peer_id, tid, data.get("reason", "user"))
 
@@ -422,6 +423,23 @@ class TeleportService:
         )
         with self._lock:
             self._active[tid] = tele
+        title_bar, dark, lights = False, True, None
+        try:
+            ch = helper.request("windows.chrome", wid=int(win.get("wid", 0)))
+            if ch.get("ok"):
+                title_bar = bool(ch.get("title_bar"))
+                dark = bool(ch.get("dark", True))
+                raw = ch.get("lights")
+                if isinstance(raw, list) and len(raw) == 3:
+                    lights = raw
+                self.logger.info(
+                    "Teleport: Fenster %s Titelleiste im Stream=%s dunkel=%s",
+                    win.get("wid"),
+                    title_bar,
+                    dark,
+                )
+        except (TeleportIPCError, TypeError, ValueError):
+            pass
         offer = offer_msg(
             tid,
             app=str(win.get("app", "")),
@@ -437,6 +455,9 @@ class TeleportService:
             place_x=place_x,
             place_y=place_y,
             drag=drag,
+            title_bar=title_bar,
+            dark=dark,
+            lights=lights,
         )
         if not self._post(peer_id, offer, outbound):
             with self._lock:
@@ -476,19 +497,23 @@ class TeleportService:
             self._post(peer_id, reject_msg(tid, "error"), outbound)
             return
         keys = st.key_session.allocate(salt16, tid).as_ipc_dict()
-        recv = helper.request(
-            "recv.open",
-            tid=tid,
-            title=str(data.get("title", "")),
-            app=str(data.get("app", "")),
-            icon_png=str(data.get("icon_png", "")),
-            w=float(data.get("w", 800)),
-            h=float(data.get("h", 600)),
-            scale=float(data.get("scale", 1.0)),
-            codec=codec,
-            fullscreen=False,
-            keys=keys,
-        )
+        recv_kw: Dict[str, Any] = {
+            "tid": tid,
+            "title": str(data.get("title", "")),
+            "app": str(data.get("app", "")),
+            "icon_png": str(data.get("icon_png", "")),
+            "w": float(data.get("w", 800)),
+            "h": float(data.get("h", 600)),
+            "scale": float(data.get("scale", 1.0)),
+            "codec": codec,
+            "fullscreen": False,
+            "keys": keys,
+            "title_bar": bool(data.get("title_bar")),
+            "dark": bool(data.get("dark", True)),
+        }
+        if isinstance(data.get("lights"), list):
+            recv_kw["lights"] = data["lights"]
+        recv = helper.request("recv.open", **recv_kw)
         if not recv.get("ok"):
             self._close_transport(helper)
             self._post(peer_id, reject_msg(tid, "error"), outbound)
@@ -605,6 +630,26 @@ class TeleportService:
         except TeleportIPCError:
             pass
 
+    def _handle_update(self, peer_id: str, tid: int, data: Mapping[str, Any], outbound: bool) -> None:
+        if keytable.is_mac(self.platform):
+            return
+        with self._lock:
+            tele = self._active.get(tid)
+        if tele is None or tele.role != "receiver" or tele.link_outbound != outbound:
+            return
+        fields: Dict[str, Any] = {"tid": tid}
+        if isinstance(data.get("title"), str):
+            fields["title"] = data["title"]
+        for key in ("w", "h"):
+            if isinstance(data.get(key), (int, float)):
+                fields[key] = float(data[key])
+        if len(fields) == 1:
+            return
+        try:
+            self._ensure_helper().request("recv.update", **fields)
+        except TeleportIPCError:
+            pass
+
     def _handle_focus(self, peer_id: str, tid: int, outbound: bool) -> None:
         if not keytable.is_mac(self.platform):
             return
@@ -683,6 +728,8 @@ class TeleportService:
                 tele = self._active.get(tid)
             if tele is not None:
                 self._request_close(tele.peer_id, tid, "gone", tele.link_outbound)
+        elif name == "send.size":
+            self._on_send_size(tid, ev)
         elif name == "helper_restarted":
             with self._lock:
                 for t in list(self._active.values()):
@@ -709,6 +756,23 @@ class TeleportService:
         if at_edge:
             self.logger.info("Teleport %s: Proxy an die Kante gezogen, Fenster geht zurück", tid)
             self._request_close(tele.peer_id, tid, "return", tele.link_outbound)
+
+    def _on_send_size(self, tid: int, ev: Mapping[str, Any]) -> None:
+        """Mac-Helfer: Streamgroesse hat sich geaendert → tp_update, der Proxy passt das Seitenverhaeltnis an."""
+        with self._lock:
+            tele = self._active.get(tid)
+        if tele is None or tele.role != "sender":
+            return
+        w, h, scale = ev.get("width"), ev.get("height"), ev.get("scale")
+        if not isinstance(w, (int, float)) or not isinstance(h, (int, float)):
+            return
+        s = float(scale) if isinstance(scale, (int, float)) and scale else 1.0
+        self.logger.info("Teleport %s: send.size %sx%s px (scale %s)", tid, int(w), int(h), s)
+        self._post(
+            tele.peer_id,
+            update_msg(tid, w=float(w) / s, h=float(h) / s, scale=s),
+            tele.link_outbound,
+        )
 
     def apply_path_decision(self, decision: PathDecision) -> None:
         self._bitrate_kbps = decision.bitrate_kbps

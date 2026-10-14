@@ -543,7 +543,16 @@ fn main() {
     let r = h.cmd(json!({"cmd":"recv.place","tid":1,"x":pt(cx),"y":pt(cy),"dragging":false}));
     let wr = wrect(hw);
     let (cw, ch) = client_size(hw);
-    let grab = beamer_teleport_win::input::title_grab_client((cw as u32, ch as u32), (1920, 1080));
+    let grab = beamer_teleport_win::chrome::Layout {
+        client: (cw as u32, ch as u32),
+        stream: Some((1920, 1080)),
+        stream_scale: 1.0,
+        dpi_scale: 1.0,
+        mode: beamer_teleport_win::chrome::Mode::Synthetic,
+        lights: beamer_teleport_win::chrome::StreamLights::default(),
+        resizable: true,
+    }
+    .grab_point();
     let mut title_mid = POINT {
         x: grab.0,
         y: grab.1,

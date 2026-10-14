@@ -126,7 +126,12 @@ impl Layout {
 
     /// Inhaltsbereich (links, oben, rechts, unten), in den das Bild gestreckt wird.
     pub fn content(&self) -> (i32, i32, i32, i32) {
-        (0, self.bar() as i32, self.client.0 as i32, self.client.1 as i32)
+        (
+            0,
+            self.bar() as i32,
+            self.client.0 as i32,
+            self.client.1 as i32,
+        )
     }
 
     /// Client-Pixel -> Stream-Pixel (linear, das Bild fuellt den Inhaltsbereich). Vor dem ersten Bild 1:1.
@@ -144,7 +149,7 @@ impl Layout {
     }
 
     /// Client-Punkt in Mac-Punkten des gestreamten Fensters.
-    fn to_window_pt(&self, x: f64, y: f64) -> (f64, f64) {
+    fn window_pt(&self, x: f64, y: f64) -> (f64, f64) {
         let (sx, sy) = self.to_stream(x, y);
         let s = self.stream_scale.max(0.1);
         (sx / s, sy / s)
@@ -165,7 +170,7 @@ impl Layout {
             }
             Mode::Stream => {
                 self.stream?;
-                let (px, py) = self.to_window_pt(x, y);
+                let (px, py) = self.window_pt(x, y);
                 let half = (LIGHT_D_PT + LIGHT_GAP_PT) / 2.0;
                 self.lights
                     .centers
@@ -197,7 +202,7 @@ impl Layout {
                 if self.stream.is_none() {
                     return false;
                 }
-                let (px, py) = self.to_window_pt(x, y);
+                let (px, py) = self.window_pt(x, y);
                 let w_pt = self.stream.map_or(0.0, |s| s.0 as f64) / self.stream_scale.max(0.1);
                 (0.0..self.lights.band_pt).contains(&py) && (0.0..=w_pt).contains(&px)
             }
@@ -339,7 +344,7 @@ pub struct Canvas {
 impl Canvas {
     pub fn new(w: usize, h: usize, rgb: u32) -> Canvas {
         let mut px = vec![0u8; w * h * 4];
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             p.copy_from_slice(&bgra(rgb));
         }
         Canvas { w, h, px }
@@ -358,9 +363,9 @@ impl Canvas {
         let a = a.min(1.0);
         let i = (y * self.w + x) * 4;
         let c = bgra(rgb);
-        for k in 0..3 {
+        for (k, src) in c.iter().take(3).enumerate() {
             let d = self.px[i + k] as f64;
-            self.px[i + k] = (d + (c[k] as f64 - d) * a).round() as u8;
+            self.px[i + k] = (d + (*src as f64 - d) * a).round() as u8;
         }
         self.px[i + 3] = 255;
     }
@@ -423,7 +428,15 @@ fn in_triangle(p: (f64, f64), t: [(f64, f64); 3]) -> bool {
 }
 
 /// Ampel `i` mit Mittelpunkt `c` (Pixel) zeichnen.
-fn draw_light(cv: &mut Canvas, i: usize, c: (f64, f64), s: f64, colored: bool, glyph: bool, pal: &Palette) {
+fn draw_light(
+    cv: &mut Canvas,
+    i: usize,
+    c: (f64, f64),
+    s: f64,
+    colored: bool,
+    glyph: bool,
+    pal: &Palette,
+) {
     let r = LIGHT_D_PT / 2.0 * s;
     let rim = (LIGHT_RIM_PT * s).max(0.6);
     let (fill, ring, sym) = if colored {
@@ -464,7 +477,8 @@ fn draw_light(cv: &mut Canvas, i: usize, c: (f64, f64), s: f64, colored: bool, g
 
 /// Bereich des Titeltexts (links, rechts) in Pixeln: mittig, Ampeln frei.
 pub fn title_span(width: u32, scale: f64) -> (i32, i32) {
-    let inset = ((LIGHT_LEFT_PT + 3.0 * LIGHT_D_PT + 2.0 * LIGHT_GAP_PT + 12.0) * scale).round() as i32;
+    let inset =
+        ((LIGHT_LEFT_PT + 3.0 * LIGHT_D_PT + 2.0 * LIGHT_GAP_PT + 12.0) * scale).round() as i32;
     let w = width as i32;
     if 2 * inset >= w {
         (inset.min(w), w)
@@ -493,11 +507,25 @@ pub fn render(spec: &BarSpec) -> Canvas {
         } else {
             pal.title_inactive
         };
-        text::draw(&mut cv, &spec.title, title_span(spec.width, spec.scale), spec.scale, color);
+        text::draw(
+            &mut cv,
+            &spec.title,
+            title_span(spec.width, spec.scale),
+            spec.scale,
+            color,
+        );
     }
     let colored = spec.active || spec.hover;
     for i in 0..3 {
-        draw_light(&mut cv, i, light_center(i, spec.scale), spec.scale, colored, spec.hover, pal);
+        draw_light(
+            &mut cv,
+            i,
+            light_center(i, spec.scale),
+            spec.scale,
+            colored,
+            spec.hover,
+            pal,
+        );
     }
     cv
 }
@@ -531,7 +559,8 @@ mod text {
                 ..Default::default()
             };
             let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-            let Ok(bmp) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+            let Ok(bmp) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+            else {
                 let _ = DeleteDC(dc);
                 return;
             };
@@ -582,7 +611,7 @@ mod text {
             let _ = DeleteObject(font.into());
             let _ = DeleteObject(bmp.into());
             let _ = DeleteDC(dc);
-            for p in cv.px.chunks_exact_mut(4) {
+            for p in cv.px.as_chunks_mut::<4>().0 {
                 p[3] = 255;
             }
         }
@@ -617,11 +646,20 @@ pub fn bmp(cv: &Canvas) -> Vec<u8> {
 
 /// `--chrome-preview <ordner> [--width PT] [--scale S] [--title T]`: alle Zustaende als BMP schreiben
 /// (dunkel/hell × aktiv/inaktiv/Hover), zum 1:1-Vergleich mit einem Mac-Screenshot.
-pub fn write_previews(dir: &std::path::Path, width_pt: f64, scale: f64, title: &str) -> std::io::Result<Vec<String>> {
+pub fn write_previews(
+    dir: &std::path::Path,
+    width_pt: f64,
+    scale: f64,
+    title: &str,
+) -> std::io::Result<Vec<String>> {
     std::fs::create_dir_all(dir)?;
     let mut names = Vec::new();
     for dark in [true, false] {
-        for (state, active, hover) in [("active", true, false), ("inactive", false, false), ("hover", false, true)] {
+        for (state, active, hover) in [
+            ("active", true, false),
+            ("inactive", false, false),
+            ("hover", false, true),
+        ] {
             let spec = BarSpec {
                 width: (width_pt * scale).round().max(1.0) as u32,
                 height: bar_px(scale),
@@ -710,7 +748,10 @@ mod tests {
         t.lights = StreamLights::from_centers([(20.0, 26.0), (40.0, 26.0), (60.0, 26.0)]);
         assert_eq!(t.lights.band_pt, 52.0);
         assert_eq!(t.hit_test(400, 50), HTCAPTION);
-        assert_eq!(t.light_at(20.0, 26.0 * 628.0 / 600.0), Some(TrafficLight::Close));
+        assert_eq!(
+            t.light_at(20.0, 26.0 * 628.0 / 600.0),
+            Some(TrafficLight::Close)
+        );
     }
 
     #[test]

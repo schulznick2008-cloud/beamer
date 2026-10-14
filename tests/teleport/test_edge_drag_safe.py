@@ -59,6 +59,19 @@ def test_exception_in_try_queue_still_allows_kvm_path():
     controller.logger.exception.assert_called()
 
 
+def test_handle_local_mouse_armed_drag_bypasses_crossing_feed():
+    from pathlib import Path
+
+    text = Path("mac_app/bridge.py").read_text(encoding="utf-8")
+    assert "edge_under_pointer" in text
+    assert "jammed_transition" in text
+    armed = text.index("if armed:")
+    feed = text.index("self.crossing.feed(")
+    assert armed < feed
+    block = text[armed:feed]
+    assert "block_while_dragging" in block or "Titelleisten-Drag" in block
+
+
 def test_handle_local_mouse_cross_does_not_call_pick_front_window():
     """Kantenüberquerung im Tap: nur try_queue_edge_drag_teleport, dann KVM; kein windows.list."""
     from pathlib import Path

@@ -283,10 +283,14 @@ fn present_if_possible(st: &mut State, cfg: &Config, shared: &Shared) {
     if let Some(r) = st.ready.take() {
         st.redraw = false;
         let t0 = Instant::now();
-        if let Err(e) = st
-            .presenter
-            .present(&st.gpu, r.d.texture(), r.d.slice(), r.d.size())
-        {
+        let bar = cfg.win.bar_spec();
+        if let Err(e) = st.presenter.present(
+            &st.gpu,
+            r.d.texture(),
+            r.d.slice(),
+            r.d.size(),
+            bar.as_ref(),
+        ) {
             eprintln!("beamer-teleport: tid {} Present: {e}", cfg.tid);
             st.last = Some(r.d);
             return;
@@ -309,9 +313,10 @@ fn present_if_possible(st: &mut State, cfg: &Config, shared: &Shared) {
     } else if st.redraw {
         st.redraw = false;
         if let Some(d) = st.last.as_ref() {
+            let bar = cfg.win.bar_spec();
             let _ = st
                 .presenter
-                .present(&st.gpu, d.texture(), d.slice(), d.size());
+                .present(&st.gpu, d.texture(), d.slice(), d.size(), bar.as_ref());
         }
     }
 }

@@ -10,6 +10,8 @@ use base64::Engine;
 use beamer_transport::StreamKeys;
 use serde_json::{json, Map, Value};
 
+use crate::chrome::{Mode, StreamLights};
+
 pub const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Befehle, die zu einer anderen Seite oder einem spaeteren Paket gehoeren. Sie werden mit
@@ -81,6 +83,10 @@ pub struct RecvOpen {
     pub keys: StreamKeys,
     /// App-Icon (PNG) fuer die Taskleiste, optional.
     pub icon_png: Option<Vec<u8>>,
+    /// `stream`: echte Mac-Titelleiste im Bild; `synthetic`: Proxy zeichnet sie.
+    pub chrome: Mode,
+    pub dark: bool,
+    pub lights: StreamLights,
 }
 
 impl std::fmt::Debug for RecvOpen {
@@ -95,6 +101,7 @@ impl std::fmt::Debug for RecvOpen {
             .field("scale", &self.scale)
             .field("codec", &self.codec)
             .field("fullscreen", &self.fullscreen)
+            .field("chrome", &self.chrome)
             .finish_non_exhaustive()
     }
 }
@@ -253,6 +260,44 @@ fn parse_icon(v: Option<&Value>, id: i64) -> Result<Option<Vec<u8>>, ParseError>
     }
 }
 
+/// `title_bar: true` (echte Mac-Leiste im Stream) oder `chrome: "stream"`. Sonst zeichnet der Proxy.
+fn parse_chrome(o: &Map<String, Value>) -> Mode {
+    if o.get("title_bar").and_then(Value::as_bool) == Some(true) {
+        return Mode::Stream;
+    }
+    match o.get("chrome").and_then(Value::as_str) {
+        Some("stream") => Mode::Stream,
+        _ => Mode::Synthetic,
+    }
+}
+
+/// Ampel-Mittelpunkte in Mac-Punkten ([[x, y], ...]); ohne Angabe Standard-Titelleiste.
+fn parse_lights(v: Option<&Value>) -> StreamLights {
+    let Some(arr) = v.and_then(Value::as_array) else {
+        return StreamLights::default();
+    };
+    if arr.len() != 3 {
+        return StreamLights::default();
+    }
+    let mut c = [(0.0, 0.0); 3];
+    for (i, item) in arr.iter().enumerate() {
+        let Some(p) = item.as_array() else {
+            return StreamLights::default();
+        };
+        if p.len() < 2 {
+            return StreamLights::default();
+        }
+        let (Some(x), Some(y)) = (p[0].as_f64(), p[1].as_f64()) else {
+            return StreamLights::default();
+        };
+        if !x.is_finite() || !y.is_finite() {
+            return StreamLights::default();
+        }
+        c[i] = (x, y);
+    }
+    StreamLights::from_centers(c)
+}
+
 pub fn parse_line(line: &str) -> Result<Request, ParseError> {
     let v: Value = serde_json::from_str(line).map_err(|e| ParseError {
         id: None,
@@ -314,6 +359,9 @@ pub fn parse_line(line: &str) -> Result<Request, ParseError> {
                     .unwrap_or(false),
                 keys: parse_keys(o.get("keys"), id)?,
                 icon_png: parse_icon(o.get("icon_png"), id)?,
+                chrome: parse_chrome(o),
+                dark: o.get("dark").and_then(Value::as_bool).unwrap_or(true),
+                lights: parse_lights(o.get("lights")),
             }))
         }
         "recv.update" => Cmd::RecvUpdate(RecvUpdate {
@@ -463,8 +511,25 @@ mod tests {
         assert_eq!(o.h, 600.5);
         assert_eq!(o.keys.s2r_key, [1; 32]);
         assert_eq!(o.keys.r2s_prefix, [4; 4]);
+        assert_eq!(o.chrome, crate::chrome::Mode::Synthetic);
+        assert!(o.dark);
         // Debug-Ausgabe verraet keine Schluessel
         assert!(!format!("{o:?}").contains("s2r_key"));
+    }
+
+    #[test]
+    fn recv_open_stream_title_bar() {
+        let line = json!({"v":1,"id":3,"cmd":"recv.open","tid":5,"w":800,"h":600,"codec":"hevc",
+            "keys":keys_json(),"title_bar":true,"dark":false,
+            "lights":[[20.0,26.0],[40.0,26.0],[60.0,26.0]]})
+        .to_string();
+        let Cmd::RecvOpen(o) = parse_line(&line).unwrap().cmd else {
+            panic!()
+        };
+        assert_eq!(o.chrome, crate::chrome::Mode::Stream);
+        assert!(!o.dark);
+        assert_eq!(o.lights.centers[0], (20.0, 26.0));
+        assert_eq!(o.lights.band_pt, 52.0);
     }
 
     #[test]
