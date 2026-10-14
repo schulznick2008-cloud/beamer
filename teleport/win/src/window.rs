@@ -27,6 +27,7 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
@@ -220,7 +221,7 @@ fn apply_proxy_chrome(hwnd: HWND) {
             &round as *const _ as *const _,
             std::mem::size_of::<u32>() as u32,
         );
-        let margins = windows::Win32::Graphics::Dwm::MARGINS {
+        let margins = MARGINS {
             cxLeftWidth: -1,
             cxRightWidth: -1,
             cyTopHeight: -1,
@@ -746,14 +747,14 @@ fn toggle_maximize(hwnd: HWND) {
 /// Ampel-Klick lokal (rot → zurück auf den Mac, gelb minimiert, grün maximiert).
 fn on_traffic_light(hwnd: HWND, s: &Shared, light: input::TrafficLight) {
     match light {
-        input::TrafficLight::Close => {
+        input::TrafficLight::Close => unsafe {
             let _ = PostThreadMessageW(
                 s.main_thread,
                 WM_APP_CLOSED,
                 WPARAM(s.tid as usize),
                 LPARAM(0),
             );
-        }
+        },
         input::TrafficLight::Minimize => unsafe {
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
         },
