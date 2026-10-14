@@ -1,3 +1,6 @@
+//! Release: kein eigenes Konsolenfenster (stdio-IPC laeuft weiter ueber Pipes vom Elternprozess).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 

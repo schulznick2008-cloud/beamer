@@ -550,20 +550,20 @@ class TeleportService:
         helper = self._ensure_helper()
         keys = st.key_session.allocate(tele.salt16, tid).as_ipc_dict()
         wid = tele.wid or int(os.environ.get("BEAMER_TELEPORT_WID", "1"))
-        start = helper.request_retry_busy(
-            "send.start",
-            tries=5,
-            delay=0.3,
-            tid=tid,
-            mode="window",
-            wid=wid,
-            codec=tele.codec,
-            max_fps=60,
-            bitrate_kbps=self._bitrate_kbps,
-            keys=keys,
-            virtual_display=True,
+        virtual_display = self._prefer_virtual_display()
+        start = self._send_start_window(
+            helper, tid=tid, wid=wid, codec=tele.codec, keys=keys, virtual_display=virtual_display
         )
+        if not start.get("ok") and virtual_display:
+            self.logger.info(
+                "Teleport: virtueller Monitor fehlgeschlagen (%s), Fenster-Capture (ScreenCaptureKit window)",
+                start.get("error"),
+            )
+            start = self._send_start_window(
+                helper, tid=tid, wid=wid, codec=tele.codec, keys=keys, virtual_display=False
+            )
         if not start.get("ok"):
+            self.logger.warning("send.start fehlgeschlagen: %s", start.get("error"))
             self._request_close(peer_id, tid, "error", outbound)
             return
         peer_host = self._path_host_for_peer(peer_id, outbound)
@@ -722,6 +722,34 @@ class TeleportService:
                     self._helper.request("send.bitrate", tid=tele.tid, bitrate_kbps=decision.bitrate_kbps)
                 except TeleportIPCError:
                     pass
+
+    def _prefer_virtual_display(self) -> bool:
+        """Standard: Fenster-Capture (nur Inhalt). ``BEAMER_TELEPORT_VIRTUAL_DISPLAY=1`` für virtuellen Monitor."""
+        return os.environ.get("BEAMER_TELEPORT_VIRTUAL_DISPLAY", "0") == "1"
+
+    def _send_start_window(
+        self,
+        helper: TeleportHelper,
+        *,
+        tid: int,
+        wid: int,
+        codec: str,
+        keys: Mapping[str, Any],
+        virtual_display: bool,
+    ) -> Mapping[str, Any]:
+        return helper.request_retry_busy(
+            "send.start",
+            tries=5,
+            delay=0.3,
+            tid=tid,
+            mode="window",
+            wid=wid,
+            codec=codec,
+            max_fps=60,
+            bitrate_kbps=self._bitrate_kbps,
+            keys=keys,
+            virtual_display=virtual_display,
+        )
 
     def _path_host_for_peer(self, peer_id: str, outbound: bool) -> str:
         decision = self._path.tick(force=True)
