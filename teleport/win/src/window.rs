@@ -19,8 +19,8 @@ use windows::core::{w, Result, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, GetStockObject, MonitorFromPoint, MonitorFromWindow,
-    ValidateRect, BLACK_BRUSH, HBRUSH, HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTONULL,
+    ScreenToClient, ValidateRect, BLACK_BRUSH, HBRUSH, HDC, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -683,6 +683,31 @@ fn send_resize(s: &Shared, v: ResizeVal) {
     ));
 }
 
+/// Gestreamte Titelleiste im Client: Ziehen verschiebt den Proxy (HTCAPTION), nicht der Mac.
+fn hit_stream_title_bar(hwnd: HWND, s: &Shared, screen_x: i32, screen_y: i32) -> bool {
+    if s.windowed.lock().unwrap().is_some() {
+        return false;
+    }
+    let mut pt = POINT {
+        x: screen_x,
+        y: screen_y,
+    };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+    match s.stream() {
+        Some(st) => input::in_stream_title_bar(pt.x as f64, pt.y as f64, s.size(), st),
+        None => false,
+    }
+}
+
+fn client_in_stream_title_bar(s: &Shared, client_x: i32, client_y: i32) -> bool {
+    match s.stream() {
+        Some(st) => input::in_stream_title_bar(client_x as f64, client_y as f64, s.size(), st),
+        None => false,
+    }
+}
+
 fn lparam_xy(lp: LPARAM) -> (i32, i32) {
     (
         (lp.0 & 0xffff) as i16 as i32,
@@ -871,6 +896,9 @@ fn on_key_inner(
 
 fn on_button(hwnd: HWND, s: &Shared, b: Button, down: bool, lp: LPARAM) {
     let (x, y) = lparam_xy(lp);
+    if client_in_stream_title_bar(s, x, y) {
+        return;
+    }
     let pos = s.to_stream(x, y);
     let mut st = s.input.lock().unwrap();
     let ev = st.button(b, down, pos, (x as f64, y as f64), Instant::now());
@@ -918,6 +946,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_NCCREATE => {
                 let cs = &*(lp.0 as *const CREATESTRUCTW);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_NCHITTEST => {
+                if let Some(s) = shared_of(hwnd) {
+                    let sx = (lp.0 & 0xffff) as i16 as i32;
+                    let sy = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+                    if hit_stream_title_bar(hwnd, s, sx, sy) {
+                        return LRESULT(HTCAPTION as isize);
+                    }
+                }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_SIZE => {
@@ -973,9 +1011,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_MOUSEMOVE => {
                 if let Some(s) = shared_of(hwnd) {
                     let (x, y) = lparam_xy(lp);
-                    let pos = s.to_stream(x, y);
-                    let v = s.input.lock().unwrap().moved(pos);
-                    s.send_input(v);
+                    if !client_in_stream_title_bar(s, x, y) {
+                        let pos = s.to_stream(x, y);
+                        let v = s.input.lock().unwrap().moved(pos);
+                        s.send_input(v);
+                    }
                 }
                 LRESULT(0)
             }

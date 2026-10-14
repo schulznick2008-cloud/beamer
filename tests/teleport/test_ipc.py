@@ -13,6 +13,7 @@ from core.teleport_ipc import (
     TeleportHelperCrashed,
     TeleportIPCTimeout,
     hello,
+    subprocess_creation_flags,
 )
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,6 +29,17 @@ def _fake_config(**env: str) -> TeleportHelperConfig:
         env=base_env,
         restart_on_crash=False,
     )
+
+
+def test_subprocess_creation_flags():
+    import sys
+
+    if sys.platform == "win32":
+        import subprocess
+
+        assert subprocess_creation_flags() == subprocess.CREATE_NO_WINDOW
+    else:
+        assert subprocess_creation_flags() == 0
 
 
 def test_hello_and_windows_list():

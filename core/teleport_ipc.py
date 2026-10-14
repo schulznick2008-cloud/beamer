@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -24,6 +25,13 @@ DEFAULT_EOF_EXIT_TIMEOUT = 5.0
 MAX_LINE_BYTES = 1 << 20
 DEFAULT_RESTART_BACKOFF = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 STDERR_RING_LINES = 200
+
+
+def subprocess_creation_flags() -> int:
+    """Windows: kein sichtbares Konsolenfenster; stdio-Pipes vom Elternprozess bleiben gültig."""
+    if sys.platform == "win32":
+        return subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    return 0
 
 
 class TeleportIPCError(Exception):
@@ -125,6 +133,7 @@ class TeleportHelper:
             bufsize=1,
             cwd=self._config.cwd,
             env=env,
+            creationflags=subprocess_creation_flags(),
         )
         gen = self._crash_generation
         self._reader = threading.Thread(
