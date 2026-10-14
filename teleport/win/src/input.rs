@@ -16,9 +16,7 @@ pub const STREAM_TITLE_BAR_PX: f64 = 28.0;
 /// Liegt der Client-Punkt in der oberen Titelleiste des gestreamten Fensterbildes (nicht Letterbox-Rand)?
 pub fn in_stream_title_bar(x: f64, y: f64, client: (u32, u32), stream: (u32, u32)) -> bool {
     let (sx, sy) = to_stream(x, y, client, stream);
-    sx >= 0.0
-        && (0.0..STREAM_TITLE_BAR_PX).contains(&sy)
-        && sx <= stream.0 as f64
+    sx >= 0.0 && (0.0..STREAM_TITLE_BAR_PX).contains(&sy) && sx <= stream.0 as f64
 }
 
 /// Client-Pixel -> Stream-Pixel. Das Bild liegt mit gleichem Seitenverhaeltnis mittig im Client
