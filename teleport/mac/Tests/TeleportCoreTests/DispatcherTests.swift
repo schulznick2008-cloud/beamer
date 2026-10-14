@@ -88,6 +88,13 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNotNil(r.string("helper_version"))
     }
 
+    func testWindowsChromeWithoutSenderEngineIsSynthetic() {
+        let r = send(["v": 1, "id": 21, "cmd": "windows.chrome", "wid": 7])
+        XCTAssertEqual(r.bool("ok"), true)
+        XCTAssertEqual(r.bool("title_bar"), false)
+        XCTAssertEqual(r.bool("dark"), true)
+    }
+
     func testUnsupportedCommandsAnswerUnsupported() {
         for cmd in ["recv.open", "recv.update", "recv.close", "bogus"] {
             let r = send(["v": 1, "id": 2, "cmd": cmd])

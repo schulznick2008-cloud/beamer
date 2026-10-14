@@ -78,7 +78,7 @@ beamer-teleport.exe --selftest-send <host> <port> [--tid N] [--fps N] [--size Bx
 | `src/identity.rs` | AppUserModelID je App, Icon aus `icon_png` |
 | `src/receiver.rs` | Thread je `tid`: Decode, Present, Keyframe-Anforderung, Rückstau |
 | `src/decode.rs` | FFmpeg D3D11VA auf dem eigenen D3D11-Gerät, kein stiller Software-Fallback |
-| `src/gpu.rs` | D3D11-Gerät (leistungsstärkste GPU), Flip-Swapchain, V-Sync aus, Latenz 1, Video-Processor (NV12→BGRA, Letterbox) |
+| `src/gpu.rs` | D3D11-Gerät (leistungsstärkste GPU), Flip-Swapchain, V-Sync aus, Latenz 1, Video-Processor (NV12→BGRA, füllt den Client; gezeichnete Titelleiste oben) |
 | `src/stats.rs` | Messfenster und `stats`-Ereignis |
 | `src/firewall.rs` | prüft die Firewall-Regel für „Öffentlich“ (§7), ändert nichts, nur Hinweis im Log |
 | `src/selftest.rs` | Testbild, Encoder, Sender |
@@ -106,7 +106,7 @@ Verhalten:
 ## Proxy (C05)
 
 **Eingabe → `proxy.input`** (§3), Koordinaten in Stream-Pixeln: Client-Pixel × Streambreite / Clientbreite,
-bei Rand (Letterbox, z. B. während eines Resizes) abzüglich des Randes; Punkte im Rand liegen außerhalb des
+über die Inhaltsfläche (unter der gezeichneten Leiste, ohne Letterbox); Punkte in der Leiste liegen außerhalb des
 Bildes (der Sender verwirft sie).
 - Maus: `move`, `down`/`up` mit `b` = left/right/middle/back/forward und `n` (Klickzahl 1–3 nach der
   Doppelklick-Zeit und dem Doppelklick-Rechteck von Windows). Während ein Button gedrückt ist, hält das Fenster
@@ -138,7 +138,7 @@ Bildes (der Sender verwirft sie).
 DPI), höchstens 10/s, der letzte Wert kommt beim Loslassen. `w`/`h` in Punkten (Client-Pixel × 96 / DPI),
 dazu als Zusatzfelder (v1.3) `px_w`, `px_h` und `dpi`, damit der Sender so kodieren kann, dass ein
 Stream-Pixel ein Bildschirm-Pixel ist. `recv.update` mit neuer Größe (die Antwort darauf) löst kein
-`proxy.resize` aus. Bis das neue Bild kommt, wird das alte ohne Verzerrung skaliert (Letterbox).
+`proxy.resize` aus. `w`/`h` gelten für die Inhaltsfläche (ohne gezeichnete Titelleiste). Bis das neue Bild kommt, wird das letzte Bild auf die Fläche gestreckt (keine schwarzen Ränder). `--chrome-preview <ordner>` schreibt BMP der Sonoma-Leiste zum 1:1-Vergleich (`docs/teleport/CHROME.md`).
 
 **Taskleiste:** eigene AppUserModelID je `app` (`Beamer.Teleport.<App>`, eigene Gruppe), Icon aus `icon_png`
 (PNG, Base64, höchstens 1 MB), Titel `<app> – <title>` (aktualisiert per `recv.update`). Normaler Mauszeiger.

@@ -245,8 +245,10 @@ impl App {
                 Some(r) => {
                     if let Some(t) = u.title {
                         r.open.title = t;
-                        r.win
-                            .set_title(&ipc::window_title(&r.open.app, &r.open.title));
+                        r.win.set_title(
+                            &ipc::window_title(&r.open.app, &r.open.title),
+                            &r.open.title,
+                        );
                     }
                     if u.w.is_some() || u.h.is_some() {
                         r.open.w = u.w.unwrap_or(r.open.w);
@@ -414,6 +416,13 @@ impl App {
             self.opened,
             self.out.clone(),
             o.fullscreen,
+            window::ChromeOpts {
+                mode: o.chrome,
+                dark: o.dark,
+                stream_scale: o.scale.max(0.1),
+                lights: o.lights,
+            },
+            &o.title,
         )
         .map_err(|e| ("internal", format!("Fenster: {e}")))?;
         // Taskleiste: eigene Gruppe je App, App-Icon.

@@ -128,6 +128,19 @@ public final class SenderEngine: TeleportBackend {
         try WindowCatalog.list()
     }
 
+    /// Titelleiste im Stream (AXTitleBar) und Ampel-Lagen, plus System-Dunkelmodus.
+    public func windowChrome(windowID: UInt32) -> JSON {
+        let dark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        var out: JSON = ["title_bar": false, "dark": dark]
+        guard let pid = ownerPIDProvider(windowID) else { return out }
+        let (titleBar, lights) = windowController.chrome(windowID: windowID, pid: pid)
+        out["title_bar"] = titleBar
+        if lights.count == 3 {
+            out["lights"] = lights.map { [$0.0, $0.1] }
+        }
+        return out
+    }
+
     public func sendStart(_ p: SendParams) throws -> SendStarted {
         lock.lock()
         guard let t = transport else {

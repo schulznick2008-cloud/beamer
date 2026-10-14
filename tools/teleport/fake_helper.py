@@ -126,6 +126,8 @@ def _handle(
         _write({"v": V, "re": req_id, "ok": True})
     elif cmd == "transport.close":
         _write({"v": V, "re": req_id, "ok": True})
+    elif cmd == "windows.chrome":
+        _write({"v": V, "re": req_id, "ok": True, "title_bar": False, "dark": True})
     elif cmd == "windows.list":
         _write(
             {

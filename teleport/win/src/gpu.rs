@@ -14,6 +14,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::WaitForSingleObjectEx;
 
+use crate::chrome::{self, BarSpec};
+
 /// Ein D3D11-Geraet mit Video-Unterstuetzung. Jeder Empfaenger hat sein eigenes (eigener Thread).
 pub struct Gpu {
     pub device: ID3D11Device,
@@ -112,6 +114,9 @@ impl Gpu {
 struct Vp {
     src: (u32, u32),
     dst: (u32, u32),
+    /// Hoehe der gezeichneten Titelleiste oben; das Bild fuellt den Rest.
+    top: u32,
+    back: ID3D11Texture2D,
     en: ID3D11VideoProcessorEnumerator,
     vp: ID3D11VideoProcessor,
     out_view: Option<ID3D11VideoProcessorOutputView>,
@@ -126,21 +131,18 @@ pub struct Presenter {
     flags: u32,
     pub size: (u32, u32),
     vp: Option<Vp>,
+    /// Gezeichnete Mac-Titelleiste (nur neu erzeugt, wenn sich ihr Inhalt aendert).
+    bar: Option<(BarSpec, ID3D11Texture2D)>,
 }
 
-/// Zielrechteck mit gleichem Seitenverhaeltnis, mittig (Rand schwarz).
-pub fn letterbox(src: (u32, u32), dst: (u32, u32)) -> RECT {
-    let (sw, sh) = (src.0.max(1) as f64, src.1.max(1) as f64);
-    let (dw, dh) = (dst.0.max(1) as f64, dst.1.max(1) as f64);
-    let s = (dw / sw).min(dh / sh);
-    let (w, h) = ((sw * s).round(), (sh * s).round());
-    let x = ((dw - w) / 2.0).floor();
-    let y = ((dh - h) / 2.0).floor();
+/// Zielrechteck des Bildes: der ganze Bereich unter der Leiste, ohne Rand. Weicht das Seitenverhaeltnis ab
+/// (Nutzer zieht, die Antwort vom Mac kommt noch), wird gestreckt statt schwarz aufgefuellt.
+pub fn fill_rect(dst: (u32, u32), top: u32) -> RECT {
     RECT {
-        left: x as i32,
-        top: y as i32,
-        right: (x + w) as i32,
-        bottom: (y + h) as i32,
+        left: 0,
+        top: top.min(dst.1.saturating_sub(1)) as i32,
+        right: dst.0.max(1) as i32,
+        bottom: dst.1.max(1) as i32,
     }
 }
 
@@ -184,6 +186,7 @@ impl Presenter {
                 flags,
                 size: (w.max(1), h.max(1)),
                 vp: None,
+                bar: None,
             })
         }
     }
@@ -208,12 +211,10 @@ impl Presenter {
         Ok(())
     }
 
-    fn ensure_vp(&mut self, gpu: &Gpu, src: (u32, u32)) -> Result<()> {
-        if self
-            .vp
-            .as_ref()
-            .is_some_and(|v| v.src == src && v.dst == self.size && v.out_view.is_some())
-        {
+    fn ensure_vp(&mut self, gpu: &Gpu, src: (u32, u32), top: u32) -> Result<()> {
+        if self.vp.as_ref().is_some_and(|v| {
+            v.src == src && v.dst == self.size && v.top == top && v.out_view.is_some()
+        }) {
             return Ok(());
         }
         self.vp = None;
@@ -283,11 +284,13 @@ impl Presenter {
                 bottom: src.1 as i32,
             };
             v.VideoProcessorSetStreamSourceRect(&vp, 0, true, Some(&srcr));
-            let dst = letterbox(src, self.size);
+            let dst = fill_rect(self.size, top);
             v.VideoProcessorSetStreamDestRect(&vp, 0, true, Some(&dst));
             self.vp = Some(Vp {
                 src,
                 dst: self.size,
+                top,
+                back,
                 en,
                 vp,
                 out_view,
@@ -303,7 +306,46 @@ impl Presenter {
         unsafe { WaitForSingleObjectEx(self.waitable, wait_ms, false) == WAIT_OBJECT_0 }
     }
 
-    /// Skaliert `tex[slice]` (Ausschnitt `src` Pixel) in den Backbuffer und praesentiert sofort.
+    /// Textur der Titelleiste fuer `spec` (Breite = Backbuffer-Breite), aus dem Zwischenspeicher oder neu.
+    fn bar_texture(&mut self, gpu: &Gpu, spec: &BarSpec) -> Result<ID3D11Texture2D> {
+        if let Some((s, t)) = &self.bar {
+            if s == spec {
+                return Ok(t.clone());
+            }
+        }
+        let cv = chrome::render(spec);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: cv.w as u32,
+            Height: cv.h as u32,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: cv.px.as_ptr() as *const _,
+            SysMemPitch: (cv.w * 4) as u32,
+            SysMemSlicePitch: 0,
+        };
+        let mut tex = None;
+        unsafe {
+            gpu.device
+                .CreateTexture2D(&desc, Some(&init), Some(&mut tex))?;
+        }
+        let tex = tex.unwrap();
+        self.bar = Some((spec.clone(), tex.clone()));
+        Ok(tex)
+    }
+
+    /// Skaliert `tex[slice]` (Ausschnitt `src` Pixel) in den Backbuffer und praesentiert sofort. Mit `chrome`
+    /// liegt oben die gezeichnete Mac-Titelleiste, das Bild fuellt den Rest; ohne fuellt es alles.
     /// Vorher `try_acquire`, sonst kann `Present` bis zu einem Bildschirm-Refresh blockieren.
     pub fn present(
         &mut self,
@@ -311,8 +353,21 @@ impl Presenter {
         tex: &ID3D11Texture2D,
         slice: u32,
         src: (u32, u32),
+        chrome: Option<&BarSpec>,
     ) -> Result<()> {
-        self.ensure_vp(gpu, src)?;
+        let chrome = chrome.filter(|c| c.height > 0 && c.height < self.size.1);
+        let bar_tex = match chrome {
+            Some(c) => {
+                let spec = BarSpec {
+                    width: self.size.0,
+                    ..c.clone()
+                };
+                Some(self.bar_texture(gpu, &spec)?)
+            }
+            None => None,
+        };
+        let top = chrome.map_or(0, |c| c.height);
+        self.ensure_vp(gpu, src, top)?;
         let vp = self.vp.as_mut().unwrap();
         let key = (tex.as_raw() as usize, slice);
         if !vp.in_views.contains_key(&key) {
@@ -359,6 +414,10 @@ impl Presenter {
             ManuallyDrop::drop(&mut s.pInputSurface);
             ManuallyDrop::drop(&mut s.pInputSurfaceRight);
             r?;
+            if let Some(b) = &bar_tex {
+                gpu.ctx
+                    .CopySubresourceRegion(&vp.back, 0, 0, 0, 0, b, 0, None);
+            }
             let pf = if self.flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 != 0 {
                 DXGI_PRESENT_ALLOW_TEARING
             } else {
@@ -384,14 +443,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn letterbox_keeps_aspect() {
-        let r = letterbox((1920, 1080), (1920, 1080));
+    fn fill_rect_has_no_black_bars() {
+        let r = fill_rect((1920, 1080), 0);
         assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 1920, 1080));
-        let r = letterbox((1920, 1080), (1000, 1000));
-        assert_eq!((r.left, r.right), (0, 1000));
-        assert_eq!(r.bottom - r.top, 563);
-        let r = letterbox((1000, 2000), (1000, 1000));
-        assert_eq!((r.top, r.bottom), (0, 1000));
-        assert_eq!((r.left, r.right), (250, 750));
+        // Mit gezeichneter Leiste: alles darunter, unabhaengig vom Seitenverhaeltnis des Bildes.
+        let r = fill_rect((1000, 1000), 56);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 56, 1000, 1000));
     }
 }

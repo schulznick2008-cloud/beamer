@@ -106,6 +106,15 @@ public final class Dispatcher {
         case "windows.list":
             return ["windows": try backend.listWindows().map { $0.json }]
 
+        case "windows.chrome":
+            guard let w = msg.int("wid"), w > 0, w <= Int(UInt32.max) else {
+                throw IPCError(.badRequest, "wid muss eine u32 ungleich 0 sein")
+            }
+            if let engine = backend as? SenderEngine {
+                return engine.windowChrome(windowID: UInt32(w))
+            }
+            return ["title_bar": false, "dark": true]
+
         case "send.start":
             let p = try SendParams.parse(msg)
             let s = try backend.sendStart(p)

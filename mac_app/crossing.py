@@ -67,6 +67,8 @@ CORNER_PX = 8.0
 # How close to the last pixel of the desktop counts as touching it. The cursor's reported
 # location at an edge is fractional on a Retina display, so an exact comparison misses.
 EDGE_TOLERANCE = 1.5
+# Titelleisten-Drag: Cursor sitzt oft in der Leiste, nicht auf dem 1,5-px-Rand (Menüleiste/Notch).
+DRAG_EDGE_TOLERANCE = 40.0
 # Pressure below this passes events through untouched: a lean of a pixel or two per event
 # would otherwise alternate between pinning and releasing the pointer at the trackpad's rate.
 HOLD_MIN_PX = 3.0
@@ -269,7 +271,9 @@ class CrossingEngine:
             self.touching = False
             return self._release()
 
-        target = self._target(x, y, bounds, notch_range, displays, ready=ready)
+        target = self._target(
+            x, y, bounds, notch_range, displays, ready=ready, tolerance=EDGE_TOLERANCE
+        )
         # Whether the pointer is at an armed region at all, whatever the pressure: a slow push
         # drains to nothing between events and releases, but is still against the edge.
         self.touching = target is not None
@@ -398,20 +402,68 @@ class CrossingEngine:
             return 0
         return min(3, int(4 * pressure / self.resistance_px))
 
-    def _target(self, x, y, bounds, notch_range, displays=None, corner=True, ready=None):
+    def edge_under_pointer(
+        self, x, y, bounds, notch_range=None, displays=None, ready=None, tolerance=None
+    ):
+        """Bewaffnete Beamer-Kante unter dem Cursor, ohne Druck und ohne Drag-Sperre.
+        Liefert ``(mac_edge, peer)`` oder ``None``."""
+        hit = self._target(
+            x,
+            y,
+            bounds,
+            notch_range,
+            displays,
+            ready=ready,
+            tolerance=EDGE_TOLERANCE if tolerance is None else tolerance,
+        )
+        if hit is None:
+            return None
+        mac_edge, _region, _diagonal, _via, peer = hit
+        return mac_edge, peer
+
+    def jammed_transition(self, x, y, dx, dy, prev, ready=None, slop=0.75, push=2.0):
+        """Titelleisten-Drag: der Cursor bewegt sich in Schubrichtung nicht mehr (Fenster am Rand
+        bzw. an der Menüleiste fest), der Trackpad-Delta geht aber weiter nach aussen.
+        Liefert ``(mac_edge, peer)`` wenn diese Seite ein bewaffneter Beamer-Übergang ist."""
+        if prev is None:
+            return None
+        px, py = prev
+        candidates = []
+        if dx < -push and x >= px - slop:
+            candidates.append("left")
+        if dx > push and x <= px + slop:
+            candidates.append("right")
+        if dy < -push and y >= py - slop:
+            candidates.append("top")
+        if dy > push and y <= py + slop:
+            candidates.append("bottom")
+        for edge in candidates:
+            for way in self.ways:
+                if ready is not None and not ready(way.peer):
+                    continue
+                if way.edge == edge and way.methods & {"edge", "part"}:
+                    return edge, way.peer
+                if "notch" in way.methods and edge == "top":
+                    return edge, way.peer
+                if "corner" in way.methods and edge in way.corner.split("_"):
+                    return edge, way.peer
+        return None
+
+    def _target(self, x, y, bounds, notch_range, displays=None, corner=True, ready=None, tolerance=None):
         """Which armed region the pointer is touching, as (mac_edge, region, diagonal, method, peer).
         Every machine's corners are checked first, then edges, then thirds, then the notch (WIRE.md
         section 8): a corner wins over the edge it sits on, since its box is inside that edge's strip.
         `ready(peer)`, when given, leaves out the zones of machines that cannot take input now."""
+        tol = EDGE_TOLERANCE if tolerance is None else float(tolerance)
         ways = [way for way in self.ways if ready is None or ready(way.peer)]
         display_frames = {str(index): frame for index, frame in enumerate(displays or ())}
         left, top, right, bottom = bounds
         x_max, y_max = right - 1, bottom - 1
         at = {
-            "left": x <= left + EDGE_TOLERANCE,
-            "right": x >= x_max - EDGE_TOLERANCE,
-            "top": y <= top + EDGE_TOLERANCE,
-            "bottom": y >= y_max - EDGE_TOLERANCE,
+            "left": x <= left + tol,
+            "right": x >= x_max - tol,
+            "top": y <= top + tol,
+            "bottom": y >= y_max - tol,
         }
         own = next((d for d in displays or () if d[0] <= x < d[2] and d[1] <= y < d[3]), None)
         edge_box = {}
@@ -441,10 +493,10 @@ class CrossingEngine:
             if screen is not None:
                 sx, sy, sr, sb = screen
                 edge_at = (sx <= x < sr and sy <= y < sb and {
-                    "left": x <= sx + EDGE_TOLERANCE,
-                    "right": x >= sr - 1 - EDGE_TOLERANCE,
-                    "top": y <= sy + EDGE_TOLERANCE,
-                    "bottom": y >= sb - 1 - EDGE_TOLERANCE,
+                    "left": x <= sx + tol,
+                    "right": x >= sr - 1 - tol,
+                    "top": y <= sy + tol,
+                    "bottom": y >= sb - 1 - tol,
                 }[way.edge])
             if "edge" in way.methods and edge_at:
                 self._push_box = screen or edge_box[way.edge]
@@ -456,10 +508,10 @@ class CrossingEngine:
             if screen is not None:
                 sx, sy, sr, sb = screen
                 edge_at = (sx <= x < sr and sy <= y < sb and {
-                    "left": x <= sx + EDGE_TOLERANCE,
-                    "right": x >= sr - 1 - EDGE_TOLERANCE,
-                    "top": y <= sy + EDGE_TOLERANCE,
-                    "bottom": y >= sb - 1 - EDGE_TOLERANCE,
+                    "left": x <= sx + tol,
+                    "right": x >= sr - 1 - tol,
+                    "top": y <= sy + tol,
+                    "bottom": y >= sb - 1 - tol,
                 }[way.edge])
             if "part" in way.methods and edge_at:
                 # The thirds are the pointer's own display's, as the PC measures them: along the whole

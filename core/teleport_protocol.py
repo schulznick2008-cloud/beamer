@@ -45,6 +45,9 @@ def offer_msg(
     place_x: Optional[float] = None,
     place_y: Optional[float] = None,
     drag: bool = False,
+    title_bar: bool = False,
+    dark: bool = True,
+    lights: Optional[list] = None,
 ) -> dict:
     data = {
         "tid": tid,
@@ -64,6 +67,11 @@ def offer_msg(
         data["place_y"] = place_y
     if drag:
         data["drag"] = True
+    if title_bar:
+        data["title_bar"] = True
+    data["dark"] = bool(dark)
+    if lights:
+        data["lights"] = list(lights)
     return {"type": MSG_OFFER, "data": data}
 
 

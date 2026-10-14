@@ -1679,6 +1679,68 @@ class KVMController:
             x, y = location[0], location[1]
             dx = quartz.CGEventGetDoubleValueField(event, quartz.kCGMouseEventDeltaX)
             dy = quartz.CGEventGetDoubleValueField(event, quartz.kCGMouseEventDeltaY)
+            dragging = event_type != quartz.kCGEventMouseMoved
+            edge_drag = getattr(self, "edge_drag", None)
+            armed = False
+            if edge_drag is not None:
+                try:
+                    armed = bool(edge_drag.is_armed())
+                except Exception:
+                    armed = False
+            if armed:
+                # Titelleisten-Drag: nicht CrossingEngine.feed (block_while_dragging wuerde
+                # jeden Uebergang verwerfen). Teleport, wenn der Cursor am Beamer-Rand ist
+                # oder das Fenster dort feststeckt und weiter geschoben wird.
+                from core.teleport_bridge import try_queue_edge_drag_teleport
+
+                bounds = self._current_desktop_bounds()
+                displays = self._current_displays()
+                prev = getattr(self, "_teleport_drag_cursor", None)
+                self._teleport_drag_cursor = (x, y)
+                hit = self.crossing.edge_under_pointer(
+                    x,
+                    y,
+                    bounds,
+                    notch_range=self.notch_range,
+                    displays=displays,
+                    ready=self._crossing_ready,
+                    tolerance=crossing.DRAG_EDGE_TOLERANCE,
+                )
+                if hit is None:
+                    hit = self.crossing.jammed_transition(
+                        x, y, dx, dy, prev, ready=self._crossing_ready
+                    )
+                if abs(dx) > 1 or abs(dy) > 1 or hit is not None:
+                    self.logger.info(
+                        "Teleport-Kante: cursor=(%.0f,%.0f) d=(%+.1f,%+.1f) armed=1 hit=%s",
+                        x,
+                        y,
+                        dx,
+                        dy,
+                        hit,
+                    )
+                if hit is not None:
+                    mac_edge, peer = hit
+
+                    class _Hit:
+                        pass
+
+                    stub = _Hit()
+                    stub.peer = peer
+                    stub.edge = mac_edge
+                    peer = self._zone_peer(stub)
+                    self.logger.info(
+                        "Teleport-Kante: Übergang %s, Peer %s bei (%.0f,%.0f) — starte Teleport",
+                        mac_edge,
+                        peer,
+                        x,
+                        y,
+                    )
+                    try_queue_edge_drag_teleport(
+                        self, peer, crossing.OPPOSITE.get(mac_edge, mac_edge), x, y, True
+                    )
+                return event
+            self._teleport_drag_cursor = None
             step = self.crossing.feed(
                 x,
                 y,
@@ -1687,7 +1749,7 @@ class KVMController:
                 self._current_desktop_bounds(),
                 self.clock(),
                 notch_range=self.notch_range,
-                dragging=event_type != quartz.kCGEventMouseMoved,
+                dragging=dragging,
                 # Each display's own edges count where nothing lies beyond them, and Part of the
                 # edge measures its thirds along the pointer's display.
                 displays=self._current_displays(),

@@ -36,6 +36,21 @@ public enum TitleBarRules {
         guard windowFrame.contains(point) else { return false }
         return point.y - windowFrame.minY < fallbackHeight
     }
+
+    /// Echte `AXTitleBar` im Baum: ScreenCaptureKit nimmt die Leiste mit. Ohne sie (SwiftUI,
+    /// full-size content view) zeichnet der Windows-Proxy die Leiste selbst.
+    public static func hasVisibleTitleBar(childRoles: [String]) -> Bool {
+        childRoles.contains("AXTitleBar")
+    }
+
+    /// Ampel-Mittelpunkte in Fensterecken, Punkte. Leer, wenn eine Ampel fehlt.
+    public static func lightCenters(close: CGRect?, minimize: CGRect?, zoom: CGRect?, window: CGRect) -> [(Double, Double)] {
+        guard let c = close, let m = minimize, let z = zoom, window.width > 0, window.height > 0 else { return [] }
+        func p(_ r: CGRect) -> (Double, Double) {
+            (Double(r.midX - window.minX), Double(r.midY - window.minY))
+        }
+        return [p(c), p(m), p(z)]
+    }
 }
 
 /// Kern: Mausereignisse rein, `windows.drag_state`-Ereignisse raus. Kein Systemzugriff ausser ueber `probe`.

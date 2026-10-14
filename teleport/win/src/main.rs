@@ -4,19 +4,21 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use beamer_teleport_win::{app, decode, ipc, selftest, window};
+use beamer_teleport_win::{app, chrome, decode, ipc, selftest, window};
 
 const USAGE: &str = "\
-beamer-teleport.exe --ipc stdio [--same-clock] [--test-loss PCT | --test-netem SPEC] [--test-present-all]
+    beamer-teleport.exe --ipc stdio [--same-clock] [--test-loss PCT | --test-netem SPEC] [--test-present-all]
 beamer-teleport.exe --selftest-send <host> <port> [--tid N] [--fps N] [--size BxH] [--codec h264|hevc]
                     [--kbps N] [--secs S] [--encoder NAME] [--local-port N] [--mac-test-keys]
+beamer-teleport.exe --chrome-preview <ordner> [--width PT] [--scale S] [--title T]
 
 --ipc stdio        JSON Lines auf stdin/stdout (docs/teleport/SCHNITTSTELLEN.md), Log auf stderr.
 --same-clock       Sender teilt die Uhr (Selbsttest auf einem Rechner): stats enthaelt same_clock_latency_ms.
 --test-loss PCT    Nur Tests: kuenstlicher Paketverlust im Transport (Keyframe-Anforderung pruefen).
 --test-netem SPEC  Nur Tests: z. B. \"loss=1,delay=5,jitter=3,stall=40,stall_every=1500\" (WLAN-Aussetzer).
 --test-present-all Nur Tests: Jitter-Puffer aus, jedes Bild blockierend zeigen (Vergleichsmessung).
---selftest-send    Testbild mit festen Testschluesseln senden (nur fuer lokale Tests).";
+--selftest-send    Testbild mit festen Testschluesseln senden (nur fuer lokale Tests).
+--chrome-preview   Titelleisten (dunkel/hell, aktiv/inaktiv/Hover) als BMP zum 1:1-Vergleich mit macOS.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -59,6 +61,37 @@ fn main() {
             )
             .run()
         }
+        Some("--chrome-preview") => match args.get(1) {
+            Some(dir) => {
+                let rest = &args[2..];
+                let val = |flag: &str| {
+                    rest.iter()
+                        .position(|a| a == flag)
+                        .and_then(|i| rest.get(i + 1))
+                        .cloned()
+                };
+                let width: f64 = val("--width").and_then(|s| s.parse().ok()).unwrap_or(480.0);
+                let scale: f64 = val("--scale").and_then(|s| s.parse().ok()).unwrap_or(1.0);
+                let title = val("--title").unwrap_or_else(|| "Safari".into());
+                match chrome::write_previews(std::path::Path::new(dir), width, scale, &title) {
+                    Ok(names) => {
+                        eprintln!("beamer-teleport: {} Dateien in {dir}", names.len());
+                        for n in names {
+                            eprintln!("  {n}");
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("beamer-teleport: chrome-preview: {e}");
+                        1
+                    }
+                }
+            }
+            None => {
+                eprintln!("{USAGE}");
+                2
+            }
+        },
         Some("--selftest-send") => match selftest::parse_args(&args[1..]) {
             Ok(o) => match selftest::run(&o, Arc::new(AtomicBool::new(false))) {
                 Ok(r) => {
