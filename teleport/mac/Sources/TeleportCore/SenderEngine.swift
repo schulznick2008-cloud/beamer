@@ -11,6 +11,8 @@ final class StreamControl {
     /// Rahmen des Fensters vor dem Verschieben auf den virtuellen Monitor (Punkte, AX-Koordinaten).
     var restoreFrame: CGRect?
     var lastActivation = Date.distantPast
+    /// `send.stop` mit `restore:true`: das Fenster kommt unter den Mauszeiger zurueck, nicht an die alte Stelle.
+    var placeAtMouse = false
 
     init(windowID: UInt32?, pid: pid_t?, displayID: UInt32?, source: FrameSource) {
         self.windowID = windowID; self.pid = pid; self.displayID = displayID; self.source = source
@@ -46,6 +48,8 @@ public final class SenderEngine: TeleportBackend {
     public var displayFrameProvider: (UInt32) -> CGRect = { CGDisplayBounds($0) }
     public var ownerPIDProvider: (UInt32) -> pid_t? = { WindowGeometry.ownerPID(windowID: $0) }
     public let sleepGuard = SleepGuard()
+    /// Wohin ein zurueckkehrendes Fenster der Groesse `size` kommt (Titelleiste unter der Maus); `nil`: alte Stelle.
+    public var returnOriginProvider: (CGSize) -> CGPoint? = { ReturnPlacement.systemOrigin(size: $0) }
     /// Oberer Rand des virtuellen Monitors, den die Menueleiste belegt: das Fenster sitzt darunter (Punkte).
     public static let menuBarAllowance = 40
     private lazy var injector = Injector(sink: eventSink, layout: { [unowned self] in self.keyLayout }, repeatTiming: SystemKeyRepeat.timing)
@@ -381,6 +385,10 @@ public final class SenderEngine: TeleportBackend {
         let c = controls.removeValue(forKey: tid)
         lock.unlock()
         guard let c = c else { return }
+        // Zurueck unter den Mauszeiger (restore:true) oder an die alte Stelle.
+        func target(_ size: CGSize, old: CGPoint?) -> CGPoint? {
+            c.placeAtMouse ? (returnOriginProvider(size) ?? old) : old
+        }
         if let vd = c.virtual {
             if let wid = c.windowID { CrashRestore.unregister(windowID: wid) }
             ScreenCaptureSource.clearScaleHint(forDisplay: vd.displayID)
@@ -388,14 +396,21 @@ public final class SenderEngine: TeleportBackend {
             // existiert, kappt macOS die Fenstergroesse an seinem Rand.
             vd.destroy()
             if let wid = c.windowID, let pid = c.pid, let f = c.restoreFrame, windowFrameProvider(wid) != nil {
+                let origin = target(f.size, old: f.origin) ?? f.origin
                 for attempt in 0..<2 {
                     Thread.sleep(forTimeInterval: attempt == 0 ? 0.2 : 0.1)
                     _ = try? runBounded(timeout: 1.0, "Fenster zurueckschieben") {
-                        try self.windowController.setFrame(windowID: wid, pid: pid, origin: f.origin, size: f.size)
+                        try self.windowController.setFrame(windowID: wid, pid: pid, origin: origin, size: f.size)
                     }
                     if let now = windowFrameProvider(wid), abs(now.width - f.width) <= 2, abs(now.height - f.height) <= 2,
-                       abs(now.minX - f.minX) <= 2, abs(now.minY - f.minY) <= 2 { break }
+                       abs(now.minX - origin.x) <= 2, abs(now.minY - origin.y) <= 2 { break }
                 }
+            }
+        } else if c.placeAtMouse, let wid = c.windowID, let pid = c.pid, let now = windowFrameProvider(wid),
+                  let origin = returnOriginProvider(now.size) {
+            // Fenster-Rueckfall mit restore:true: nur die Position, die Groesse bleibt.
+            _ = try? runBounded(timeout: 1.0, "Fenster zurueckschieben") {
+                try self.windowController.setFrame(windowID: wid, pid: pid, origin: origin, size: nil)
             }
         }
         injector.releaseAll(at: nil)
@@ -437,6 +452,7 @@ public final class SenderEngine: TeleportBackend {
             if wasEnded { return } // schon per send.gone beendet
             throw IPCError(.notFound, "tid \(tid) unbekannt")
         }
+        if restore { control(tid)?.placeAtMouse = true }
         dropPipeline(tid)
     }
 

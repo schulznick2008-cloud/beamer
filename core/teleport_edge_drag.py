@@ -5,7 +5,7 @@ import logging
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 
 @dataclass
@@ -31,8 +31,7 @@ class EdgeDragController:
         self._dragging = False
         self._title_bar = False
         self._wid: Optional[int] = None
-        self._cursor_x: float = 0.0
-        self._cursor_y: float = 0.0
+        self._cursor: Optional[Tuple[float, float]] = None
         self._pending: "queue.SimpleQueue[Optional[tuple]]" = queue.SimpleQueue()
         self._worker = threading.Thread(target=self._run, name="teleport-edge-drag", daemon=True)
         self._worker.start()
@@ -44,18 +43,18 @@ class EdgeDragController:
             self._title_bar = bool(ev.get("title_bar"))
             wid = ev.get("wid")
             self._wid = int(wid) if wid is not None else None
-            if "x" in ev:
-                try:
-                    self._cursor_x = float(ev["x"])
-                except (TypeError, ValueError):
-                    pass
-            if "y" in ev:
-                try:
-                    self._cursor_y = float(ev["y"])
-                except (TypeError, ValueError):
-                    pass
             if not (self._dragging and self._title_bar and self._wid):
                 self._wid = None
+            x, y = ev.get("x"), ev.get("y")
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                self._cursor = (float(x), float(y))
+            if not self._dragging:
+                self._cursor = None
+
+    def cursor(self) -> Optional[Tuple[float, float]]:
+        """Letzte vom Helfer gemeldete Cursorposition (x, y) während eines Titelleisten-Zugs."""
+        with self._lock:
+            return self._cursor
 
     def is_armed(self) -> bool:
         with self._lock:
@@ -76,8 +75,10 @@ class EdgeDragController:
             return False
         with self._lock:
             wid = self._wid
-            cx = self._cursor_x if self._dragging else cursor_x
-            cy = self._cursor_y if self._dragging else cursor_y
+            if self._cursor is not None:
+                cx, cy = self._cursor
+            else:
+                cx, cy = cursor_x, cursor_y
         if wid is None:
             return False
         self._pending.put((peer_id, edge, cx, cy, wid))
