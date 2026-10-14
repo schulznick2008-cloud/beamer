@@ -388,7 +388,6 @@ impl App {
             Some(hwnd) => {
                 unsafe {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetFocus(Some(hwnd));
                 }
                 Ok(json!({}))
             }

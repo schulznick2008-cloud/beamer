@@ -433,7 +433,6 @@ impl ProxyWindow {
     pub fn focus(&self) {
         unsafe {
             let _ = SetForegroundWindow(self.hwnd);
-            let _ = SetFocus(Some(self.hwnd));
         }
     }
 

@@ -145,7 +145,7 @@ public final class SenderEngine: TeleportBackend {
             throw IPCError(.badRequest, "virtual_display gilt nur fuer mode window")
         }
         // Fenster-Daten und (bei `virtual_display`) der virtuelle Monitor.
-        var captureMode = p.mode
+        let captureMode = p.mode
         var windowID: UInt32?
         var pid: pid_t?
         var displayID: UInt32?
