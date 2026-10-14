@@ -510,11 +510,12 @@ class Hooks:
     reads cached geometry and must stay bounded like the other hook callbacks.
     """
 
-    def __init__(self, on_key, on_mouse, on_motion, on_seam=None) -> None:
+    def __init__(self, on_key, on_mouse, on_motion, on_seam=None, on_injected_pointer=None) -> None:
         self._on_key = on_key
         self._on_mouse = on_mouse
         self._on_motion = on_motion
         self._on_seam = on_seam
+        self._on_injected_pointer = on_injected_pointer
         self._window = None
         self._thread: Optional[threading.Thread] = None
         self._thread_id: Optional[int] = None
@@ -631,6 +632,8 @@ class Hooks:
         try:
             data = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             if data.flags & LLKHF_INJECTED and data.dwExtraInfo == INJECTED_MARK:
+                if self._on_injected_pointer is not None:
+                    self._on_injected_pointer()
                 return user32.CallNextHookEx(None, code, wparam, lparam)
             down = wparam in KEY_DOWN_MESSAGES
             if not down and wparam not in KEY_UP_MESSAGES:
@@ -682,6 +685,8 @@ class Hooks:
             if data.flags & LLMHF_INJECTED and (
                 wparam == WM_MOUSEMOVE or data.dwExtraInfo == INJECTED_MARK
             ):
+                if self._on_injected_pointer is not None:
+                    self._on_injected_pointer(data.pt.x, data.pt.y)
                 return user32.CallNextHookEx(None, code, wparam, lparam)
             if wparam == WM_MOUSEMOVE and self._on_seam is not None:
                 position = self._on_seam(data.pt.x, data.pt.y)

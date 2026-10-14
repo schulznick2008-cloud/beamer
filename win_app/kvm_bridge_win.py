@@ -653,10 +653,27 @@ class WindowsApplication(QWidget):
         self.sender.on_alert = self.bridge.alert.emit
         self.bridge.alert.connect(self._on_alert)
         hook_callbacks = (self._on_hook_key, self._on_hook_mouse, self.sender.on_motion)
+
+        def on_injected_pointer(x=None, y=None):
+            teleport = getattr(self.sender, "teleport", None)
+            if teleport is None:
+                return
+            if x is None or y is None:
+                pt = capture_win.POINT()
+                if capture_win.user32 and capture_win.user32.GetCursorPos(ctypes.byref(pt)):
+                    x, y = pt.x, pt.y
+                else:
+                    return
+            teleport.focus_proxy_at_screen_px(int(x), int(y))
+
         if sys.platform.startswith("win"):
-            self.hooks = capture_win.Hooks(*hook_callbacks, on_seam=self.sender.seam_clip_position)
+            self.hooks = capture_win.Hooks(
+                *hook_callbacks,
+                on_seam=self.sender.seam_clip_position,
+                on_injected_pointer=on_injected_pointer,
+            )
         else:
-            self.hooks = capture_win.Hooks(*hook_callbacks)
+            self.hooks = capture_win.Hooks(*hook_callbacks, on_injected_pointer=on_injected_pointer)
         if self.permission_state is not None and hasattr(self.hooks, "on_permission"):
             self.hooks.on_permission = lambda status, detail="", retryable=False: self.permission_state.report(
                 "capture", status, detail, retryable,
@@ -4118,6 +4135,9 @@ class WindowsApplication(QWidget):
     def _on_hook_mouse(self, message: int, x: int, y: int, mouse_data: int) -> bool:
         """Every mouse message, on the hook thread: what Windows said becomes the sender's neutral
         call. True when the event belongs to a peer and Windows must not see it."""
+        teleport = getattr(self.sender, "teleport", None)
+        if teleport is not None and teleport.proxy_swallow_input:
+            return False
         event = capture_win.mouse_event(message, mouse_data)
         if event is None:
             return False

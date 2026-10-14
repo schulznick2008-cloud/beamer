@@ -429,6 +429,25 @@ pub fn create(
 }
 
 impl ProxyWindow {
+    /// Fokus fuer KVM-injizierte Eingabe (SendInput mit INJECTED_MARK erreicht nur das Vordergrundfenster).
+    pub fn focus(&self) {
+        unsafe {
+            let _ = SetForegroundWindow(self.hwnd);
+            let _ = SetFocus(Some(self.hwnd));
+        }
+    }
+
+    /// Liegt der Bildschirmpunkt in diesem Fenster (inkl. Rahmen)?
+    pub fn contains_screen_point(&self, x: i32, y: i32) -> bool {
+        let mut r = RECT::default();
+        unsafe {
+            if GetWindowRect(self.hwnd, &mut r).is_err() {
+                return false;
+            }
+        }
+        x >= r.left && x < r.right && y >= r.top && y < r.bottom
+    }
+
     pub fn set_title(&self, title: &str) {
         unsafe {
             let _ = SetWindowTextW(self.hwnd, &HSTRING::from(title));

@@ -119,6 +119,7 @@ class TeleportService:
         # Letzter teleport-fähiger Windows-Peer (für Hotkey kurz nach Reconnect).
         self._last_win_peer: Optional[Tuple[str, bool]] = None
         self._hotkey_peer_wait_s = float(os.environ.get("BEAMER_TELEPORT_PEER_WAIT", "1.5"))
+        self._proxy_focus_last = 0.0
 
     @property
     def proxy_swallow_input(self) -> bool:
@@ -724,8 +725,26 @@ class TeleportService:
                     pass
 
     def _prefer_virtual_display(self) -> bool:
-        """Standard: Fenster-Capture (nur Inhalt). ``BEAMER_TELEPORT_VIRTUAL_DISPLAY=1`` für virtuellen Monitor."""
-        return os.environ.get("BEAMER_TELEPORT_VIRTUAL_DISPLAY", "0") == "1"
+        """Standard (Vertrag v1.5): virtueller Monitor, Fenster auf dem Mac ausblenden. Nur Fenster-Capture.
+        ``BEAMER_TELEPORT_VIRTUAL_DISPLAY=0`` erzwingt den Fenster-Rückfall ohne Ausblendung."""
+        return os.environ.get("BEAMER_TELEPORT_VIRTUAL_DISPLAY", "1") != "0"
+
+    def focus_proxy_at_screen_px(self, x: int, y: int) -> None:
+        """Windows: KVM-injizierte Eingabe landet im Vordergrundfenster — Proxy fokussieren, wenn der
+        Cursor darueber liegt."""
+        if self.platform != "windows":
+            return
+        with self._lock:
+            if not any(t.role == "receiver" for t in self._active.values()):
+                return
+        now = time.monotonic()
+        if now - self._proxy_focus_last < 0.25:
+            return
+        self._proxy_focus_last = now
+        try:
+            self._ensure_helper().request("recv.focus", x=int(x), y=int(y))
+        except TeleportIPCError:
+            pass
 
     def _send_start_window(
         self,

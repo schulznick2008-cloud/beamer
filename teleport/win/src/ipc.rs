@@ -125,6 +125,12 @@ pub enum Cmd {
     RecvClose {
         tid: u32,
     },
+    /// Proxy in den Vordergrund (optional `tid`; sonst Fenster unter `x`/`y` in Bildschirm-Pixeln).
+    RecvFocus {
+        tid: Option<u32>,
+        x: Option<i32>,
+        y: Option<i32>,
+    },
     /// §2.1 (Kanten-Drag): Proxy so legen, dass die Titelleiste unter (x, y) liegt (Bildschirm-Punkte);
     /// mit `dragging` folgt das Fenster danach der Maus, bis die linke Taste los ist.
     RecvPlace {
@@ -319,6 +325,18 @@ pub fn parse_line(line: &str) -> Result<Request, ParseError> {
         "recv.close" => Cmd::RecvClose {
             tid: get_tid(o, id)?,
         },
+        "recv.focus" => {
+            let coord = |k: &str| {
+                o.get(k)
+                    .and_then(Value::as_i64)
+                    .and_then(|v| i32::try_from(v).ok())
+            };
+            Cmd::RecvFocus {
+                tid: o.get("tid").and_then(|v| v.as_u64()).map(|u| u as u32),
+                x: coord("x"),
+                y: coord("y"),
+            }
+        }
         "recv.place" => {
             let coord = |k: &str| {
                 o.get(k)

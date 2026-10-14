@@ -40,6 +40,8 @@ final class FakeWindowController: WindowController {
     func setFrame(windowID: UInt32, pid: pid_t, origin: CGPoint?, size: CGSize?) throws {
         if let e = failSetFrame { throw e }
         log("setFrame \(origin.map { "\($0.x),\($0.y)" } ?? "-") \(size.map { "\($0.width)x\($0.height)" } ?? "-")")
+        if let o = origin { frame.origin = o }
+        if let s = size { frame.size = s }
         onSetFrame?(origin, size)
     }
     func isFrontmost(windowID: UInt32, pid: pid_t) -> Bool { frontmost }
@@ -91,7 +93,7 @@ final class EngineInputTests: XCTestCase {
         engine.windowController = ctl
         engine.keyLayout = USKeyLayout()
         engine.accessibilityCheck = {}
-        engine.windowFrameProvider = { _ in CGRect(x: 100, y: 50, width: 1200, height: 800) }
+        engine.windowFrameProvider = { _ in ctl.frame }
         engine.ownerPIDProvider = { _ in 4242 }
         engine.returnOriginProvider = { _ in nil } // Standard in Tests: alte Stelle
         engine.makeSource = { _, _ in source }
@@ -246,7 +248,7 @@ final class EngineInputTests: XCTestCase {
         r.engine.makeSource = { mode, _ in madeModes.append(mode); return r.source }
         let info = try r.engine.sendStart(params(virtual: true))
         let vd = try XCTUnwrap(r.vd())
-        XCTAssertEqual(madeModes, [.display(77)], "der ganze virtuelle Monitor wird aufgenommen")
+        XCTAssertEqual(madeModes, [.window(5)], "Fenster-Capture trotz virtuellem Monitor")
         XCTAssertEqual(vd.widthPoints, 1200)
         XCTAssertEqual(vd.heightPoints, 800 + SenderEngine.menuBarAllowance)
         XCTAssertEqual(info.width, 2400)
@@ -254,9 +256,9 @@ final class EngineInputTests: XCTestCase {
         XCTAssertEqual(r.ctl.snapshot.filter { $0.hasPrefix("setFrame") }, ["setFrame -1200.0,40.0 1200.0x800.0"])
         XCTAssertTrue(r.engine.sleepGuard.isHeld)
 
-        // Eingabe: ganze Monitorflaeche, Ursprung ist der des Monitors (negativ).
+        // Eingabe: Stream-Koordinaten auf das Fenster (nicht die ganze Monitorflaeche).
         try r.engine.inject(tid: 1, input: .move(x: 1200, y: 840))
-        XCTAssertEqual(r.sink.events.last, .mouse(.moved, CGPoint(x: -1200 + 600, y: 420), nil, 0, 0))
+        XCTAssertEqual(r.sink.events.last, .mouse(.moved, CGPoint(x: -600, y: 440), nil, 0, 0))
 
         try r.engine.sendStop(tid: 1, restore: true)
         XCTAssertTrue(vd.destroyed, "der virtuelle Monitor ist weg")
