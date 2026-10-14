@@ -236,4 +236,23 @@ def attach_win_sender(sender, identity_fn: Callable[[], dict], server=None) -> T
             )
 
     sender.on_link = on_link
+    service.set_return_edge_probe(lambda peer_id, x, y: win_at_return_edge(sender, peer_id, x, y))
     return service
+
+
+def win_at_return_edge(sender, peer_id: str, x: float, y: float) -> bool:
+    """Liegt der Punkt (physische Pixel) an der Kante, über die dieser PC zu ``peer_id`` wechselt?
+    Nutzt dieselben Kantenmodelle wie Beamers eigener Wechsel (``sender._models``), nur ohne Druck: der
+    Proxy ist an die Wand gezogen, das genügt."""
+    try:
+        monitors = sender._cached_monitors()
+        display_map = sender._cached_display_map()
+        point = (int(round(x)), int(round(y)))
+        for peer, model in list(getattr(sender, "_models", [])):
+            if protocol.id_text(peer) != peer_id:
+                continue
+            if model._at_edge(monitors, point, display_map):
+                return True
+    except Exception:
+        log.exception("Kantenprüfung fehlgeschlagen")
+    return False

@@ -57,6 +57,10 @@ case "--ipc":
         signalSources.append(src)
     }
     CrashRestore.install()
+    // Nach einem Neustart: was das System noch als gedrueckt fuehrt (Tasten, Modifier, Maustasten), loslassen (C04c).
+    StuckInput.releaseAtStartup()
+    // Titelleisten-Zug melden (windows.drag_state, §2.1): passiver Maus-Beobachter auf eigenem Thread.
+    DragMonitor(emit: { writer.write(JSONLine.encode($0)) }).start()
     IPCServer(engine: engine, writer: writer).run()
     exit(0)
 

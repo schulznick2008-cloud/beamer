@@ -93,6 +93,7 @@ final class EngineInputTests: XCTestCase {
         engine.accessibilityCheck = {}
         engine.windowFrameProvider = { _ in CGRect(x: 100, y: 50, width: 1200, height: 800) }
         engine.ownerPIDProvider = { _ in 4242 }
+        engine.returnOriginProvider = { _ in nil } // Standard in Tests: alte Stelle
         engine.makeSource = { _, _ in source }
         engine.virtualDisplayFactory = { w, h in
             let v = FakeVirtualDisplay(w: w, h: h)
@@ -399,5 +400,37 @@ final class RealVirtualDisplayTests: XCTestCase {
     func testAbsurdSizesAreRefused() {
         XCTAssertThrowsError(try SystemVirtualDisplay.make(widthPoints: 10, heightPoints: 10))
         XCTAssertThrowsError(try SystemVirtualDisplay.make(widthPoints: 100_000, heightPoints: 100_000))
+    }
+
+}
+
+extension EngineInputTests {
+    // MARK: Zurueck unter die Maus (C04d)
+
+    func testRestoreTrueInWindowModePlacesTheTitleBarUnderTheMouseKeepingTheSize() throws {
+        let r = try rig()
+        r.engine.returnOriginProvider = { size in CGPoint(x: 700 - size.width / 2, y: 300) }
+        _ = try r.engine.sendStart(params())
+        try r.engine.sendStop(tid: 1, restore: true)
+        XCTAssertTrue(r.ctl.snapshot.contains("setFrame 100.0,300.0 -"), "\(r.ctl.snapshot)")
+    }
+
+    func testRestoreFalseInWindowModeMovesNothing() throws {
+        let r = try rig()
+        r.engine.returnOriginProvider = { _ in CGPoint(x: 1, y: 2) }
+        _ = try r.engine.sendStart(params())
+        try r.engine.sendStop(tid: 1, restore: false)
+        XCTAssertFalse(r.ctl.snapshot.contains { $0.hasPrefix("setFrame") })
+    }
+
+    func testRestoreTrueInVirtualModeGoesUnderTheMouseRestoreFalseToTheOldPlace() throws {
+        for (restore, want) in [(true, "setFrame 450.0,300.0 1200.0x800.0"), (false, "setFrame 100.0,50.0 1200.0x800.0")] {
+            let r = try rig()
+            r.engine.returnOriginProvider = { _ in CGPoint(x: 450, y: 300) }
+            _ = try r.engine.sendStart(params(virtual: true))
+            r.ctl.onSetFrame = nil
+            try r.engine.sendStop(tid: 1, restore: restore)
+            XCTAssertTrue(r.ctl.snapshot.contains(want), "restore \(restore): \(r.ctl.snapshot)")
+        }
     }
 }

@@ -172,7 +172,37 @@ def _handle(
         tid = msg.get("tid", 1)
         _write({"v": V, "re": req_id, "ok": True})
         _emit_stats(tid, platform, role="recv")
+    elif cmd == "recv.place":
+        _write({"v": V, "re": req_id, "ok": True, "placed": True})
+    elif cmd == "emit.proxy_drag":
+        tid = msg.get("tid", 1)
+        _write(
+            {
+                "v": V,
+                "ev": "proxy.drag",
+                "tid": tid,
+                "x": msg.get("x", 0),
+                "y": msg.get("y", 0),
+                "dragging": bool(msg.get("dragging", True)),
+            }
+        )
+        _write({"v": V, "re": req_id, "ok": True})
+    elif cmd == "emit.drag_state":
+        _write(
+            {
+                "v": V,
+                "ev": "windows.drag_state",
+                "dragging": bool(msg.get("dragging", True)),
+                "title_bar": bool(msg.get("title_bar", True)),
+                "wid": msg.get("wid", 1),
+                "x": msg.get("x", 0),
+                "y": msg.get("y", 0),
+            }
+        )
+        _write({"v": V, "re": req_id, "ok": True})
     elif cmd == "recv.close":
+        _write({"v": V, "re": req_id, "ok": True})
+    elif cmd == "recv.place":
         _write({"v": V, "re": req_id, "ok": True})
     elif cmd == "send.stop":
         _write({"v": V, "re": req_id, "ok": True})

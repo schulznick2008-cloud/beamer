@@ -28,11 +28,12 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetKeyState, GetKeyboardLayout, ReleaseCapture, SetCapture, ToUnicodeEx,
-    VK_CAPITAL,
+    GetAsyncKeyState, GetDoubleClickTime, GetKeyState, GetKeyboardLayout, ReleaseCapture,
+    SetCapture, ToUnicodeEx, VK_CAPITAL, VK_LBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::drag::{self, Follow, Throttle};
 use crate::input::{self, Button, Debounce, DebounceOut, InputState};
 use crate::ipc::{self, Out};
 
@@ -62,6 +63,9 @@ struct Windowed {
 }
 
 const RESIZE_TIMER: usize = 1;
+/// Kanten-Drag: der Maus folgen (`recv.place` mit `dragging`).
+const FOLLOW_TIMER: usize = 2;
+const FOLLOW_TICK_MS: u32 = 8;
 /// `proxy.resize` hoechstens 10/s.
 const RESIZE_EVERY: Duration = Duration::from_millis(100);
 const VK_F: u32 = 0x46;
@@ -85,6 +89,11 @@ pub struct Shared {
     windowed: Mutex<Option<Windowed>>,
     /// Zuletzt gemeldeter Fokus (WM_ACTIVATE kommt auch ohne Wechsel, gemeldet wird nur der Wechsel).
     focused: AtomicBool,
+    /// Kanten-Drag: Fenster folgt der Maus, bis die linke Taste los ist.
+    follow: Mutex<Option<Follow>>,
+    /// Nutzer zieht das Fenster an der Titelleiste (modale Verschiebe-Schleife).
+    moving: AtomicBool,
+    drag_throttle: Mutex<Throttle>,
 }
 
 impl Shared {
@@ -321,6 +330,9 @@ pub fn create(
             programmatic: AtomicBool::new(true),
             windowed: Mutex::new(None),
             focused: AtomicBool::new(false),
+            follow: Mutex::new(None),
+            moving: AtomicBool::new(false),
+            drag_throttle: Mutex::new(Throttle::new(drag::DRAG_EVERY)),
         });
         let raw = Arc::into_raw(shared.clone());
         let hinst = GetModuleHandleW(None)?;
@@ -425,11 +437,142 @@ impl ProxyWindow {
         set_fullscreen(self.hwnd, on, None);
     }
 
+    /// `recv.place` (§2.1): Titelleiste unter (x, y) Bildschirm-Punkte legen, auf die Arbeitsflaeche geklemmt.
+    /// Mit `dragging` folgt das Fenster danach der echten Maus, bis die linke Taste los ist, und meldet
+    /// `proxy.drag` (<= 30/s, am Ende `dragging: false`). Im Vollbild bleibt das Fenster, wo es ist.
+    pub fn place(&self, x: f64, y: f64, dragging: bool) {
+        if self.is_fullscreen() {
+            eprintln!(
+                "beamer-teleport: tid {} recv.place im Vollbild ignoriert",
+                self.shared.tid
+            );
+            return;
+        }
+        let hwnd = self.hwnd;
+        unsafe {
+            let mons = monitors();
+            let px = drag::points_to_px((x, y), &mons);
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let outer = (wr.right - wr.left, wr.bottom - wr.top);
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            let grab = drag::title_grab(outer.0, -frame_rect(0, 0, dpi).top);
+            let mon = MonitorFromPoint(POINT { x: px.0, y: px.1 }, MONITOR_DEFAULTTONEAREST);
+            let w = work_area(mon);
+            let (left, top) =
+                drag::place_origin(px, outer, grab, (w.left, w.top, w.right, w.bottom));
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                left,
+                top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            if dragging {
+                *self.shared.follow.lock().unwrap() = Some(Follow::new(grab, Instant::now()));
+                SetTimer(Some(hwnd), FOLLOW_TIMER, FOLLOW_TICK_MS, None);
+                emit_drag(&self.shared, cursor_px(), true, true);
+            }
+        }
+    }
+
     pub fn destroy(&self) {
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
     }
+}
+
+/// Alle Monitore mit Rechteck (physische Pixel) und DPI.
+fn monitors() -> Vec<drag::Mon> {
+    all_monitors()
+        .into_iter()
+        .map(|m| {
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            unsafe {
+                let _ = GetMonitorInfoW(m, &mut mi);
+            }
+            let r = mi.rcMonitor;
+            drag::Mon {
+                rect: (r.left, r.top, r.right, r.bottom),
+                dpi: monitor_dpi(m),
+            }
+        })
+        .collect()
+}
+
+fn cursor_px() -> (i32, i32) {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    (pt.x, pt.y)
+}
+
+/// Linke (primaere) Maustaste unten, auch bei vertauschten Tasten.
+fn primary_button_down() -> bool {
+    unsafe {
+        let vk = if GetSystemMetrics(SM_SWAPBUTTON) != 0 {
+            VK_RBUTTON
+        } else {
+            VK_LBUTTON
+        };
+        GetAsyncKeyState(vk.0 as i32) < 0
+    }
+}
+
+/// `proxy.drag` (§2.1): `x`/`y` in Bildschirm-Punkten, dazu `px_x`/`px_y` (physische Pixel des
+/// virtuellen Desktops, Zusatzfelder) fuer Pythons Kantenpruefung. `force`: ohne Drosselung (Ende des Zugs).
+fn emit_drag(s: &Shared, px: (i32, i32), dragging: bool, force: bool) {
+    if !force && !s.drag_throttle.lock().unwrap().ready(Instant::now()) {
+        return;
+    }
+    let (x, y) = drag::px_to_points(px, &monitors());
+    s.out.send(&ipc::event(
+        "proxy.drag",
+        json!({"tid": s.tid, "x": x, "y": y, "dragging": dragging, "px_x": px.0, "px_y": px.1}),
+    ));
+}
+
+/// Ein Schritt der Mausfolge (Timer).
+fn follow_tick(hwnd: HWND, s: &Shared) {
+    let cur = cursor_px();
+    let down = primary_button_down();
+    let step = s
+        .follow
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map(|f| f.tick(cur, down, Instant::now()));
+    let Some(((left, top), ended)) = step else {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), FOLLOW_TIMER);
+        }
+        return;
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            left,
+            top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        if ended {
+            let _ = KillTimer(Some(hwnd), FOLLOW_TIMER);
+        }
+    }
+    if ended {
+        *s.follow.lock().unwrap() = None;
+    }
+    emit_drag(s, cur, !ended, ended);
 }
 
 /// Randloses Vollbild an/aus. `mon`: Zielmonitor (sonst der des Fensters).
@@ -791,9 +934,29 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 LRESULT(0)
             }
+            WM_MOVING => {
+                // Nutzer zieht an der Titelleiste: Position fuer Pythons Rueckweg-Kante melden.
+                if let Some(s) = shared_of(hwnd) {
+                    s.moving.store(true, Ordering::Release);
+                    emit_drag(s, cursor_px(), true, false);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_EXITSIZEMOVE => {
                 if let Some(s) = shared_of(hwnd) {
                     offer_resize(hwnd, s, true);
+                    if s.moving.swap(false, Ordering::AcqRel) {
+                        emit_drag(s, cursor_px(), false, true);
+                    }
+                    // Waehrend der modalen Schleife verwirft Windows Thread-Nachrichten: wartende
+                    // IPC-Befehle jetzt abarbeiten lassen.
+                    let _ = PostThreadMessageW(s.main_thread, WM_APP_CMD, WPARAM(0), LPARAM(0));
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == FOLLOW_TIMER => {
+                if let Some(s) = shared_of(hwnd) {
+                    follow_tick(hwnd, s);
                 }
                 LRESULT(0)
             }

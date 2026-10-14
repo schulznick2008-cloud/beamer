@@ -165,7 +165,7 @@ public final class AXWindowController: WindowController {
     public init() {}
 
     @_silgen_name("_AXUIElementGetWindow")
-    private static func _axGetWindow(_ element: AXUIElement, _ out: UnsafeMutablePointer<CGWindowID>) -> AXError
+    static func _axGetWindow(_ element: AXUIElement, _ out: UnsafeMutablePointer<CGWindowID>) -> AXError
 
     // Das AX-Element eines Fensters bleibt gueltig, solange das Fenster lebt: einmal suchen (Fensterliste der App
     // durchgehen kostet je nach App 10-40 ms), danach merken. Ein Fehler beim Setzen wirft den Eintrag weg.
