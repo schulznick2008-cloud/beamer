@@ -10,6 +10,15 @@ use serde_json::{json, Value};
 use crate::gpu::letterbox;
 use crate::keytable_gen::VK_NAMES;
 
+/// Hoehe der gestreamten macOS-Titelleiste in Stream-Pixeln (≈ `TitleBarRules.fallbackHeight` auf dem Mac).
+pub const STREAM_TITLE_BAR_PX: f64 = 28.0;
+
+/// Liegt der Client-Punkt in der oberen Titelleiste des gestreamten Fensterbildes (nicht Letterbox-Rand)?
+pub fn in_stream_title_bar(x: f64, y: f64, client: (u32, u32), stream: (u32, u32)) -> bool {
+    let (sx, sy) = to_stream(x, y, client, stream);
+    sx >= 0.0 && sy >= 0.0 && sy < STREAM_TITLE_BAR_PX && sx <= stream.0 as f64
+}
+
 /// Client-Pixel -> Stream-Pixel. Das Bild liegt mit gleichem Seitenverhaeltnis mittig im Client
 /// (Letterbox, siehe gpu.rs); ohne Rand ist das genau `x * Streambreite / Clientbreite`.
 /// Punkte ausserhalb des Bildes ergeben Koordinaten ausserhalb von 0..Stream (der Sender verwirft sie).
@@ -363,6 +372,16 @@ mod tests {
             to_stream(100.5, 10.0, (1920, 1080), (1920, 1080)),
             (100.5, 10.0)
         );
+    }
+
+    #[test]
+    fn stream_title_bar_band() {
+        let client = (800, 600);
+        let stream = (1600, 1200);
+        assert!(in_stream_title_bar(400.0, 5.0, client, stream));
+        assert!(!in_stream_title_bar(400.0, 80.0, client, stream));
+        // Letterbox-Rand oben: kein Titel (sy < 0).
+        assert!(!in_stream_title_bar(500.0, 10.0, (1000, 1000), (1920, 1080)));
     }
 
     #[test]
