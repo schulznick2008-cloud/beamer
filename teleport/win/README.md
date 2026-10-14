@@ -152,6 +152,24 @@ per `PostMessage`, keine echten Eingaben). Von Hand: Selbsttest-Sender und Helfe
 starten; im Fenster klicken, tippen, scrollen, ziehen – die `proxy.input`-Zeilen erscheinen auf stdout des
 Helfers. Strg+Alt+Shift+F im Fenster schaltet das Vollbild um.
 
+## Kanten-Drag (05b, §2.1)
+
+- **`recv.place`** (`tid`, `x`, `y` in Bildschirm-Punkten, `dragging`): legt den Proxy so, dass die Mitte der
+  Titelleiste unter (x, y) liegt, auf die Arbeitsfläche des Monitors geklemmt. Punkte gelten je Monitor
+  (Pixel = Punkte × DPI/96; bei 100 % identisch, links vom Hauptmonitor negativ). Mit `dragging: true` folgt
+  das Fenster danach der echten Maus (Timer, 8 ms), bis die linke (primäre) Taste los ist; ist sie beim Start
+  nicht unten, endet das Folgen nach 1 s. Im Vollbild wird nicht verschoben.
+- **`proxy.drag`** (`tid`, `x`, `y` in Punkten, `dragging`, dazu `px_x`/`px_y` in physischen Pixeln als
+  Zusatzfelder): während des Folgens und während der Nutzer den Proxy an der Titelleiste zieht, höchstens
+  30/s; am Ende genau einmal `dragging: false`.
+- Python (`core/teleport_service.py`): nach `recv.open` mit `drag` und Position → `recv.place … dragging:true`.
+  `proxy.drag` an der Übergangskante zum Mac (Beamers Kantenmodelle, `core/teleport_bridge.py`
+  `win_at_return_edge`) → `tp_close` `return`, der Mac holt das Fenster an der Maus zurück.
+- Titelleiste: `WM_NCHITTEST` liefert dort `HTCAPTION` (Inhalt `HTCLIENT`), Ziehen startet die normale
+  Windows-Verschiebung. Nach ihr (`WM_EXITSIZEMOVE`) arbeitet der Helfer wartende IPC-Befehle ab: in der
+  modalen Schleife verwirft Windows Thread-Nachrichten (auch ein stdin-Ende wird dann nachgeholt).
+- Eingabe bleibt nativ (C05, Fenster-Nachrichten); Beamers Hook verschluckt nichts für den Proxy.
+
 ## Abnahmetest ohne Mac
 
 ```powershell

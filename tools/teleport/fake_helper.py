@@ -202,6 +202,8 @@ def _handle(
         _write({"v": V, "re": req_id, "ok": True})
     elif cmd == "recv.close":
         _write({"v": V, "re": req_id, "ok": True})
+    elif cmd == "recv.place":
+        _write({"v": V, "re": req_id, "ok": True})
     elif cmd == "send.stop":
         _write({"v": V, "re": req_id, "ok": True})
     elif cmd == "shutdown":

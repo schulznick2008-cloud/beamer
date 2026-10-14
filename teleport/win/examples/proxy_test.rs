@@ -516,6 +516,111 @@ fn main() {
         &mut fails,
     );
 
+    // --- Kanten-Drag §2.1: recv.place, Hit-Test, Folgen der Maus, proxy.drag
+    let wrect = |h: HWND| {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(h, &mut r);
+        }
+        r
+    };
+    let (mut work, mon_dpi) = (RECT::default(), unsafe {
+        windows::Win32::UI::HiDpi::GetDpiForWindow(hw)
+    });
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = GetMonitorInfoW(MonitorFromWindow(hw, MONITOR_DEFAULTTONEAREST), &mut mi);
+    }
+    work.clone_from(&mi.rcWork);
+    let s = mon_dpi as f64 / 96.0;
+    let pt = |px: i32| px as f64 / s;
+    // Titelmitte unter einen Punkt mitten auf der Arbeitsflaeche.
+    let (cx, cy) = ((work.left + work.right) / 2, work.top + 200);
+    let r = h.cmd(json!({"cmd":"recv.place","tid":1,"x":pt(cx),"y":pt(cy),"dragging":false}));
+    let wr = wrect(hw);
+    let title_mid = ((wr.left + wr.right) / 2, wr.top);
+    println!(
+        "  recv.place ({cx},{cy}) -> Fenster {:?}",
+        (wr.left, wr.top, wr.right, wr.bottom)
+    );
+    check(
+        r["ok"] == true && (title_mid.0 - cx).abs() <= 1 && cy > wr.top && cy < wr.top + 60,
+        "recv.place: Titelleiste unter dem Punkt",
+        &mut fails,
+    );
+    // Hit-Test: Titelleiste -> HTCAPTION, Bildmitte -> HTCLIENT.
+    let hit = |x: i32, y: i32| unsafe {
+        SendMessageW(hw, WM_NCHITTEST, Some(WPARAM(0)), Some(LPARAM(xy(x, y)))).0 as u32
+    };
+    check(
+        hit(cx, cy) == HTCAPTION
+            && hit((wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2) == HTCLIENT,
+        "WM_NCHITTEST: Titel = HTCAPTION, Inhalt = HTCLIENT",
+        &mut fails,
+    );
+    // Am rechten Rand: auf die Arbeitsflaeche geklemmt.
+    let r = h.cmd(
+        json!({"cmd":"recv.place","tid":1,"x":pt(work.right - 3),"y":pt(cy),"dragging":false}),
+    );
+    let wr = wrect(hw);
+    check(
+        r["ok"] == true && wr.right <= work.right && wr.right >= work.right - 2,
+        &format!(
+            "recv.place am Rand geklemmt ({} <= {})",
+            wr.right, work.right
+        ),
+        &mut fails,
+    );
+    let r = h.cmd(json!({"cmd":"recv.place","tid":99,"x":0,"y":0,"dragging":false}));
+    check(
+        r["error"]["code"] == "not_found",
+        "recv.place unbekannter tid",
+        &mut fails,
+    );
+    // Mit dragging: Fenster springt an den echten Mauszeiger (Titelleiste darunter); die Taste ist nicht
+    // gedrueckt (keine echte Eingabe im Test), also endet der Zug nach der Wartezeit mit dragging:false.
+    let r = h.cmd(json!({"cmd":"recv.place","tid":1,"x":pt(cx),"y":pt(cy),"dragging":true}));
+    let ev = h.collect(Duration::from_millis(1500));
+    let drags: Vec<&Value> = ev.iter().filter(|e| e["ev"] == "proxy.drag").collect();
+    let mut cur = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut cur);
+    }
+    let wr = wrect(hw);
+    println!(
+        "  proxy.drag: {} Ereignisse, letztes {:?}; Maus {:?}, Fenster {:?}",
+        drags.len(),
+        drags.last(),
+        (cur.x, cur.y),
+        (wr.left, wr.top, wr.right, wr.bottom)
+    );
+    check(
+        r["ok"] == true
+            && drags.first().is_some_and(|e| e["dragging"] == true)
+            && drags
+                .last()
+                .is_some_and(|e| e["dragging"] == false && e["px_x"].is_i64())
+            && drags.iter().filter(|e| e["dragging"] == false).count() == 1
+            && drags.len() <= 40,
+        "proxy.drag: dragging true ... einmal false (<= 30/s)",
+        &mut fails,
+    );
+    // Nach dem Ende steht das Fenster still: die letzte gemeldete Mausposition liegt in seiner
+    // Titelleiste (unabhaengig davon, ob der Nutzer die Maus danach bewegt).
+    let last = |k: &str| drags.last().and_then(|e| e[k].as_i64()).unwrap_or(i64::MIN);
+    let (lx, ly) = (last("px_x"), last("px_y"));
+    check(
+        lx >= wr.left as i64
+            && lx <= wr.right as i64
+            && ly >= wr.top as i64
+            && ly <= wr.top as i64 + 60,
+        &format!("Folgen: Titelleiste unter der Maus (letztes proxy.drag {lx},{ly})"),
+        &mut fails,
+    );
+
     // --- Vollbild bei recv.open (Vollbild-Stream)
     let r = h.cmd(
         json!({"cmd":"recv.open","tid":2,"title":"Bildschirm","app":"Mac","w":1280,"h":720,

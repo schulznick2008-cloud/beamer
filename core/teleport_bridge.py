@@ -97,27 +97,6 @@ def enqueue_teleport_hotkey(controller) -> None:
         q.put(True)
 
 
-def _attach_win_proxy_drag(service: TeleportService) -> None:
-    import os
-
-    from core.teleport_proxy_drag import ProxyDragController
-
-    margin = float(os.environ.get("BEAMER_TELEPORT_RETURN_MARGIN", "12"))
-
-    def edge_at(x: float, _y: float) -> bool:
-        return x <= margin
-
-    def on_return(peer_id: str, tid: int) -> None:
-        with service._lock:
-            tele = service._active.get(tid)
-        if tele is None or tele.role != "receiver":
-            return
-        service._request_close(peer_id, tid, "return", tele.link_outbound)
-
-    ctrl = ProxyDragController(on_return, edge_at=edge_at, logger=service.logger)
-    service.set_proxy_drag_handler(ctrl.on_proxy_drag)
-
-
 def _attach_mac_edge_drag(controller, service: TeleportService) -> None:
     from core.teleport_edge_drag import EdgeDragController
 
@@ -224,7 +203,6 @@ def attach_win_sender(sender, identity_fn: Callable[[], dict], server=None) -> T
         logger=logging.getLogger("Beamer"),
     )
     sender.teleport = service
-    _attach_win_proxy_drag(service)
 
     orig_msg = sender.on_message
 
@@ -258,4 +236,23 @@ def attach_win_sender(sender, identity_fn: Callable[[], dict], server=None) -> T
             )
 
     sender.on_link = on_link
+    service.set_return_edge_probe(lambda peer_id, x, y: win_at_return_edge(sender, peer_id, x, y))
     return service
+
+
+def win_at_return_edge(sender, peer_id: str, x: float, y: float) -> bool:
+    """Liegt der Punkt (physische Pixel) an der Kante, über die dieser PC zu ``peer_id`` wechselt?
+    Nutzt dieselben Kantenmodelle wie Beamers eigener Wechsel (``sender._models``), nur ohne Druck: der
+    Proxy ist an die Wand gezogen, das genügt."""
+    try:
+        monitors = sender._cached_monitors()
+        display_map = sender._cached_display_map()
+        point = (int(round(x)), int(round(y)))
+        for peer, model in list(getattr(sender, "_models", [])):
+            if protocol.id_text(peer) != peer_id:
+                continue
+            if model._at_edge(monitors, point, display_map):
+                return True
+    except Exception:
+        log.exception("Kantenprüfung fehlgeschlagen")
+    return False

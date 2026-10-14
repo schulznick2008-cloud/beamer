@@ -103,7 +103,8 @@ class TeleportService:
         self.logger = logger or log
         self._pick_front_window = pick_front_window
         self._drag_state_handler: Optional[Callable[[Mapping[str, Any]], None]] = None
-        self._proxy_drag_handler: Optional[Callable[[str, int, Mapping[str, Any]], None]] = None
+        # Windows: liegt (x, y) (physische Pixel) an der Übergangskante zu diesem Peer? (Kanten-Drag zurück)
+        self._return_edge_probe: Optional[Callable[[str, float, float], bool]] = None
         self._lock = threading.RLock()
         self._links: Dict[LinkRef, PeerTeleportState] = {}
         self._seen_offers: Dict[LinkRef, Set[Tuple[bytes, int]]] = {}
@@ -116,7 +117,9 @@ class TeleportService:
 
     @property
     def proxy_swallow_input(self) -> bool:
-        """Windows: KVM-Hook unterdrücken, wenn ein Proxy Fokus hat (bis C05 vollständig native erfasst)."""
+        """Windows: Ein Proxy hat den Fokus. Der Proxy erfasst Tastatur und Maus nativ über seine
+        Fenster-Nachrichten (C05); der KVM-Hook gibt die Taste dann nur durch (``return False``),
+        verschluckt nichts und leitet nichts an den Peer weiter. Ohne Proxy-Fokus gilt Beamer-KVM."""
         with self._lock:
             return any(t.proxy_focused for t in self._active.values() if t.role == "receiver")
 
@@ -126,10 +129,10 @@ class TeleportService:
     def set_drag_state_handler(self, handler: Optional[Callable[[Mapping[str, Any]], None]]) -> None:
         self._drag_state_handler = handler
 
-    def set_proxy_drag_handler(
-        self, handler: Optional[Callable[[str, int, Mapping[str, Any]], None]]
-    ) -> None:
-        self._proxy_drag_handler = handler
+    def set_return_edge_probe(self, probe: Optional[Callable[[str, float, float], bool]]) -> None:
+        """Windows: ``probe(peer_id, x, y)`` sagt, ob ein Punkt (physische Pixel) an der Kante zu diesem
+        Peer liegt (Beamer-Layout). Zieht der Nutzer einen Proxy dorthin, geht das Fenster zurück."""
+        self._return_edge_probe = probe
 
     def _ensure_helper(self) -> TeleportHelper:
         if self._helper is None:
@@ -386,17 +389,6 @@ class TeleportService:
         place_x = data.get("place_x")
         place_y = data.get("place_y")
         drag_offer = bool(data.get("drag"))
-        if drag_offer and place_x is not None and place_y is not None:
-            try:
-                helper.request(
-                    "recv.place",
-                    tid=tid,
-                    x=float(place_x),
-                    y=float(place_y),
-                    dragging=True,
-                )
-            except TeleportIPCError:
-                self.logger.warning("recv.place fehlgeschlagen (tid=%s)", tid)
         tele = ActiveTeleport(
             tid=tid,
             peer_id=peer_id,
@@ -417,6 +409,25 @@ class TeleportService:
         peer_host = self._path_host_for_peer(peer_id, outbound)
         if peer_host and int(data.get("udp_port", 0)):
             helper.request("transport.peer", peer_host=peer_host, peer_port=int(data["udp_port"]))
+        self._place_after_open(helper, tele)
+
+    def _place_after_open(self, helper: TeleportHelper, tele: ActiveTeleport) -> None:
+        """Kanten-Drag (§2.1): Proxy an die Maus legen; mit ``dragging`` folgt er ihr, bis die Taste los
+        ist. Läuft hier im IPC-/Link-Thread, nie im Hook. Ohne ``drag`` oder Position bleibt alles wie
+        bisher. ``place_x``/``place_y`` sind laut Vertrag Bildschirmkoordinaten der Empfängerseite; der
+        Helfer folgt beim Ziehen ohnehin der echten Maus, eine ungenaue Startposition korrigiert sich."""
+        if not tele.drag_pending or tele.place_x is None or tele.place_y is None:
+            return
+        try:
+            r = helper.request(
+                "recv.place", tid=tele.tid, x=float(tele.place_x), y=float(tele.place_y), dragging=True
+            )
+            if not r.get("ok"):
+                self.logger.warning("recv.place abgelehnt: %s", r.get("error"))
+        except (TeleportIPCError, TypeError, ValueError):
+            self.logger.exception("recv.place fehlgeschlagen")
+        finally:
+            tele.drag_pending = False
 
     def _handle_accept(self, peer_id: str, data: Mapping[str, Any], outbound: bool) -> None:
         if not keytable.is_mac(self.platform):
@@ -536,15 +547,6 @@ class TeleportService:
                 self.logger.exception("windows.drag_state Handler fehlgeschlagen")
             return
         tid = ev.get("tid")
-        if name == "proxy.drag" and isinstance(tid, int) and self._proxy_drag_handler is not None:
-            try:
-                with self._lock:
-                    tele = self._active.get(tid)
-                if tele is not None and tele.role == "receiver":
-                    self._proxy_drag_handler(tele.peer_id, tid, dict(ev))
-            except Exception:
-                self.logger.exception("proxy.drag Handler fehlgeschlagen")
-            return
         if not isinstance(tid, int):
             return
         if name == "proxy.input":
@@ -562,6 +564,8 @@ class TeleportService:
                     tele.proxy_focused = focused
             if focused and tele is not None:
                 self._post(tele.peer_id, focus_msg(tid), tele.link_outbound)
+        elif name == "proxy.drag":
+            self._on_proxy_drag(tid, ev)
         elif name == "proxy.closed":
             with self._lock:
                 tele = self._active.get(tid)
@@ -576,6 +580,28 @@ class TeleportService:
             with self._lock:
                 for t in list(self._active.values()):
                     self._local_close(t.tid, "error")
+
+    def _on_proxy_drag(self, tid: int, ev: Mapping[str, Any]) -> None:
+        """Proxy wird gezogen (§2.1). Erreicht der Zug die Übergangskante zum Peer, geht das Fenster
+        zurück (``tp_close`` ``return``, der Mac holt es an der Maus zurück). Sonst nichts."""
+        if not ev.get("dragging") or self._return_edge_probe is None:
+            return
+        with self._lock:
+            tele = self._active.get(tid)
+        if tele is None or tele.role != "receiver":
+            return
+        x = ev.get("px_x", ev.get("x"))
+        y = ev.get("px_y", ev.get("y"))
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return
+        try:
+            at_edge = bool(self._return_edge_probe(tele.peer_id, float(x), float(y)))
+        except Exception:
+            self.logger.exception("Kantenprüfung für proxy.drag fehlgeschlagen")
+            return
+        if at_edge:
+            self.logger.info("Teleport %s: Proxy an die Kante gezogen, Fenster geht zurück", tid)
+            self._request_close(tele.peer_id, tid, "return", tele.link_outbound)
 
     def apply_path_decision(self, decision: PathDecision) -> None:
         self._bitrate_kbps = decision.bitrate_kbps

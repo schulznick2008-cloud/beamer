@@ -125,6 +125,14 @@ pub enum Cmd {
     RecvClose {
         tid: u32,
     },
+    /// §2.1 (Kanten-Drag): Proxy so legen, dass die Titelleiste unter (x, y) liegt (Bildschirm-Punkte);
+    /// mit `dragging` folgt das Fenster danach der Maus, bis die linke Taste los ist.
+    RecvPlace {
+        tid: u32,
+        x: f64,
+        y: f64,
+        dragging: bool,
+    },
     Shutdown,
     /// Bekannter Befehl, den dieser Helfer (noch) nicht kann.
     Unsupported(String),
@@ -311,6 +319,20 @@ pub fn parse_line(line: &str) -> Result<Request, ParseError> {
         "recv.close" => Cmd::RecvClose {
             tid: get_tid(o, id)?,
         },
+        "recv.place" => {
+            let coord = |k: &str| {
+                o.get(k)
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite() && v.abs() < 1.0e6)
+                    .ok_or_else(|| bad(id, format!("{k} fehlt oder ist keine Zahl")))
+            };
+            Cmd::RecvPlace {
+                tid: get_tid(o, id)?,
+                x: coord("x")?,
+                y: coord("y")?,
+                dragging: o.get("dragging").and_then(Value::as_bool).unwrap_or(false),
+            }
+        }
         "shutdown" => Cmd::Shutdown,
         other if LATER_CMDS.contains(&other) => Cmd::Unsupported(other.to_owned()),
         other => return Err(bad(id, format!("unbekannter Befehl {other}"))),
@@ -467,6 +489,33 @@ mod tests {
         assert!(with(json!(7)).is_err());
         let big = base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_ICON_BYTES + 1]);
         assert!(with(json!(big)).is_err());
+    }
+
+    #[test]
+    fn recv_place() {
+        let r = parse_line(
+            r#"{"v":1,"id":4,"cmd":"recv.place","tid":3,"x":-120.5,"y":40,"dragging":true}"#,
+        )
+        .unwrap();
+        match r.cmd {
+            Cmd::RecvPlace {
+                tid,
+                x,
+                y,
+                dragging,
+            } => assert_eq!((tid, x, y, dragging), (3, -120.5, 40.0, true)),
+            _ => panic!(),
+        }
+        let r = parse_line(r#"{"v":1,"id":4,"cmd":"recv.place","tid":3,"x":1,"y":2}"#).unwrap();
+        assert!(matches!(
+            r.cmd,
+            Cmd::RecvPlace {
+                dragging: false,
+                ..
+            }
+        ));
+        assert!(parse_line(r#"{"v":1,"id":4,"cmd":"recv.place","tid":3,"x":1}"#).is_err());
+        assert!(parse_line(r#"{"v":1,"id":4,"cmd":"recv.place","tid":0,"x":1,"y":2}"#).is_err());
     }
 
     #[test]

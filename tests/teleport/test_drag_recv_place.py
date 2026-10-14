@@ -81,7 +81,6 @@ def test_drag_offer_calls_recv_place(monkeypatch):
 
 
 def test_proxy_drag_at_edge_sends_tp_close_return(monkeypatch):
-    monkeypatch.setenv("BEAMER_TELEPORT_RETURN_MARGIN", "50")
     with open(VECTORS, encoding="utf-8") as f:
         vectors = json.load(f)
     posted = []
@@ -90,10 +89,8 @@ def test_proxy_drag_at_edge_sends_tp_close_return(monkeypatch):
         posted.append(msg)
         return True
 
-    from core.teleport_bridge import _attach_win_proxy_drag
-
     win = TeleportService("windows", post_to_peer=post_win, helper_config=_fake_cfg("windows", 47311, monkeypatch))
-    _attach_win_proxy_drag(win)
+    win.set_return_edge_probe(lambda _peer_id, x, _y: x <= 50.0)
     session = FakeLinkSession(vectors["link"])
     win.on_link_up("peer-mac", vectors["link"]["token"], "macos", True, session, outbound=False)
     tid = 7
