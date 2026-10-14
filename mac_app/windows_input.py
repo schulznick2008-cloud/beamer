@@ -131,8 +131,14 @@ class WindowsInput:
             self._logger.exception("The listener for other machines' input could not start")
 
     def _token_for_peer(self, peer_id: str) -> str:
+        from core import protocol
+
+        want = protocol.read_id(peer_id)
         for entry in self._controller.book.peers():
             if entry.get("id") == peer_id:
+                return str(entry.get("token") or "")
+            eid = protocol.read_id(entry.get("id"))
+            if want is not None and eid is not None and eid == want:
                 return str(entry.get("token") or "")
         return ""
 
