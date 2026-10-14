@@ -256,6 +256,7 @@ impl App {
                     Ok(json!({}))
                 }
             },
+            Cmd::RecvFocus { tid, x, y } => self.recv_focus(tid, x, y),
             Cmd::RecvPlace {
                 tid,
                 x,
@@ -364,6 +365,36 @@ impl App {
         *lock(&self.slot) = None;
         if let Some(s) = self.session.take() {
             s.close();
+        }
+    }
+
+    fn recv_focus(
+        &mut self,
+        tid: Option<u32>,
+        x: Option<i32>,
+        y: Option<i32>,
+    ) -> Result<Value, (&'static str, String)> {
+        let target = if let Some(t) = tid {
+            self.recvs.get(&t).map(|r| r.win.hwnd)
+        } else if let (Some(x), Some(y)) = (x, y) {
+            self.recvs
+                .values()
+                .find(|r| r.win.contains_screen_point(x, y))
+                .map(|r| r.win.hwnd)
+        } else {
+            None
+        };
+        match target {
+            Some(hwnd) => {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                }
+                Ok(json!({}))
+            }
+            None => Err((
+                "not_found",
+                "kein Proxy unter dem Punkt oder tid unbekannt".to_owned(),
+            )),
         }
     }
 

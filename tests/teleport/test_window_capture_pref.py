@@ -1,4 +1,4 @@
-"""send.start: Fenster-Capture statt virtueller Monitor (Standard)."""
+"""send.start: virtueller Monitor + Fenster-Capture (Standard, Vertrag v1.5)."""
 import json
 import os
 from pathlib import Path
@@ -28,11 +28,10 @@ class FakeLinkSession:
 def _fake_cfg(monkeypatch, port: int):
     monkeypatch.setenv("BEAMER_TELEPORT_FAKE_HELPER", "1")
     monkeypatch.setenv("BEAMER_FAKE_HELPER_LOCAL_PORT", str(port))
-    monkeypatch.delenv("BEAMER_TELEPORT_VIRTUAL_DISPLAY", raising=False)
     return default_helper_config("macos", fake=True)
 
 
-def test_send_start_uses_window_capture_by_default(monkeypatch):
+def test_send_start_uses_virtual_display_by_default(monkeypatch):
     vectors = json.loads(VECTORS.read_text())
     calls = []
 
@@ -63,13 +62,12 @@ def test_send_start_uses_window_capture_by_default(monkeypatch):
         )
     mac._handle_accept("peer-win", {"tid": 3, "udp_port": 47100}, outbound=True)
     assert calls
-    assert calls[0].get("virtual_display") is False
+    assert calls[0].get("virtual_display") is True
     mac.shutdown()
 
 
-def test_virtual_display_env_enables_virtual_monitor(monkeypatch):
-    monkeypatch.setenv("BEAMER_TELEPORT_VIRTUAL_DISPLAY", "1")
+def test_virtual_display_env_disables_virtual_monitor(monkeypatch):
     svc = TeleportService("macos", post_to_peer=lambda *_: True)
     assert svc._prefer_virtual_display() is True
-    monkeypatch.delenv("BEAMER_TELEPORT_VIRTUAL_DISPLAY", raising=False)
+    monkeypatch.setenv("BEAMER_TELEPORT_VIRTUAL_DISPLAY", "0")
     assert svc._prefer_virtual_display() is False

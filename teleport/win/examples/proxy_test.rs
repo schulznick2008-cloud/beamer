@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use beamer_teleport_win::input::{HTCAPTION, HTCLIENT};
 use beamer_teleport_win::selftest::test_keys;
 use serde_json::{json, Value};
 use windows::core::{w, HSTRING};
@@ -541,22 +542,31 @@ fn main() {
     let (cx, cy) = ((work.left + work.right) / 2, work.top + 200);
     let r = h.cmd(json!({"cmd":"recv.place","tid":1,"x":pt(cx),"y":pt(cy),"dragging":false}));
     let wr = wrect(hw);
-    let title_mid = ((wr.left + wr.right) / 2, wr.top);
+    let (cw, ch) = client_size(hw);
+    let grab = beamer_teleport_win::input::title_grab_client((cw as u32, ch as u32), (1920, 1080));
+    let mut title_mid = POINT {
+        x: grab.0,
+        y: grab.1,
+    };
+    unsafe {
+        let _ = ClientToScreen(hw, &mut title_mid);
+    }
     println!(
-        "  recv.place ({cx},{cy}) -> Fenster {:?}",
-        (wr.left, wr.top, wr.right, wr.bottom)
+        "  recv.place ({cx},{cy}) -> Fenster {:?}, Titelmitte {:?}",
+        (wr.left, wr.top, wr.right, wr.bottom),
+        (title_mid.x, title_mid.y)
     );
     check(
-        r["ok"] == true && (title_mid.0 - cx).abs() <= 1 && cy > wr.top && cy < wr.top + 60,
+        r["ok"] == true && (title_mid.x - cx).abs() <= 2 && (title_mid.y - cy).abs() <= 2,
         "recv.place: Titelleiste unter dem Punkt",
         &mut fails,
     );
     // Hit-Test: Titelleiste -> HTCAPTION, Bildmitte -> HTCLIENT.
     let hit = |x: i32, y: i32| unsafe {
-        SendMessageW(hw, WM_NCHITTEST, Some(WPARAM(0)), Some(LPARAM(xy(x, y)))).0 as u32
+        SendMessageW(hw, WM_NCHITTEST, Some(WPARAM(0)), Some(LPARAM(xy(x, y)))).0 as isize
     };
     check(
-        hit(cx, cy) == HTCAPTION
+        hit(title_mid.x, title_mid.y) == HTCAPTION
             && hit((wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2) == HTCLIENT,
         "WM_NCHITTEST: Titel = HTCAPTION, Inhalt = HTCLIENT",
         &mut fails,

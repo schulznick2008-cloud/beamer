@@ -165,10 +165,13 @@ Helfers. Strg+Alt+Shift+F im Fenster schaltet das Vollbild um.
 - Python (`core/teleport_service.py`): nach `recv.open` mit `drag` und Position → `recv.place … dragging:true`.
   `proxy.drag` an der Übergangskante zum Mac (Beamers Kantenmodelle, `core/teleport_bridge.py`
   `win_at_return_edge`) → `tp_close` `return`, der Mac holt das Fenster an der Maus zurück.
-- Titelleiste: `WM_NCHITTEST` liefert in der oberen Bildband der gestreamten macOS-Titelleiste (~28 Stream-Pixel)
-  `HTCAPTION` (Inhalt darunter `HTCLIENT`); Klicks dort gehen nicht als `proxy.input` an den Mac. Ziehen
-  verschiebt den Proxy auf dem PC. Nach `WM_EXITSIZEMOVE` arbeitet der Helfer wartende IPC-Befehle ab: in der
-  modalen Schleife verwirft Windows Thread-Nachrichten (auch ein stdin-Ende wird dann nachgeholt).
+- Proxy-Chrome: rahmenloses Fenster (`WS_POPUP` + `WS_THICKFRAME`, DWM abgerundete Ecken und Schatten),
+  weiter in Taskleiste und Alt+Tab (`WS_EX_APPWINDOW`). Die gestreamte macOS-Titelleiste ist die einzige
+  Titelleiste; Kanten liefern `HTLEFT`/`HTRIGHT`/… für `proxy.resize`.
+- Titelleiste: `WM_NCHITTEST` liefert in der oberen Bildband der gestreamten macOS-Titelleiste (~28 Stream-Pixel,
+  ohne Ampelzone) `HTCAPTION`; Ampeln sind `HTCLIENT` und werden lokal behandelt (rot → `proxy.closed`/Zurück,
+  gelb → minimieren, grün → maximieren). Klicks in der Titelleiste gehen nicht als `proxy.input` an den Mac.
+  Ziehen verschiebt den Proxy auf dem PC. Nach `WM_EXITSIZEMOVE` arbeitet der Helfer wartende IPC-Befehle ab.
 - Eingabe bleibt nativ (C05, Fenster-Nachrichten); Beamers Hook verschluckt nichts für den Proxy.
 
 ## Abnahmetest ohne Mac

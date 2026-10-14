@@ -145,7 +145,7 @@ public final class SenderEngine: TeleportBackend {
             throw IPCError(.badRequest, "virtual_display gilt nur fuer mode window")
         }
         // Fenster-Daten und (bei `virtual_display`) der virtuelle Monitor.
-        var captureMode = p.mode
+        let captureMode = p.mode
         var windowID: UInt32?
         var pid: pid_t?
         var displayID: UInt32?
@@ -164,7 +164,8 @@ public final class SenderEngine: TeleportBackend {
                                                    Int(frame.height.rounded()) + Self.menuBarAllowance)
                 virtual = vd
                 restoreFrame = frame
-                captureMode = .display(vd.displayID)
+                // Fenster auf dem virtuellen Monitor ausblenden, aber weiter nur dieses Fenster streamen
+                // (kein Display-Capture — sonst fuellt der Proxy den ganzen Monitor).
                 displayID = vd.displayID
                 ScreenCaptureSource.setScaleHint(2, forDisplay: vd.displayID) // der virtuelle Monitor ist HiDPI
             }
@@ -265,10 +266,10 @@ public final class SenderEngine: TeleportBackend {
     private func geometry(of c: StreamControl) -> InputGeometry? {
         let px = c.source.pixelSize
         let rect: CGRect?
-        if let vd = c.virtual {
+        if let wid = c.windowID, let wf = windowFrameProvider(wid), wf.width > 0, wf.height > 0 {
+            rect = wf
+        } else if let vd = c.virtual {
             rect = vd.bounds
-        } else if let wid = c.windowID {
-            rect = windowFrameProvider(wid)
         } else if let did = c.displayID {
             rect = displayFrameProvider(did)
         } else {
@@ -321,11 +322,10 @@ public final class SenderEngine: TeleportBackend {
         if let vd = c.virtual {
             let newMonitorH = Int(size.height) + Self.menuBarAllowance
             let shrinking = Int(size.width) <= vd.widthPoints && newMonitorH <= vd.heightPoints
-            // Das Bild ist der ganze Monitor: seine Zielgroesse steht fest. Die Capture-Umstellung (ScreenCaptureKit,
-            // 60-180 ms) laeuft deshalb gleichzeitig mit Monitor- und Fensterwechsel statt danach.
+            // Stream = Fenstergroesse; Monitor wird parallel vergroessert/verkleinert.
             captureGroup.enter()
             DispatchQueue.global(qos: .userInitiated).async {
-                captureChanged = pipe.applySizeEarly(points: CGSize(width: size.width, height: CGFloat(newMonitorH)))
+                captureChanged = pipe.applySizeEarly(points: size)
                 captureGroup.leave()
             }
             func moveWindow() throws {
@@ -371,7 +371,7 @@ public final class SenderEngine: TeleportBackend {
             try windowController.setFrame(windowID: wid, pid: pid, origin: nil, size: size)
             lap("Fenster")
         }
-        let expected = c.virtual != nil ? CGSize(width: size.width, height: size.height + CGFloat(Self.menuBarAllowance)) : size
+        let expected = size
         captureGroup.wait()
         let px = pipe.syncSize(expecting: expected, alreadyChanged: captureChanged)
         lap("Capture")
