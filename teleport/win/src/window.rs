@@ -754,11 +754,9 @@ fn on_traffic_light(hwnd: HWND, s: &Shared, light: input::TrafficLight) {
                 LPARAM(0),
             );
         }
-        input::TrafficLight::Minimize => {
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_MINIMIZE);
-            }
-        }
+        input::TrafficLight::Minimize => unsafe {
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        },
         input::TrafficLight::Zoom => toggle_maximize(hwnd),
     }
 }
@@ -1018,13 +1016,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     let sy = ((lp.0 >> 16) & 0xffff) as i16 as i32;
                     let fullscreen = s.windowed.lock().unwrap().is_some();
                     let (cx, cy) = client_point(hwnd, sx, sy);
-                    let hit = input::client_hit_test(
-                        cx,
-                        cy,
-                        s.size(),
-                        s.stream(),
-                        !fullscreen,
-                    );
+                    let hit = input::client_hit_test(cx, cy, s.size(), s.stream(), !fullscreen);
                     if hit != input::HTCLIENT {
                         return LRESULT(hit);
                     }

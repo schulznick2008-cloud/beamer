@@ -728,10 +728,7 @@ mod tests {
     fn client_hit_test_edges_and_title() {
         let client = (800, 600);
         let stream = (1600, 1200);
-        assert_eq!(
-            client_hit_test(4, 300, client, Some(stream), true),
-            HTLEFT
-        );
+        assert_eq!(client_hit_test(4, 300, client, Some(stream), true), HTLEFT);
         assert_eq!(
             client_hit_test(796, 300, client, Some(stream), true),
             HTRIGHT
@@ -748,9 +745,6 @@ mod tests {
             client_hit_test(400, 300, client, Some(stream), true),
             HTCLIENT
         );
-        assert_eq!(
-            client_hit_test(4, 4, client, Some(stream), true),
-            HTTOPLEFT
-        );
+        assert_eq!(client_hit_test(4, 4, client, Some(stream), true), HTTOPLEFT);
     }
 }

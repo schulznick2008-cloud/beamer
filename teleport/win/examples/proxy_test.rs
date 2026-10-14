@@ -543,10 +543,7 @@ fn main() {
     let r = h.cmd(json!({"cmd":"recv.place","tid":1,"x":pt(cx),"y":pt(cy),"dragging":false}));
     let wr = wrect(hw);
     let (cw, ch) = client_size(hw);
-    let grab = beamer_teleport_win::input::title_grab_client(
-        (cw as u32, ch as u32),
-        (1920, 1080),
-    );
+    let grab = beamer_teleport_win::input::title_grab_client((cw as u32, ch as u32), (1920, 1080));
     let mut title_mid = POINT {
         x: grab.0,
         y: grab.1,
@@ -560,9 +557,7 @@ fn main() {
         (title_mid.x, title_mid.y)
     );
     check(
-        r["ok"] == true
-            && (title_mid.x - cx).abs() <= 2
-            && (title_mid.y - cy).abs() <= 2,
+        r["ok"] == true && (title_mid.x - cx).abs() <= 2 && (title_mid.y - cy).abs() <= 2,
         "recv.place: Titelleiste unter dem Punkt",
         &mut fails,
     );
