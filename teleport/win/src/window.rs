@@ -688,29 +688,22 @@ fn hit_stream_title_bar(hwnd: HWND, s: &Shared, screen_x: i32, screen_y: i32) ->
     if s.windowed.lock().unwrap().is_some() {
         return false;
     }
-    let mut pt = POINT { x: screen_x, y: screen_y };
+    let mut pt = POINT {
+        x: screen_x,
+        y: screen_y,
+    };
     unsafe {
         let _ = ScreenToClient(hwnd, &mut pt);
     }
     match s.stream() {
-        Some(st) => input::in_stream_title_bar(
-            pt.x as f64,
-            pt.y as f64,
-            s.size(),
-            st,
-        ),
+        Some(st) => input::in_stream_title_bar(pt.x as f64, pt.y as f64, s.size(), st),
         None => false,
     }
 }
 
 fn client_in_stream_title_bar(s: &Shared, client_x: i32, client_y: i32) -> bool {
     match s.stream() {
-        Some(st) => input::in_stream_title_bar(
-            client_x as f64,
-            client_y as f64,
-            s.size(),
-            st,
-        ),
+        Some(st) => input::in_stream_title_bar(client_x as f64, client_y as f64, s.size(), st),
         None => false,
     }
 }

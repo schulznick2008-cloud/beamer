@@ -381,7 +381,12 @@ mod tests {
         assert!(in_stream_title_bar(400.0, 5.0, client, stream));
         assert!(!in_stream_title_bar(400.0, 80.0, client, stream));
         // Letterbox-Rand oben: kein Titel (sy < 0).
-        assert!(!in_stream_title_bar(500.0, 10.0, (1000, 1000), (1920, 1080)));
+        assert!(!in_stream_title_bar(
+            500.0,
+            10.0,
+            (1000, 1000),
+            (1920, 1080)
+        ));
     }
 
     #[test]
